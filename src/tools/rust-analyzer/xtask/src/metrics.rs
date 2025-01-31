@@ -6,7 +6,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, format_err};
+use anyhow::format_err;
 use xshell::{cmd, Shell};
 
 use crate::flags::{self, MeasurementType};
@@ -36,6 +36,9 @@ impl flags::Metrics {
                     MeasurementType::Build => {
                         metrics.measure_build(sh)?;
                     }
+                    MeasurementType::RustcTests => {
+                        metrics.measure_rustc_tests(sh)?;
+                    }
                     MeasurementType::AnalyzeSelf => {
                         metrics.measure_analysis_stats_self(sh)?;
                     }
@@ -50,6 +53,7 @@ impl flags::Metrics {
             }
             None => {
                 metrics.measure_build(sh)?;
+                metrics.measure_rustc_tests(sh)?;
                 metrics.measure_analysis_stats_self(sh)?;
                 metrics.measure_analysis_stats(sh, MeasurementType::AnalyzeRipgrep.as_ref())?;
                 metrics.measure_analysis_stats(sh, MeasurementType::AnalyzeWebRender.as_ref())?;
@@ -60,7 +64,7 @@ impl flags::Metrics {
         };
 
         let mut file =
-            fs::File::options().write(true).create(true).open(format!("target/{}.json", name))?;
+            fs::File::options().write(true).create(true).open(format!("target/{name}.json"))?;
         writeln!(file, "{}", metrics.json())?;
         eprintln!("{metrics:#?}");
         Ok(())
@@ -78,6 +82,23 @@ impl Metrics {
         self.report("build", time.as_millis() as u64, "ms".into());
         Ok(())
     }
+
+    fn measure_rustc_tests(&mut self, sh: &Shell) -> anyhow::Result<()> {
+        eprintln!("\nMeasuring rustc tests");
+
+        cmd!(
+            sh,
+            "git clone --depth=1 --branch 1.76.0 https://github.com/rust-lang/rust.git --single-branch"
+        )
+        .run()?;
+
+        let output = cmd!(sh, "./target/release/rust-analyzer rustc-tests ./rust").read()?;
+        for (metric, value, unit) in parse_metrics(&output) {
+            self.report(metric, value, unit.into());
+        }
+        Ok(())
+    }
+
     fn measure_analysis_stats_self(&mut self, sh: &Shell) -> anyhow::Result<()> {
         self.measure_analysis_stats_path(sh, "self", ".")
     }
@@ -168,15 +189,15 @@ impl Metrics {
 impl Host {
     fn new(sh: &Shell) -> anyhow::Result<Host> {
         if cfg!(not(target_os = "linux")) {
-            bail!("can only collect metrics on Linux ");
+            return Ok(Host { os: "unknown".into(), cpu: "unknown".into(), mem: "unknown".into() });
         }
 
-        let os = read_field(sh, "/etc/os-release", "PRETTY_NAME=")?.trim_matches('"').to_string();
+        let os = read_field(sh, "/etc/os-release", "PRETTY_NAME=")?.trim_matches('"').to_owned();
 
         let cpu = read_field(sh, "/proc/cpuinfo", "model name")?
             .trim_start_matches(':')
             .trim()
-            .to_string();
+            .to_owned();
 
         let mem = read_field(sh, "/proc/meminfo", "MemTotal:")?;
 
@@ -187,7 +208,7 @@ impl Host {
 
             text.lines()
                 .find_map(|it| it.strip_prefix(field))
-                .map(|it| it.trim().to_string())
+                .map(|it| it.trim().to_owned())
                 .ok_or_else(|| format_err!("can't parse {}", path))
         }
     }

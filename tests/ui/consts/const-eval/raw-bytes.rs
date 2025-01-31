@@ -1,15 +1,14 @@
-// stderr-per-bitwidth
-// ignore-endian-big
+//@ stderr-per-bitwidth
+//@ ignore-endian-big
 // ignore-tidy-linelength
-// normalize-stderr-test "╾─*ALLOC[0-9]+(\+[a-z0-9]+)?─*╼" -> "╾ALLOC_ID$1╼"
-
-#![feature(never_type, rustc_attrs, ptr_metadata, slice_from_ptr_range, const_slice_from_ptr_range)]
+//@ normalize-stderr: "╾─*ALLOC[0-9]+(\+[a-z0-9]+)?(<imm>)?─*╼" -> "╾ALLOC_ID$1╼"
 #![allow(invalid_value)]
+#![feature(never_type, rustc_attrs, ptr_metadata, slice_from_ptr_range, const_slice_from_ptr_range)]
 
 use std::mem;
 use std::alloc::Layout;
 use std::ptr::NonNull;
-use std::num::{NonZeroU8, NonZeroUsize};
+use std::num::NonZero;
 use std::slice::{from_ptr_range, from_raw_parts};
 
 // # Bad enums and chars
@@ -57,9 +56,9 @@ const BAD_OPTION_CHAR: Option<(char, char)> = Some(('x', unsafe { mem::transmute
 const NULL_PTR: NonNull<u8> = unsafe { mem::transmute(0usize) };
 //~^ ERROR it is undefined behavior to use this value
 
-const NULL_U8: NonZeroU8 = unsafe { mem::transmute(0u8) };
+const NULL_U8: NonZero<u8> = unsafe { mem::transmute(0u8) };
 //~^ ERROR it is undefined behavior to use this value
-const NULL_USIZE: NonZeroUsize = unsafe { mem::transmute(0usize) };
+const NULL_USIZE: NonZero<usize> = unsafe { mem::transmute(0usize) };
 //~^ ERROR it is undefined behavior to use this value
 
 #[rustc_layout_scalar_valid_range_start(10)]
@@ -196,8 +195,10 @@ const TRAIT_OBJ_CONTENT_INVALID: &dyn Trait = unsafe { mem::transmute::<_, &bool
 
 const RAW_TRAIT_OBJ_VTABLE_NULL: *const dyn Trait = unsafe { mem::transmute((&92u8, 0usize)) };
 //~^ ERROR it is undefined behavior to use this value
+//~| null pointer
 const RAW_TRAIT_OBJ_VTABLE_INVALID: *const dyn Trait = unsafe { mem::transmute((&92u8, &3u64)) };
 //~^ ERROR it is undefined behavior to use this value
+//~| vtable
 
 // Uninhabited types
 const _: &[!; 1] = unsafe { &*(1_usize as *const [!; 1]) }; //~ ERROR undefined behavior

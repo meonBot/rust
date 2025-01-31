@@ -3,11 +3,12 @@
 #![cfg_attr(specialized, feature(specialization))]
 #![allow(incomplete_features)]
 
-// revisions: stock specialized
-// [specialized]check-pass
+//@ revisions: stock specialized
+//@ [specialized]check-pass
 
 type OpaqueCoroutine = impl Sized;
 fn defining_use() -> OpaqueCoroutine {
+    #[coroutine]
     || {
         for i in 0..10 {
             yield i;

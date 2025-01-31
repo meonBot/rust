@@ -1,8 +1,8 @@
 // Test for inlining with an indirect destination place.
 //
-// unit-test: Inline
-// edition: 2021
-// needs-unwind
+//@ test-mir-pass: Inline
+//@ edition: 2021
+//@ needs-unwind
 #![crate_type = "lib"]
 #![feature(custom_mir, core_intrinsics)]
 use core::intrinsics::mir::*;
@@ -25,7 +25,7 @@ pub fn f(a: *mut u8) {
             Goto(bb1)
         }
         bb1 = {
-            Call(*a = g(), bb1, UnwindUnreachable())
+            Call(*a = g(), ReturnTo(bb1), UnwindUnreachable())
         }
     }
 }

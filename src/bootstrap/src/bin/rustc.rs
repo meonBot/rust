@@ -16,30 +16,31 @@
 //! never get replaced.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Instant;
 
-use dylib_util::{dylib_path, dylib_path_var};
+use shared_helpers::{
+    dylib_path, dylib_path_var, exe, maybe_dump, parse_rustc_stage, parse_rustc_verbose,
+    parse_value_from_args,
+};
 
-#[path = "../utils/bin_helpers.rs"]
-mod bin_helpers;
+#[path = "../utils/shared_helpers.rs"]
+mod shared_helpers;
 
-#[path = "../utils/dylib.rs"]
-mod dylib_util;
+#[path = "../utils/proc_macro_deps.rs"]
+mod proc_macro_deps;
 
 fn main() {
-    let args = env::args_os().skip(1).collect::<Vec<_>>();
-    let arg = |name| args.windows(2).find(|args| args[0] == name).and_then(|args| args[1].to_str());
+    let orig_args = env::args_os().skip(1).collect::<Vec<_>>();
+    let mut args = orig_args.clone();
 
-    // We don't use the stage in this shim, but let's parse it to make sure that we're invoked
-    // by bootstrap, or that we provide a helpful error message if not.
-    bin_helpers::parse_rustc_stage();
-    let verbose = bin_helpers::parse_rustc_verbose();
+    let stage = parse_rustc_stage();
+    let verbose = parse_rustc_verbose();
 
     // Detect whether or not we're a build script depending on whether --target
     // is passed (a bit janky...)
-    let target = arg("--target");
+    let target = parse_value_from_args(&orig_args, "--target");
     let version = args.iter().find(|w| &**w == "-vV");
 
     // Use a different compiler for build scripts, since there may not yet be a
@@ -47,7 +48,8 @@ fn main() {
     // determine the version of the compiler, the real compiler needs to be
     // used. Currently, these two states are differentiated based on whether
     // --target and -vV is/isn't passed.
-    let (rustc, libdir) = if target.is_none() && version.is_none() {
+    let is_build_script = target.is_none() && version.is_none();
+    let (rustc, libdir) = if is_build_script {
         ("RUSTC_SNAPSHOT", "RUSTC_SNAPSHOT_LIBDIR")
     } else {
         ("RUSTC_REAL", "RUSTC_LIBDIR")
@@ -56,16 +58,67 @@ fn main() {
     let sysroot = env::var_os("RUSTC_SYSROOT").expect("RUSTC_SYSROOT was not set");
     let on_fail = env::var_os("RUSTC_ON_FAIL").map(Command::new);
 
-    let rustc = env::var_os(rustc).unwrap_or_else(|| panic!("{:?} was not set", rustc));
+    let rustc_real = env::var_os(rustc).unwrap_or_else(|| panic!("{:?} was not set", rustc));
     let libdir = env::var_os(libdir).unwrap_or_else(|| panic!("{:?} was not set", libdir));
     let mut dylib_path = dylib_path();
     dylib_path.insert(0, PathBuf::from(&libdir));
 
-    let mut cmd = Command::new(rustc);
-    cmd.args(&args).env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
+    // if we're running clippy, trust cargo-clippy to set clippy-driver appropriately (and don't override it with rustc).
+    // otherwise, substitute whatever cargo thinks rustc should be with RUSTC_REAL.
+    // NOTE: this means we ignore RUSTC in the environment.
+    // FIXME: We might want to consider removing RUSTC_REAL and setting RUSTC directly?
+    // NOTE: we intentionally pass the name of the host, not the target.
+    let host = env::var("CFG_COMPILER_BUILD_TRIPLE").unwrap();
+    let is_clippy = args[0].to_string_lossy().ends_with(&exe("clippy-driver", &host));
+    let rustc_driver = if is_clippy {
+        if is_build_script {
+            // Don't run clippy on build scripts (for one thing, we may not have libstd built with
+            // the appropriate version yet, e.g. for stage 1 std).
+            // Also remove the `clippy-driver` param in addition to the RUSTC param.
+            args.drain(..2);
+            rustc_real
+        } else {
+            args.remove(0)
+        }
+    } else {
+        // Cargo doesn't respect RUSTC_WRAPPER for version information >:(
+        // don't remove the first arg if we're being run as RUSTC instead of RUSTC_WRAPPER.
+        // Cargo also sometimes doesn't pass the `.exe` suffix on Windows - add it manually.
+        let current_exe = env::current_exe().expect("couldn't get path to rustc shim");
+        let arg0 = exe(args[0].to_str().expect("only utf8 paths are supported"), &host);
+        if Path::new(&arg0) == current_exe {
+            args.remove(0);
+        }
+        rustc_real
+    };
 
     // Get the name of the crate we're compiling, if any.
-    let crate_name = arg("--crate-name");
+    let crate_name = parse_value_from_args(&orig_args, "--crate-name");
+
+    // When statically linking `std` into `rustc_driver`, remove `-C prefer-dynamic`
+    if env::var("RUSTC_LINK_STD_INTO_RUSTC_DRIVER").unwrap() == "1"
+        && crate_name == Some("rustc_driver")
+    {
+        if let Some(pos) = args.iter().enumerate().position(|(i, a)| {
+            a == "-C" && args.get(i + 1).map(|a| a == "prefer-dynamic").unwrap_or(false)
+        }) {
+            args.remove(pos);
+            args.remove(pos);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "-Cprefer-dynamic") {
+            args.remove(pos);
+        }
+    }
+
+    let mut cmd = match env::var_os("RUSTC_WRAPPER_REAL") {
+        Some(wrapper) if !wrapper.is_empty() => {
+            let mut cmd = Command::new(wrapper);
+            cmd.arg(rustc_driver);
+            cmd
+        }
+        _ => Command::new(rustc_driver),
+    };
+    cmd.args(&args).env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
 
     if let Some(crate_name) = crate_name {
         if let Some(target) = env::var_os("RUSTC_TIME") {
@@ -84,6 +137,12 @@ fn main() {
 
     if let Ok(lint_flags) = env::var("RUSTC_LINT_FLAGS") {
         cmd.args(lint_flags.split_whitespace());
+    }
+
+    // Conditionally pass `-Zon-broken-pipe=kill` to underlying rustc. Not all binaries want
+    // `-Zon-broken-pipe=kill`, which includes cargo itself.
+    if env::var_os("FORCE_ON_BROKEN_PIPE_KILL").is_some() {
+        cmd.arg("-Z").arg("on-broken-pipe=kill");
     }
 
     if target.is_some() {
@@ -106,21 +165,20 @@ fn main() {
             cmd.arg("-C").arg("panic=abort");
         }
 
+        let crate_type = parse_value_from_args(&orig_args, "--crate-type");
         // `-Ztls-model=initial-exec` must not be applied to proc-macros, see
         // issue https://github.com/rust-lang/rust/issues/100530
         if env::var("RUSTC_TLS_MODEL_INITIAL_EXEC").is_ok()
-            && arg("--crate-type") != Some("proc-macro")
-            && !matches!(crate_name, Some("proc_macro2" | "quote" | "syn" | "synstructure"))
+            && crate_type != Some("proc-macro")
+            && proc_macro_deps::CRATES.binary_search(&crate_name.unwrap_or_default()).is_err()
         {
             cmd.arg("-Ztls-model=initial-exec");
         }
-    } else if std::env::var("MIRI").is_err() {
+    } else {
         // Find any host flags that were passed by bootstrap.
         // The flags are stored in a RUSTC_HOST_FLAGS variable, separated by spaces.
         if let Ok(flags) = std::env::var("RUSTC_HOST_FLAGS") {
-            for flag in flags.split(' ') {
-                cmd.arg(flag);
-            }
+            cmd.args(flags.split(' '));
         }
     }
 
@@ -184,6 +242,12 @@ fn main() {
         }
     }
 
+    if env::var_os("RUSTC_BOLT_LINK_FLAGS").is_some() {
+        if let Some("rustc_driver") = crate_name {
+            cmd.arg("-Clink-args=-Wl,-q");
+        }
+    }
+
     let is_test = args.iter().any(|a| a == "--test");
     if verbose > 2 {
         let rust_env_vars =
@@ -208,11 +272,7 @@ fn main() {
         eprintln!("{prefix} libdir: {libdir:?}");
     }
 
-    if env::var_os("RUSTC_BOLT_LINK_FLAGS").is_some() {
-        if let Some("rustc_driver") = crate_name {
-            cmd.arg("-Clink-args=-Wl,-q");
-        }
-    }
+    maybe_dump(format!("stage{stage}-rustc"), &cmd);
 
     let start = Instant::now();
     let (child, status) = {
@@ -238,7 +298,7 @@ fn main() {
                 dur.as_secs(),
                 dur.subsec_millis(),
                 if rusage_data.is_some() { " " } else { "" },
-                rusage_data.unwrap_or(String::new()),
+                rusage_data.unwrap_or_default(),
             );
         }
     }
@@ -277,14 +337,10 @@ fn format_rusage_data(_child: Child) -> Option<String> {
 fn format_rusage_data(child: Child) -> Option<String> {
     use std::os::windows::io::AsRawHandle;
 
-    use windows::{
-        Win32::Foundation::HANDLE,
-        Win32::System::ProcessStatus::{
-            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
-        },
-        Win32::System::Threading::GetProcessTimes,
-        Win32::System::Time::FileTimeToSystemTime,
-    };
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetProcessTimes;
+    use windows::Win32::System::Time::FileTimeToSystemTime;
 
     let handle = HANDLE(child.as_raw_handle() as isize);
 
@@ -293,6 +349,7 @@ fn format_rusage_data(child: Child) -> Option<String> {
     let mut kernel_filetime = Default::default();
     let mut kernel_time = Default::default();
     let mut memory_counters = PROCESS_MEMORY_COUNTERS::default();
+    let memory_counters_size = std::mem::size_of_val(&memory_counters);
 
     unsafe {
         GetProcessTimes(
@@ -309,15 +366,9 @@ fn format_rusage_data(child: Child) -> Option<String> {
 
     // Unlike on Linux with RUSAGE_CHILDREN, this will only return memory information for the process
     // with the given handle and none of that process's children.
-    unsafe {
-        K32GetProcessMemoryInfo(
-            handle,
-            &mut memory_counters,
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-        )
-    }
-    .ok()
-    .ok()?;
+    unsafe { K32GetProcessMemoryInfo(handle, &mut memory_counters, memory_counters_size as u32) }
+        .ok()
+        .ok()?;
 
     // Guide on interpreting these numbers:
     // https://docs.microsoft.com/en-us/windows/win32/psapi/process-memory-usage-information
@@ -402,5 +453,5 @@ fn format_rusage_data(_child: Child) -> Option<String> {
         ));
     }
 
-    return Some(init_str);
+    Some(init_str)
 }

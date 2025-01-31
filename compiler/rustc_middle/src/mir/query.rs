@@ -1,83 +1,20 @@
 //! Values computed by queries that use MIR.
 
-use crate::mir;
-use crate::ty::{self, OpaqueHiddenType, Ty, TyCtxt};
+use std::fmt::{self, Debug};
+
+use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::unord::UnordSet;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::bit_set::BitMatrix;
 use rustc_index::{Idx, IndexVec};
-use rustc_span::symbol::Symbol;
-use rustc_span::Span;
-use rustc_target::abi::{FieldIdx, VariantIdx};
+use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_span::{Span, Symbol};
 use smallvec::SmallVec;
-use std::cell::Cell;
-use std::fmt::{self, Debug};
 
 use super::{ConstValue, SourceInfo};
-
-#[derive(Copy, Clone, PartialEq, TyEncodable, TyDecodable, HashStable, Debug)]
-pub enum UnsafetyViolationKind {
-    /// Unsafe operation outside `unsafe`.
-    General,
-    /// Unsafe operation in an `unsafe fn` but outside an `unsafe` block.
-    /// Has to be handled as a lint for backwards compatibility.
-    UnsafeFn,
-}
-
-#[derive(Clone, PartialEq, TyEncodable, TyDecodable, HashStable, Debug)]
-pub enum UnsafetyViolationDetails {
-    CallToUnsafeFunction,
-    UseOfInlineAssembly,
-    InitializingTypeWith,
-    CastOfPointerToInt,
-    UseOfMutableStatic,
-    UseOfExternStatic,
-    DerefOfRawPointer,
-    AccessToUnionField,
-    MutationOfLayoutConstrainedField,
-    BorrowOfLayoutConstrainedField,
-    CallToFunctionWith {
-        /// Target features enabled in callee's `#[target_feature]` but missing in
-        /// caller's `#[target_feature]`.
-        missing: Vec<Symbol>,
-        /// Target features in `missing` that are enabled at compile time
-        /// (e.g., with `-C target-feature`).
-        build_enabled: Vec<Symbol>,
-    },
-}
-
-#[derive(Clone, PartialEq, TyEncodable, TyDecodable, HashStable, Debug)]
-pub struct UnsafetyViolation {
-    pub source_info: SourceInfo,
-    pub lint_root: hir::HirId,
-    pub kind: UnsafetyViolationKind,
-    pub details: UnsafetyViolationDetails,
-}
-
-#[derive(Copy, Clone, PartialEq, TyEncodable, TyDecodable, HashStable, Debug)]
-pub enum UnusedUnsafe {
-    /// `unsafe` block contains no unsafe operations
-    /// > ``unnecessary `unsafe` block``
-    Unused,
-    /// `unsafe` block nested under another (used) `unsafe` block
-    /// > ``… because it's nested under this `unsafe` block``
-    InUnsafeBlock(hir::HirId),
-}
-
-#[derive(TyEncodable, TyDecodable, HashStable, Debug)]
-pub struct UnsafetyCheckResult {
-    /// Violations that are propagated *upwards* from this function.
-    pub violations: Vec<UnsafetyViolation>,
-
-    /// Used `unsafe` blocks in this function. This is used for the "unused_unsafe" lint.
-    pub used_unsafe_blocks: UnordSet<hir::HirId>,
-
-    /// This is `Some` iff the item is not a closure.
-    pub unused_unsafes: Option<Vec<(hir::HirId, UnusedUnsafe)>>,
-}
+use crate::ty::fold::fold_regions;
+use crate::ty::{self, CoroutineArgsExt, OpaqueHiddenType, Ty, TyCtxt};
 
 rustc_index::newtype_index! {
     #[derive(HashStable)]
@@ -86,7 +23,8 @@ rustc_index::newtype_index! {
     pub struct CoroutineSavedLocal {}
 }
 
-#[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub struct CoroutineSavedTy<'tcx> {
     pub ty: Ty<'tcx>,
     /// Source info corresponding to the local in the original MIR body.
@@ -96,7 +34,8 @@ pub struct CoroutineSavedTy<'tcx> {
 }
 
 /// The layout of coroutine state.
-#[derive(Clone, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, PartialEq, Eq)]
+#[derive(TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub struct CoroutineLayout<'tcx> {
     /// The type of every local stored inside the coroutine.
     pub field_tys: IndexVec<CoroutineSavedLocal, CoroutineSavedTy<'tcx>>,
@@ -122,55 +61,26 @@ pub struct CoroutineLayout<'tcx> {
 
 impl Debug for CoroutineLayout<'_> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        /// Prints an iterator of (key, value) tuples as a map.
-        struct MapPrinter<'a, K, V>(Cell<Option<Box<dyn Iterator<Item = (K, V)> + 'a>>>);
-        impl<'a, K, V> MapPrinter<'a, K, V> {
-            fn new(iter: impl Iterator<Item = (K, V)> + 'a) -> Self {
-                Self(Cell::new(Some(Box::new(iter))))
-            }
-        }
-        impl<'a, K: Debug, V: Debug> Debug for MapPrinter<'a, K, V> {
-            fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-                fmt.debug_map().entries(self.0.take().unwrap()).finish()
-            }
-        }
-
-        /// Prints the coroutine variant name.
-        struct GenVariantPrinter(VariantIdx);
-        impl From<VariantIdx> for GenVariantPrinter {
-            fn from(idx: VariantIdx) -> Self {
-                GenVariantPrinter(idx)
-            }
-        }
-        impl Debug for GenVariantPrinter {
-            fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let variant_name = ty::CoroutineArgs::variant_name(self.0);
-                if fmt.alternate() {
-                    write!(fmt, "{:9}({:?})", variant_name, self.0)
-                } else {
-                    write!(fmt, "{variant_name}")
-                }
-            }
-        }
-
-        /// Forces its contents to print in regular mode instead of alternate mode.
-        struct OneLinePrinter<T>(T);
-        impl<T: Debug> Debug for OneLinePrinter<T> {
-            fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(fmt, "{:?}", self.0)
-            }
-        }
-
         fmt.debug_struct("CoroutineLayout")
-            .field("field_tys", &MapPrinter::new(self.field_tys.iter_enumerated()))
-            .field(
-                "variant_fields",
-                &MapPrinter::new(
-                    self.variant_fields
-                        .iter_enumerated()
-                        .map(|(k, v)| (GenVariantPrinter(k), OneLinePrinter(v))),
-                ),
-            )
+            .field_with("field_tys", |fmt| {
+                fmt.debug_map().entries(self.field_tys.iter_enumerated()).finish()
+            })
+            .field_with("variant_fields", |fmt| {
+                let mut map = fmt.debug_map();
+                for (idx, fields) in self.variant_fields.iter_enumerated() {
+                    map.key_with(|fmt| {
+                        let variant_name = ty::CoroutineArgs::variant_name(idx);
+                        if fmt.alternate() {
+                            write!(fmt, "{variant_name:9}({idx:?})")
+                        } else {
+                            write!(fmt, "{variant_name}")
+                        }
+                    });
+                    // Force variant fields to print in regular mode instead of alternate mode.
+                    map.value_with(|fmt| write!(fmt, "{fields:?}"));
+                }
+                map.finish()
+            })
             .field("storage_conflicts", &self.storage_conflicts)
             .finish()
     }
@@ -189,7 +99,7 @@ pub struct BorrowCheckResult<'tcx> {
 
 /// The result of the `mir_const_qualif` query.
 ///
-/// Each field (except `error_occurred`) corresponds to an implementer of the `Qualif` trait in
+/// Each field (except `tainted_by_errors`) corresponds to an implementer of the `Qualif` trait in
 /// `rustc_const_eval/src/transform/check_consts/qualifs.rs`. See that file for more information on each
 /// `Qualif`.
 #[derive(Clone, Copy, Debug, Default, TyEncodable, TyDecodable, HashStable)]
@@ -197,7 +107,6 @@ pub struct ConstQualifs {
     pub has_mut_interior: bool,
     pub needs_drop: bool,
     pub needs_non_const_drop: bool,
-    pub custom_eq: bool,
     pub tainted_by_errors: Option<ErrorGuaranteed>,
 }
 
@@ -275,7 +184,7 @@ pub struct ClosureOutlivesRequirement<'tcx> {
 }
 
 // Make sure this enum doesn't unintentionally grow
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 rustc_data_structures::static_assert_size!(ConstraintCategory<'_>, 16);
 
 /// Outlives-constraints can be categorized to determine whether and why they
@@ -283,24 +192,21 @@ rustc_data_structures::static_assert_size!(ConstraintCategory<'_>, 16);
 /// order of the category, thereby influencing diagnostic output.
 ///
 /// See also `rustc_const_eval::borrow_check::constraints`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[derive(TyEncodable, TyDecodable, HashStable, TypeVisitable, TypeFoldable)]
 pub enum ConstraintCategory<'tcx> {
     Return(ReturnConstraint),
     Yield,
     UseAsConst,
     UseAsStatic,
-    TypeAnnotation,
+    TypeAnnotation(AnnotationSource),
     Cast {
-        /// Whether this is an unsizing cast and if yes, this contains the target type.
+        /// Whether this cast is a coercion that was automatically inserted by the compiler.
+        is_implicit_coercion: bool,
+        /// Whether this is an unsizing coercion and if yes, this contains the target type.
         /// Region variables are erased to ReErased.
         unsize_to: Option<Ty<'tcx>>,
     },
-
-    /// A constraint that came from checking the body of a closure.
-    ///
-    /// We try to get the category that the closure used when reporting this.
-    ClosureBounds,
 
     /// Contains the function type if available.
     CallArgument(Option<Ty<'tcx>>),
@@ -327,13 +233,25 @@ pub enum ConstraintCategory<'tcx> {
 
     /// A constraint that doesn't correspond to anything the user sees.
     Internal,
+
+    /// An internal constraint derived from an illegal universe relation.
+    IllegalUniverse,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[derive(TyEncodable, TyDecodable, HashStable, TypeVisitable, TypeFoldable)]
 pub enum ReturnConstraint {
     Normal,
     ClosureUpvar(FieldIdx),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(TyEncodable, TyDecodable, HashStable, TypeVisitable, TypeFoldable)]
+pub enum AnnotationSource {
+    Ascription,
+    Declaration,
+    OpaqueCast,
+    GenericArg,
 }
 
 /// The subject of a `ClosureOutlivesRequirement` -- that is, the thing
@@ -367,9 +285,12 @@ impl<'tcx> ClosureOutlivesSubjectTy<'tcx> {
     /// All regions of `ty` must be of kind `ReVar` and must represent
     /// universal regions *external* to the closure.
     pub fn bind(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Self {
-        let inner = tcx.fold_regions(ty, |r, depth| match r.kind() {
+        let inner = fold_regions(tcx, ty, |r, depth| match r.kind() {
             ty::ReVar(vid) => {
-                let br = ty::BoundRegion { var: ty::BoundVar::new(vid.index()), kind: ty::BrAnon };
+                let br = ty::BoundRegion {
+                    var: ty::BoundVar::new(vid.index()),
+                    kind: ty::BoundRegionKind::Anon,
+                };
                 ty::Region::new_bound(tcx, depth, br)
             }
             _ => bug!("unexpected region in ClosureOutlivesSubjectTy: {r:?}"),
@@ -383,7 +304,7 @@ impl<'tcx> ClosureOutlivesSubjectTy<'tcx> {
         tcx: TyCtxt<'tcx>,
         mut map: impl FnMut(ty::RegionVid) -> ty::Region<'tcx>,
     ) -> Ty<'tcx> {
-        tcx.fold_regions(self.inner, |r, depth| match r.kind() {
+        fold_regions(tcx, self.inner, |r, depth| match r.kind() {
             ty::ReBound(debruijn, br) => {
                 debug_assert_eq!(debruijn, depth);
                 map(ty::RegionVid::new(br.var.index()))
@@ -398,21 +319,4 @@ impl<'tcx> ClosureOutlivesSubjectTy<'tcx> {
 pub struct DestructuredConstant<'tcx> {
     pub variant: Option<VariantIdx>,
     pub fields: &'tcx [(ConstValue<'tcx>, Ty<'tcx>)],
-}
-
-/// Summarizes coverage IDs inserted by the `InstrumentCoverage` MIR pass
-/// (for compiler option `-Cinstrument-coverage`), after MIR optimizations
-/// have had a chance to potentially remove some of them.
-///
-/// Used by the `coverage_ids_info` query.
-#[derive(Clone, TyEncodable, TyDecodable, Debug, HashStable)]
-pub struct CoverageIdsInfo {
-    /// Coverage codegen needs to know the highest counter ID that is ever
-    /// incremented within a function, so that it can set the `num-counters`
-    /// argument of the `llvm.instrprof.increment` intrinsic.
-    ///
-    /// This may be less than the highest counter ID emitted by the
-    /// InstrumentCoverage MIR pass, if the highest-numbered counter increments
-    /// were removed by MIR optimizations.
-    pub max_counter_id: mir::coverage::CounterId,
 }

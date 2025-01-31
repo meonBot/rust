@@ -8,7 +8,7 @@ use ide_db::{
         insert_use::{insert_use, insert_use_as_alias, ImportScope},
     },
 };
-use syntax::{ast, AstNode, NodeOrToken, SyntaxElement};
+use syntax::{ast, AstNode, Edition, NodeOrToken, SyntaxElement};
 
 use crate::{AssistContext, AssistId, AssistKind, Assists, GroupLabel};
 
@@ -49,6 +49,8 @@ use crate::{AssistContext, AssistId, AssistKind, Assists, GroupLabel};
 // - `item`: Don't merge imports at all, creating one import per item.
 // - `preserve`: Do not change the granularity of any imports. For auto-import this has the same
 //  effect as `item`.
+// - `one`: Merge all imports into a single use statement as long as they have the same visibility
+//  and attributes.
 //
 // In `VS Code` the configuration for this is `rust-analyzer.imports.granularity.group`.
 //
@@ -88,13 +90,12 @@ use crate::{AssistContext, AssistId, AssistKind, Assists, GroupLabel};
 // # pub mod std { pub mod collections { pub struct HashMap { } } }
 // ```
 pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+    let cfg = ctx.config.import_path_config();
+
     let (import_assets, syntax_under_caret) = find_importable_node(ctx)?;
-    let mut proposed_imports = import_assets.search_for_imports(
-        &ctx.sema,
-        ctx.config.insert_use.prefix_kind,
-        ctx.config.prefer_no_std,
-        ctx.config.prefer_no_std,
-    );
+    let mut proposed_imports: Vec<_> = import_assets
+        .search_for_imports(&ctx.sema, cfg, ctx.config.insert_use.prefix_kind)
+        .collect();
     if proposed_imports.is_empty() {
         return None;
     }
@@ -103,7 +104,6 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
         NodeOrToken::Node(node) => ctx.sema.original_range(node).range,
         NodeOrToken::Token(token) => token.text_range(),
     };
-    let group_label = group_label(import_assets.import_candidate());
     let scope = ImportScope::find_insert_use_container(
         &match syntax_under_caret {
             NodeOrToken::Node(it) => it,
@@ -113,29 +113,25 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
     )?;
 
     // we aren't interested in different namespaces
+    proposed_imports.sort_by(|a, b| a.import_path.cmp(&b.import_path));
     proposed_imports.dedup_by(|a, b| a.import_path == b.import_path);
 
-    let current_node = match ctx.covering_element() {
-        NodeOrToken::Node(node) => Some(node),
-        NodeOrToken::Token(token) => token.parent(),
-    };
-
-    let current_module =
-        current_node.as_ref().and_then(|node| ctx.sema.scope(node)).map(|scope| scope.module());
-
+    let current_module = ctx.sema.scope(scope.as_syntax_node()).map(|scope| scope.module());
     // prioritize more relevant imports
     proposed_imports
         .sort_by_key(|import| Reverse(relevance_score(ctx, import, current_module.as_ref())));
+    let edition = current_module.map(|it| it.krate().edition(ctx.db())).unwrap_or(Edition::CURRENT);
 
+    let group_label = group_label(import_assets.import_candidate());
     for import in proposed_imports {
         let import_path = import.import_path;
 
         let (assist_id, import_name) =
-            (AssistId("auto_import", AssistKind::QuickFix), import_path.display(ctx.db()));
+            (AssistId("auto_import", AssistKind::QuickFix), import_path.display(ctx.db(), edition));
         acc.add_group(
             &group_label,
             assist_id,
-            format!("Import `{}`", import_name),
+            format!("Import `{import_name}`"),
             range,
             |builder| {
                 let scope = match scope.clone() {
@@ -143,7 +139,7 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
                     ImportScope::Module(it) => ImportScope::Module(builder.make_mut(it)),
                     ImportScope::Block(it) => ImportScope::Block(builder.make_mut(it)),
                 };
-                insert_use(&scope, mod_path_to_ast(&import_path), &ctx.config.insert_use);
+                insert_use(&scope, mod_path_to_ast(&import_path, edition), &ctx.config.insert_use);
             },
         );
 
@@ -160,7 +156,7 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
                 acc.add_group(
                     &group_label,
                     assist_id,
-                    format!("Import `{} as _`", import_name),
+                    format!("Import `{import_name} as _`"),
                     range,
                     |builder| {
                         let scope = match scope.clone() {
@@ -170,7 +166,7 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
                         };
                         insert_use_as_alias(
                             &scope,
-                            mod_path_to_ast(&import_path),
+                            mod_path_to_ast(&import_path, edition),
                             &ctx.config.insert_use,
                         );
                     },
@@ -193,7 +189,7 @@ pub(super) fn find_importable_node(
     {
         ImportAssets::for_method_call(&method_under_caret, &ctx.sema)
             .zip(Some(method_under_caret.syntax().clone().into()))
-    } else if let Some(_) = ctx.find_node_at_offset_with_descend::<ast::Param>() {
+    } else if ctx.find_node_at_offset_with_descend::<ast::Param>().is_some() {
         None
     } else if let Some(pat) = ctx
         .find_node_at_offset_with_descend::<ast::IdentPat>()
@@ -220,7 +216,7 @@ fn group_label(import_candidate: &ImportCandidate) -> GroupLabel {
 
 /// Determine how relevant a given import is in the current context. Higher scores are more
 /// relevant.
-fn relevance_score(
+pub(crate) fn relevance_score(
     ctx: &AssistContext<'_>,
     import: &LocatedImport,
     current_module: Option<&Module>,
@@ -267,8 +263,10 @@ fn module_distance_heuristic(db: &dyn HirDatabase, current: &Module, item: &Modu
     // cost of importing from another crate
     let crate_boundary_cost = if current.krate() == item.krate() {
         0
-    } else if item.krate().is_builtin(db) {
+    } else if item.krate().origin(db).is_local() {
         2
+    } else if item.krate().is_builtin(db) {
+        3
     } else {
         4
     };
@@ -280,12 +278,9 @@ fn module_distance_heuristic(db: &dyn HirDatabase, current: &Module, item: &Modu
 mod tests {
     use super::*;
 
-    use hir::Semantics;
-    use ide_db::{
-        assists::AssistResolveStrategy,
-        base_db::{fixture::WithFixture, FileRange},
-        RootDatabase,
-    };
+    use hir::{FileRange, Semantics};
+    use ide_db::{assists::AssistResolveStrategy, RootDatabase};
+    use test_fixture::WithFixture;
 
     use crate::tests::{
         check_assist, check_assist_by_label, check_assist_not_applicable, check_assist_target,
@@ -360,6 +355,49 @@ pub struct HashMap;
         check_auto_import_order(
             before,
             &["Import `collections::hash_map::HashMap`", "Import `foo::HashMap`"],
+        )
+    }
+
+    #[test]
+    fn prefer_workspace() {
+        let before = r"
+//- /main.rs crate:main deps:foo,bar
+HashMap$0::new();
+
+//- /lib.rs crate:foo
+pub mod module {
+    pub struct HashMap;
+}
+
+//- /lib.rs crate:bar library
+pub struct HashMap;
+        ";
+
+        check_auto_import_order(before, &["Import `foo::module::HashMap`", "Import `bar::HashMap`"])
+    }
+
+    #[test]
+    fn prefer_non_local_over_long_path() {
+        let before = r"
+//- /main.rs crate:main deps:foo,bar
+HashMap$0::new();
+
+//- /lib.rs crate:foo
+pub mod deeply {
+    pub mod nested {
+        pub mod module {
+            pub struct HashMap;
+        }
+    }
+}
+
+//- /lib.rs crate:bar library
+pub struct HashMap;
+        ";
+
+        check_auto_import_order(
+            before,
+            &["Import `bar::HashMap`", "Import `foo::deeply::nested::module::HashMap`"],
         )
     }
 
@@ -1549,6 +1587,139 @@ mod bar {
 }
 use foo::Foo$0;
 ",
+        );
+    }
+
+    #[test]
+    fn considers_pub_crate() {
+        check_assist(
+            auto_import,
+            r#"
+mod foo {
+    pub struct Foo;
+}
+
+pub(crate) use self::foo::*;
+
+mod bar {
+    fn main() {
+        Foo$0;
+    }
+}
+"#,
+            r#"
+mod foo {
+    pub struct Foo;
+}
+
+pub(crate) use self::foo::*;
+
+mod bar {
+    use crate::Foo;
+
+    fn main() {
+        Foo;
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn local_inline_import_has_alias() {
+        // FIXME wrong import
+        check_assist(
+            auto_import,
+            r#"
+struct S<T>(T);
+use S as IoResult;
+
+mod foo {
+    pub fn bar() -> S$0<()> {}
+}
+"#,
+            r#"
+struct S<T>(T);
+use S as IoResult;
+
+mod foo {
+    use crate::S;
+
+    pub fn bar() -> S<()> {}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn alias_local() {
+        // FIXME wrong import
+        check_assist(
+            auto_import,
+            r#"
+struct S<T>(T);
+use S as IoResult;
+
+mod foo {
+    pub fn bar() -> IoResult$0<()> {}
+}
+"#,
+            r#"
+struct S<T>(T);
+use S as IoResult;
+
+mod foo {
+    use crate::S;
+
+    pub fn bar() -> IoResult<()> {}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn preserve_raw_identifiers_strict() {
+        check_assist(
+            auto_import,
+            r"
+            r#as$0
+
+            pub mod ffi_mod {
+                pub fn r#as() {};
+            }
+            ",
+            r"
+            use ffi_mod::r#as;
+
+            r#as
+
+            pub mod ffi_mod {
+                pub fn r#as() {};
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn preserve_raw_identifiers_reserved() {
+        check_assist(
+            auto_import,
+            r"
+            r#abstract$0
+
+            pub mod ffi_mod {
+                pub fn r#abstract() {};
+            }
+            ",
+            r"
+            use ffi_mod::r#abstract;
+
+            r#abstract
+
+            pub mod ffi_mod {
+                pub fn r#abstract() {};
+            }
+            ",
         );
     }
 }

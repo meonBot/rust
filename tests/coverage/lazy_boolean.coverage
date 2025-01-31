@@ -1,5 +1,6 @@
    LL|       |#![allow(unused_assignments, unused_variables)]
    LL|       |
+   LL|       |#[rustfmt::skip]
    LL|      1|fn main() {
    LL|      1|    // Initialize test constants in a way that cannot be determined at compile time, to ensure
    LL|      1|    // rustc and LLVM cannot optimize out statements (or coverage counters) downstream from
@@ -12,7 +13,7 @@
    LL|      1|        b = 10;
    LL|      1|        c = 100;
    LL|      1|    }
-                   ^0
+                  ^0
    LL|       |    let
    LL|      1|        somebool
    LL|       |        =
@@ -32,7 +33,7 @@
                                           ^0
    LL|       |
    LL|       |    if
-   LL|       |        !
+   LL|      1|        !
    LL|      1|        is_true
    LL|      0|    {
    LL|      0|        a = 2

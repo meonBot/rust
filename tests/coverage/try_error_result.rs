@@ -1,5 +1,6 @@
 #![allow(unused_assignments)]
-// failure-status: 1
+#![cfg_attr(rustfmt, rustfmt::skip)]
+//@ failure-status: 1
 
 fn call(return_error: bool) -> Result<(), ()> {
     if return_error {

@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::{get_expr_use_or_unification_node, get_parent_node, path_def_id, path_to_local, path_to_local_id};
+use clippy_utils::{get_expr_use_or_unification_node, path_def_id, path_to_local, path_to_local_id};
 use core::cell::Cell;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::Applicability;
@@ -9,8 +9,8 @@ use rustc_hir::{Body, Expr, ExprKind, HirId, ImplItem, ImplItemKind, Node, PatKi
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{self, ConstKind, EarlyBinder, GenericArgKind, GenericArgsRef};
 use rustc_session::impl_lint_pass;
-use rustc_span::symbol::{kw, Ident};
 use rustc_span::Span;
+use rustc_span::symbol::{Ident, kw};
 use std::iter;
 
 declare_clippy_lint! {
@@ -153,7 +153,8 @@ impl Params {
             param.uses = Vec::new();
             let key = (param.fn_id, param.idx);
             self.by_fn.remove(&key);
-            self.by_id.remove(&id);
+            // FIXME(rust/#120456) - is `swap_remove` correct?
+            self.by_id.swap_remove(&id);
         }
     }
 
@@ -199,7 +200,7 @@ impl Params {
                 if self
                     .get_by_fn(param.fn_id, usage.idx)
                     // If the parameter can't be found, then it's used for more than just recursion.
-                    .map_or(true, |p| self.try_disable_lint_for_param(p, eval_stack))
+                    .is_none_or(|p| self.try_disable_lint_for_param(p, eval_stack))
                 {
                     param.apply_lint.set(false);
                     eval_stack.pop();
@@ -220,30 +221,29 @@ pub struct OnlyUsedInRecursion {
 }
 
 impl<'tcx> LateLintPass<'tcx> for OnlyUsedInRecursion {
-    fn check_body(&mut self, cx: &LateContext<'tcx>, body: &'tcx Body<'tcx>) {
+    fn check_body(&mut self, cx: &LateContext<'tcx>, body: &Body<'tcx>) {
         if body.value.span.from_expansion() {
             return;
         }
         // `skip_params` is either `0` or `1` to skip the `self` parameter in trait functions.
         // It can't be renamed, and it can't be removed without removing it from multiple functions.
-        let (fn_id, fn_kind, skip_params) = match get_parent_node(cx.tcx, body.value.hir_id) {
-            Some(Node::Item(i)) => (i.owner_id.to_def_id(), FnKind::Fn, 0),
-            Some(Node::TraitItem(&TraitItem {
+        let (fn_id, fn_kind, skip_params) = match cx.tcx.parent_hir_node(body.value.hir_id) {
+            Node::Item(i) => (i.owner_id.to_def_id(), FnKind::Fn, 0),
+            Node::TraitItem(&TraitItem {
                 kind: TraitItemKind::Fn(ref sig, _),
                 owner_id,
                 ..
-            })) => (
+            }) => (
                 owner_id.to_def_id(),
                 FnKind::TraitFn,
                 usize::from(sig.decl.implicit_self.has_implicit_self()),
             ),
-            Some(Node::ImplItem(&ImplItem {
+            Node::ImplItem(&ImplItem {
                 kind: ImplItemKind::Fn(ref sig, _),
                 owner_id,
                 ..
-            })) => {
-                #[allow(trivial_casts)]
-                if let Some(Node::Item(item)) = get_parent_node(cx.tcx, owner_id.into())
+            }) => {
+                if let Node::Item(item) = cx.tcx.parent_hir_node(owner_id.into())
                     && let Some(trait_ref) = cx
                         .tcx
                         .impl_trait_ref(item.owner_id)
@@ -252,7 +252,7 @@ impl<'tcx> LateLintPass<'tcx> for OnlyUsedInRecursion {
                 {
                     (
                         trait_item_id,
-                        FnKind::ImplTraitFn(cx.tcx.erase_regions(trait_ref.args) as *const _ as usize),
+                        FnKind::ImplTraitFn(std::ptr::from_ref(cx.tcx.erase_regions(trait_ref.args)) as usize),
                         usize::from(sig.decl.implicit_self.has_implicit_self()),
                     )
                 } else {
@@ -290,7 +290,7 @@ impl<'tcx> LateLintPass<'tcx> for OnlyUsedInRecursion {
                     Some((Node::Expr(parent), child_id)) => match parent.kind {
                         // Recursive call. Track which index the parameter is used in.
                         ExprKind::Call(callee, args)
-                            if path_def_id(cx, callee).map_or(false, |id| {
+                            if path_def_id(cx, callee).is_some_and(|id| {
                                 id == param.fn_id && has_matching_args(param.fn_kind, typeck.node_args(callee.hir_id))
                             }) =>
                         {
@@ -300,7 +300,7 @@ impl<'tcx> LateLintPass<'tcx> for OnlyUsedInRecursion {
                             return;
                         },
                         ExprKind::MethodCall(_, receiver, args, _)
-                            if typeck.type_dependent_def_id(parent.hir_id).map_or(false, |id| {
+                            if typeck.type_dependent_def_id(parent.hir_id).is_some_and(|id| {
                                 id == param.fn_id && has_matching_args(param.fn_kind, typeck.node_args(parent.hir_id))
                             }) =>
                         {
@@ -349,7 +349,7 @@ impl<'tcx> LateLintPass<'tcx> for OnlyUsedInRecursion {
         }
     }
 
-    fn check_body_post(&mut self, cx: &LateContext<'tcx>, body: &'tcx Body<'tcx>) {
+    fn check_body_post(&mut self, cx: &LateContext<'tcx>, body: &Body<'tcx>) {
         if self.entered_body == Some(body.value.hir_id) {
             self.entered_body = None;
             self.params.flag_for_linting();
@@ -390,7 +390,6 @@ fn has_matching_args(kind: FnKind, args: GenericArgsRef<'_>) -> bool {
             GenericArgKind::Type(ty) => matches!(*ty.kind(), ty::Param(ty) if ty.index as usize == idx),
             GenericArgKind::Const(c) => matches!(c.kind(), ConstKind::Param(c) if c.index as usize == idx),
         }),
-        #[allow(trivial_casts)]
-        FnKind::ImplTraitFn(expected_args) => args as *const _ as usize == expected_args,
+        FnKind::ImplTraitFn(expected_args) => std::ptr::from_ref(args) as usize == expected_args,
     }
 }

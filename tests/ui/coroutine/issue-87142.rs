@@ -1,5 +1,5 @@
-// compile-flags: -Cdebuginfo=2
-// build-pass
+//@ compile-flags: -Cdebuginfo=2
+//@ build-pass
 
 // Regression test for #87142
 // This test needs the above flags and the "lib" crate type.
@@ -22,6 +22,7 @@ pub struct Context<G: 'static + CoroutineProviderAlt> {
 impl CoroutineProviderAlt for () {
     type Coro = impl Coroutine<(), Return = (), Yield = ()>;
     fn start(ctx: Context<Self>) -> Self::Coro {
+        #[coroutine]
         move || {
             match ctx {
                 _ => (),

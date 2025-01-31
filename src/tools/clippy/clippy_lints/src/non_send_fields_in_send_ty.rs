@@ -1,3 +1,4 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::is_lint_allowed;
 use clippy_utils::source::snippet;
@@ -54,15 +55,14 @@ declare_clippy_lint! {
     "there is a field that is not safe to be sent to another thread in a `Send` struct"
 }
 
-#[derive(Copy, Clone)]
 pub struct NonSendFieldInSendTy {
     enable_raw_pointer_heuristic: bool,
 }
 
 impl NonSendFieldInSendTy {
-    pub fn new(enable_raw_pointer_heuristic: bool) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            enable_raw_pointer_heuristic,
+            enable_raw_pointer_heuristic: conf.enable_raw_pointer_heuristic_for_send,
         }
     }
 }
@@ -94,7 +94,6 @@ impl<'tcx> LateLintPass<'tcx> for NonSendFieldInSendTy {
         {
             let mut non_send_fields = Vec::new();
 
-            let hir_map = cx.tcx.hir();
             for variant in adt_def.variants() {
                 for field in &variant.fields {
                     if let Some(field_hir_id) = field
@@ -104,7 +103,7 @@ impl<'tcx> LateLintPass<'tcx> for NonSendFieldInSendTy {
                         && !is_lint_allowed(cx, NON_SEND_FIELDS_IN_SEND_TY, field_hir_id)
                         && let field_ty = field.ty(cx.tcx, impl_trait_args)
                         && !ty_allowed_in_send(cx, field_ty, send_trait)
-                        && let Node::Field(field_def) = hir_map.get(field_hir_id)
+                        && let Node::Field(field_def) = cx.tcx.hir_node(field_hir_id)
                     {
                         non_send_fields.push(NonSendField {
                             def: field_def,
@@ -120,7 +119,7 @@ impl<'tcx> LateLintPass<'tcx> for NonSendFieldInSendTy {
                     cx,
                     NON_SEND_FIELDS_IN_SEND_TY,
                     item.span,
-                    &format!(
+                    format!(
                         "some fields in `{}` are not safe to be sent to another thread",
                         snippet(cx, hir_impl.self_ty.span, "Unknown")
                     ),
@@ -160,7 +159,7 @@ struct NonSendField<'tcx> {
     generic_params: Vec<Ty<'tcx>>,
 }
 
-impl<'tcx> NonSendField<'tcx> {
+impl NonSendField<'_> {
     fn generic_params_string(&self) -> String {
         self.generic_params
             .iter()
@@ -220,7 +219,7 @@ fn ty_allowed_with_raw_pointer_heuristic<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'t
             }
         },
         // Raw pointers are `!Send` but allowed by the heuristic
-        ty::RawPtr(_) => true,
+        ty::RawPtr(_, _) => true,
         _ => false,
     }
 }
@@ -230,7 +229,7 @@ fn contains_pointer_like<'tcx>(cx: &LateContext<'tcx>, target_ty: Ty<'tcx>) -> b
     for ty_node in target_ty.walk() {
         if let GenericArgKind::Type(inner_ty) = ty_node.unpack() {
             match inner_ty.kind() {
-                ty::RawPtr(_) => {
+                ty::RawPtr(_, _) => {
                     return true;
                 },
                 ty::Adt(adt_def, _) => {

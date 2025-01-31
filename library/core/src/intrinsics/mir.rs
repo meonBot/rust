@@ -20,7 +20,7 @@
 //!
 //! #[custom_mir(dialect = "built")]
 //! pub fn simple(x: i32) -> i32 {
-//!     mir!(
+//!     mir! {
 //!         let temp2: i32;
 //!
 //!         {
@@ -33,7 +33,7 @@
 //!             RET = temp2;
 //!             Return()
 //!         }
-//!     )
+//!     }
 //! }
 //! ```
 //!
@@ -65,12 +65,13 @@
 //! ```rust
 //! #![feature(core_intrinsics, custom_mir)]
 //! #![allow(internal_features)]
+//! #![allow(unused_assignments)]
 //!
 //! use core::intrinsics::mir::*;
 //!
 //! #[custom_mir(dialect = "built")]
 //! pub fn choose_load(a: &i32, b: &i32, c: bool) -> i32 {
-//!     mir!(
+//!     mir! {
 //!         {
 //!             match c {
 //!                 true => t,
@@ -92,51 +93,53 @@
 //!             RET = *temp;
 //!             Return()
 //!         }
-//!     )
+//!     }
 //! }
 //!
 //! #[custom_mir(dialect = "built")]
 //! fn unwrap_unchecked<T>(opt: Option<T>) -> T {
-//!     mir!({
-//!         RET = Move(Field(Variant(opt, 1), 0));
-//!         Return()
-//!     })
+//!     mir! {
+//!         {
+//!             RET = Move(Field(Variant(opt, 1), 0));
+//!             Return()
+//!         }
+//!     }
 //! }
 //!
 //! #[custom_mir(dialect = "runtime", phase = "optimized")]
 //! fn push_and_pop<T>(v: &mut Vec<T>, value: T) {
-//!     mir!(
+//!     mir! {
 //!         let _unused;
 //!         let popped;
 //!
 //!         {
-//!             Call(_unused = Vec::push(v, value), pop, UnwindContinue())
+//!             Call(_unused = Vec::push(v, value), ReturnTo(pop), UnwindContinue())
 //!         }
 //!
 //!         pop = {
-//!             Call(popped = Vec::pop(v), drop, UnwindContinue())
+//!             Call(popped = Vec::pop(v), ReturnTo(drop), UnwindContinue())
 //!         }
 //!
 //!         drop = {
-//!             Drop(popped, ret, UnwindContinue())
+//!             Drop(popped, ReturnTo(ret), UnwindContinue())
 //!         }
 //!
 //!         ret = {
 //!             Return()
 //!         }
-//!     )
+//!     }
 //! }
 //!
 //! #[custom_mir(dialect = "runtime", phase = "optimized")]
 //! fn annotated_return_type() -> (i32, bool) {
-//!     mir!(
+//!     mir! {
 //!         type RET = (i32, bool);
 //!         {
 //!             RET.0 = 1;
 //!             RET.1 = true;
 //!             Return()
 //!         }
-//!     )
+//!     }
 //! }
 //! ```
 //!
@@ -151,7 +154,7 @@
 //!
 //! #[custom_mir(dialect = "built")]
 //! fn borrow_error(should_init: bool) -> i32 {
-//!     mir!(
+//!     mir! {
 //!         let temp: i32;
 //!
 //!         {
@@ -170,7 +173,7 @@
 //!             RET = temp;
 //!             Return()
 //!         }
-//!     )
+//!     }
 //! }
 //! ```
 //!
@@ -178,7 +181,7 @@
 //! error[E0381]: used binding is possibly-uninitialized
 //!   --> test.rs:24:13
 //!    |
-//! 8  | /     mir!(
+//! 8  | /     mir! {
 //! 9  | |         let temp: i32;
 //! 10 | |
 //! 11 | |         {
@@ -190,7 +193,7 @@
 //!    | |             ^^^^^^^^^^ value used here but it is possibly-uninitialized
 //! 25 | |             Return()
 //! 26 | |         }
-//! 27 | |     )
+//! 27 | |     }
 //!    | |_____- binding declared here but left uninitialized
 //!
 //! error: aborting due to 1 previous error
@@ -210,7 +213,7 @@
 //!  - All other locals need to be declared with `let` somewhere and then can be accessed by name.
 //!
 //! #### Places
-//!  - Locals implicit convert to places.
+//!  - Locals implicitly convert to places.
 //!  - Field accesses, derefs, and indexing work normally.
 //!  - Fields in variants can be accessed via the [`Variant`] and [`Field`] associated functions,
 //!    see their documentation for details.
@@ -242,9 +245,43 @@
 //!  - `match some_int_operand` becomes a `SwitchInt`. Each arm should be `literal => basic_block`
 //!     - The exception is the last arm, which must be `_ => basic_block` and corresponds to the
 //!       otherwise branch.
-//!  - [`Call`] has an associated function as well. The third argument of this function is a normal
-//!    function call expression, for example `my_other_function(a, 5)`.
+//!  - [`Call`] has an associated function as well, with special syntax:
+//!    `Call(ret_val = function(arg1, arg2, ...), ReturnTo(next_block), UnwindContinue())`.
+//!  - [`TailCall`] does not have a return destination or next block, so its syntax is just
+//!    `TailCall(function(arg1, arg2, ...))`.
 //!
+//! #### Debuginfo
+//!
+//! Debuginfo associates source code variable names (of variables that may not exist any more) with
+//! MIR expressions that indicate where the value of that variable is stored. The syntax to do so
+//! is:
+//! ```text
+//! debug source_var_name => expression;
+//! ```
+//! Both places and constants are supported in the `expression`.
+//!
+//! ```rust
+//! #![allow(internal_features)]
+//! #![feature(core_intrinsics, custom_mir)]
+//!
+//! use core::intrinsics::mir::*;
+//!
+//! #[custom_mir(dialect = "built")]
+//! fn debuginfo(arg: Option<&i32>) {
+//!     mir!(
+//!         // Debuginfo for a source variable `plain_local` that just duplicates `arg`.
+//!         debug plain_local => arg;
+//!         // Debuginfo for a source variable `projection` that can be computed by dereferencing
+//!         // a field of `arg`.
+//!         debug projection => *Field::<&i32>(Variant(arg, 1), 0);
+//!         // Debuginfo for a source variable `constant` that always holds the value `5`.
+//!         debug constant => 5_usize;
+//!         {
+//!             Return()
+//!         }
+//!     )
+//! }
+//! ```
 
 #![unstable(
     feature = "custom_mir",
@@ -274,8 +311,7 @@ pub enum UnwindTerminateReason {
     InCleanup,
 }
 
-pub use UnwindTerminateReason::Abi as ReasonAbi;
-pub use UnwindTerminateReason::InCleanup as ReasonInCleanup;
+pub use UnwindTerminateReason::{Abi as ReasonAbi, InCleanup as ReasonInCleanup};
 
 macro_rules! define {
     ($name:literal, $( #[ $meta:meta ] )* fn $($sig:tt)*) => {
@@ -287,35 +323,74 @@ macro_rules! define {
 }
 
 // Unwind actions
+pub struct UnwindActionArg;
 define!(
     "mir_unwind_continue",
     /// An unwind action that continues unwinding.
-    fn UnwindContinue()
+    fn UnwindContinue() -> UnwindActionArg
 );
 define!(
     "mir_unwind_unreachable",
-    /// An unwind action that triggers undefined behaviour.
-    fn UnwindUnreachable() -> BasicBlock
+    /// An unwind action that triggers undefined behavior.
+    fn UnwindUnreachable() -> UnwindActionArg
 );
 define!(
     "mir_unwind_terminate",
     /// An unwind action that terminates the execution.
     ///
     /// `UnwindTerminate` can also be used as a terminator.
-    fn UnwindTerminate(reason: UnwindTerminateReason)
+    fn UnwindTerminate(reason: UnwindTerminateReason) -> UnwindActionArg
 );
 define!(
     "mir_unwind_cleanup",
-    /// An unwind action that continues execution in a given basic blok.
-    fn UnwindCleanup(goto: BasicBlock)
+    /// An unwind action that continues execution in a given basic block.
+    fn UnwindCleanup(goto: BasicBlock) -> UnwindActionArg
 );
+
+// Return destination for `Call`
+pub struct ReturnToArg;
+define!("mir_return_to", fn ReturnTo(goto: BasicBlock) -> ReturnToArg);
 
 // Terminators
 define!("mir_return", fn Return() -> BasicBlock);
 define!("mir_goto", fn Goto(destination: BasicBlock) -> BasicBlock);
 define!("mir_unreachable", fn Unreachable() -> BasicBlock);
-define!("mir_drop", fn Drop<T, U>(place: T, goto: BasicBlock, unwind_action: U));
-define!("mir_call", fn Call<U>(call: (), goto: BasicBlock, unwind_action: U));
+define!("mir_drop",
+    /// Drop the contents of a place.
+    ///
+    /// The first argument must be a place.
+    ///
+    /// The second argument must be of the form `ReturnTo(bb)`, where `bb` is the basic block that
+    /// will be jumped to after the destructor returns.
+    ///
+    /// The third argument describes what happens on unwind. It can be one of:
+    /// - [`UnwindContinue`]
+    /// - [`UnwindUnreachable`]
+    /// - [`UnwindTerminate`]
+    /// - [`UnwindCleanup`]
+    fn Drop<T>(place: T, goto: ReturnToArg, unwind_action: UnwindActionArg)
+);
+define!("mir_call",
+    /// Call a function.
+    ///
+    /// The first argument must be of the form `ret_val = fun(arg1, arg2, ...)`.
+    ///
+    /// The second argument must be of the form `ReturnTo(bb)`, where `bb` is the basic block that
+    /// will be jumped to after the function returns.
+    ///
+    /// The third argument describes what happens on unwind. It can be one of:
+    /// - [`UnwindContinue`]
+    /// - [`UnwindUnreachable`]
+    /// - [`UnwindTerminate`]
+    /// - [`UnwindCleanup`]
+    fn Call(call: (), goto: ReturnToArg, unwind_action: UnwindActionArg)
+);
+define!("mir_tail_call",
+    /// Call a function.
+    ///
+    /// The argument must be of the form `fun(arg1, arg2, ...)`.
+    fn TailCall<T>(call: T)
+);
 define!("mir_unwind_resume",
     /// A terminator that resumes the unwinding.
     fn UnwindResume()
@@ -323,9 +398,14 @@ define!("mir_unwind_resume",
 
 define!("mir_storage_live", fn StorageLive<T>(local: T));
 define!("mir_storage_dead", fn StorageDead<T>(local: T));
+define!("mir_assume", fn Assume(operand: bool));
 define!("mir_deinit", fn Deinit<T>(place: T));
 define!("mir_checked", fn Checked<T>(binop: T) -> (T, bool));
 define!("mir_len", fn Len<T>(place: T) -> usize);
+define!(
+    "mir_ptr_metadata",
+    fn PtrMetadata<P: ?Sized>(place: *const P) -> <P as ::core::ptr::Pointee>::Metadata
+);
 define!("mir_copy_for_deref", fn CopyForDeref<T>(place: T) -> T);
 define!("mir_retag", fn Retag<T>(place: T));
 define!("mir_move", fn Move<T>(place: T) -> T);
@@ -369,18 +449,22 @@ define!(
     ///
     /// #[custom_mir(dialect = "built")]
     /// fn unwrap_deref(opt: Option<&i32>) -> i32 {
-    ///     mir!({
-    ///         RET = *Field::<&i32>(Variant(opt, 1), 0);
-    ///         Return()
-    ///     })
+    ///     mir! {
+    ///         {
+    ///             RET = *Field::<&i32>(Variant(opt, 1), 0);
+    ///             Return()
+    ///         }
+    ///     }
     /// }
     ///
     /// #[custom_mir(dialect = "built")]
     /// fn set(opt: &mut Option<i32>) {
-    ///     mir!({
-    ///         place!(Field(Variant(*opt, 1), 0)) = 5;
-    ///         Return()
-    ///     })
+    ///     mir! {
+    ///         {
+    ///             place!(Field(Variant(*opt, 1), 0)) = 5;
+    ///             Return()
+    ///         }
+    ///     }
     /// }
     /// ```
     fn Field<F>(place: (), field: u32) -> F
@@ -401,6 +485,13 @@ define!(
     fn CastTransmute<T, U>(operand: T) -> U
 );
 define!(
+    "mir_cast_ptr_to_ptr",
+    /// Emits a `CastKind::PtrToPtr` cast.
+    ///
+    /// This allows bypassing normal validation to generate strange casts.
+    fn CastPtrToPtr<T, U>(operand: T) -> U
+);
+define!(
     "mir_make_place",
     #[doc(hidden)]
     fn __internal_make_place<T>(place: T) -> *mut T
@@ -417,7 +508,7 @@ define!(
 /// your MIR into something that is easier to parse in the compiler.
 #[rustc_macro_transparency = "transparent"]
 pub macro mir {
-    (
+    {
         $(type RET = $ret_ty:ty ;)?
         $(let $local_decl:ident $(: $local_decl_ty:ty)? ;)*
         $(debug $dbg_name:ident => $dbg_data:expr ;)*
@@ -431,7 +522,7 @@ pub macro mir {
                 $($block:tt)*
             }
         )*
-    ) => {{
+    } => {{
         // First, we declare all basic blocks.
         __internal_declare_basic_blocks!($(
             $block_name $(($block_cleanup))?

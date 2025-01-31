@@ -1,8 +1,8 @@
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
-use clippy_utils::macros::{is_panic, root_macro_call};
+use clippy_utils::macros::{is_panic, matching_root_macro_call, root_macro_call};
 use clippy_utils::source::{indent_of, reindent_multiline, snippet};
 use clippy_utils::ty::is_type_diagnostic_item;
-use clippy_utils::{higher, is_trait_method, path_to_local_id, peel_blocks, SpanlessEq};
+use clippy_utils::{SpanlessEq, higher, is_trait_method, path_to_local_id, peel_blocks};
 use hir::{Body, HirId, MatchSource, Pat};
 use rustc_errors::Applicability;
 use rustc_hir as hir;
@@ -10,28 +10,28 @@ use rustc_hir::def::Res;
 use rustc_hir::{Closure, Expr, ExprKind, PatKind, PathSegment, QPath, UnOp};
 use rustc_lint::LateContext;
 use rustc_middle::ty::adjustment::Adjust;
-use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::Span;
+use rustc_span::symbol::{Ident, Symbol, sym};
 use std::borrow::Cow;
 
-use super::{MANUAL_FILTER_MAP, MANUAL_FIND_MAP, OPTION_FILTER_MAP};
+use super::{MANUAL_FILTER_MAP, MANUAL_FIND_MAP, OPTION_FILTER_MAP, RESULT_FILTER_MAP};
 
-fn is_method(cx: &LateContext<'_>, expr: &hir::Expr<'_>, method_name: Symbol) -> bool {
+fn is_method(cx: &LateContext<'_>, expr: &Expr<'_>, method_name: Symbol) -> bool {
     match &expr.kind {
-        hir::ExprKind::Path(QPath::TypeRelative(_, mname)) => mname.ident.name == method_name,
-        hir::ExprKind::Path(QPath::Resolved(_, segments)) => {
-            segments.segments.last().unwrap().ident.name == method_name
-        },
-        hir::ExprKind::Closure(&hir::Closure { body, .. }) => {
-            let body = cx.tcx.hir().body(body);
+        ExprKind::Path(QPath::TypeRelative(_, mname)) => mname.ident.name == method_name,
+        ExprKind::Path(QPath::Resolved(_, segments)) => segments.segments.last().unwrap().ident.name == method_name,
+        ExprKind::MethodCall(segment, _, _, _) => segment.ident.name == method_name,
+        ExprKind::Closure(Closure { body, .. }) => {
+            let body = cx.tcx.hir().body(*body);
             let closure_expr = peel_blocks(body.value);
-            let arg_id = body.params[0].pat.hir_id;
             match closure_expr.kind {
-                hir::ExprKind::MethodCall(hir::PathSegment { ident, .. }, receiver, ..) => {
+                ExprKind::MethodCall(PathSegment { ident, .. }, receiver, ..) => {
                     if ident.name == method_name
-                        && let hir::ExprKind::Path(path) = &receiver.kind
+                        && let ExprKind::Path(path) = &receiver.kind
                         && let Res::Local(ref local) = cx.qpath_res(path, receiver.hir_id)
+                        && !body.params.is_empty()
                     {
+                        let arg_id = body.params[0].pat.hir_id;
                         return arg_id == *local;
                     }
                     false
@@ -43,8 +43,11 @@ fn is_method(cx: &LateContext<'_>, expr: &hir::Expr<'_>, method_name: Symbol) ->
     }
 }
 
-fn is_option_filter_map(cx: &LateContext<'_>, filter_arg: &hir::Expr<'_>, map_arg: &hir::Expr<'_>) -> bool {
+fn is_option_filter_map(cx: &LateContext<'_>, filter_arg: &Expr<'_>, map_arg: &Expr<'_>) -> bool {
     is_method(cx, map_arg, sym::unwrap) && is_method(cx, filter_arg, sym!(is_some))
+}
+fn is_ok_filter_map(cx: &LateContext<'_>, filter_arg: &Expr<'_>, map_arg: &Expr<'_>) -> bool {
+    is_method(cx, map_arg, sym::unwrap) && is_method(cx, filter_arg, sym!(is_ok))
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -70,7 +73,7 @@ enum OffendingFilterExpr<'tcx> {
     },
     /// `.filter(|enum| matches!(enum, Enum::A(_)))`
     Matches {
-        /// The DefId of the variant being matched
+        /// The `DefId` of the variant being matched
         variant_def_id: hir::def_id::DefId,
     },
 }
@@ -186,7 +189,7 @@ impl<'tcx> OffendingFilterExpr<'tcx> {
                     match higher::IfLetOrMatch::parse(cx, map_body.value) {
                         // For `if let` we want to check that the variant matching arm references the local created by
                         // its pattern
-                        Some(higher::IfLetOrMatch::IfLet(sc, pat, then, Some(else_)))
+                        Some(higher::IfLetOrMatch::IfLet(sc, pat, then, Some(else_), ..))
                             if let Some((ident, span)) = expr_uses_local(pat, then) =>
                         {
                             (sc, else_, ident, span)
@@ -231,12 +234,12 @@ impl<'tcx> OffendingFilterExpr<'tcx> {
             // the latter only calls `effect` once
             let side_effect_expr_span = receiver.can_have_side_effects().then_some(receiver.span);
 
-            if cx.tcx.is_diagnostic_item(sym::Option, recv_ty.did()) && path.ident.name == sym!(is_some) {
+            if cx.tcx.is_diagnostic_item(sym::Option, recv_ty.did()) && path.ident.name.as_str() == "is_some" {
                 Some(Self::IsSome {
                     receiver,
                     side_effect_expr_span,
                 })
-            } else if cx.tcx.is_diagnostic_item(sym::Result, recv_ty.did()) && path.ident.name == sym!(is_ok) {
+            } else if cx.tcx.is_diagnostic_item(sym::Result, recv_ty.did()) && path.ident.name.as_str() == "is_ok" {
                 Some(Self::IsOk {
                     receiver,
                     side_effect_expr_span,
@@ -244,8 +247,7 @@ impl<'tcx> OffendingFilterExpr<'tcx> {
             } else {
                 None
             }
-        } else if let Some(macro_call) = root_macro_call(expr.span)
-            && cx.tcx.get_diagnostic_name(macro_call.def_id) == Some(sym::matches_macro)
+        } else if matching_root_macro_call(cx, expr.span, sym::matches_macro).is_some()
             // we know for a fact that the wildcard pattern is the second arm
             && let ExprKind::Match(scrutinee, [arm, _], _) = expr.kind
             && path_to_local_id(scrutinee, filter_param_id)
@@ -262,10 +264,10 @@ impl<'tcx> OffendingFilterExpr<'tcx> {
 /// is `filter(|x| x.is_some()).map(|x| x.unwrap())`
 fn is_filter_some_map_unwrap(
     cx: &LateContext<'_>,
-    expr: &hir::Expr<'_>,
-    filter_recv: &hir::Expr<'_>,
-    filter_arg: &hir::Expr<'_>,
-    map_arg: &hir::Expr<'_>,
+    expr: &Expr<'_>,
+    filter_recv: &Expr<'_>,
+    filter_arg: &Expr<'_>,
+    map_arg: &Expr<'_>,
 ) -> bool {
     let iterator = is_trait_method(cx, expr, sym::Iterator);
     let option = is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(filter_recv), sym::Option);
@@ -273,16 +275,23 @@ fn is_filter_some_map_unwrap(
     (iterator || option) && is_option_filter_map(cx, filter_arg, map_arg)
 }
 
+/// is `filter(|x| x.is_ok()).map(|x| x.unwrap())`
+fn is_filter_ok_map_unwrap(cx: &LateContext<'_>, expr: &Expr<'_>, filter_arg: &Expr<'_>, map_arg: &Expr<'_>) -> bool {
+    // result has no filter, so we only check for iterators
+    let iterator = is_trait_method(cx, expr, sym::Iterator);
+    iterator && is_ok_filter_map(cx, filter_arg, map_arg)
+}
+
 /// lint use of `filter().map()` or `find().map()` for `Iterators`
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check(
     cx: &LateContext<'_>,
-    expr: &hir::Expr<'_>,
-    filter_recv: &hir::Expr<'_>,
-    filter_arg: &hir::Expr<'_>,
+    expr: &Expr<'_>,
+    filter_recv: &Expr<'_>,
+    filter_arg: &Expr<'_>,
     filter_span: Span,
-    map_recv: &hir::Expr<'_>,
-    map_arg: &hir::Expr<'_>,
+    map_recv: &Expr<'_>,
+    map_arg: &Expr<'_>,
     map_span: Span,
     is_find: bool,
 ) {
@@ -300,30 +309,21 @@ pub(super) fn check(
         return;
     }
 
-    if is_trait_method(cx, map_recv, sym::Iterator)
+    if is_filter_ok_map_unwrap(cx, expr, filter_arg, map_arg) {
+        span_lint_and_sugg(
+            cx,
+            RESULT_FILTER_MAP,
+            filter_span.with_hi(expr.span.hi()),
+            "`filter` for `Ok` followed by `unwrap`",
+            "consider using `flatten` instead",
+            reindent_multiline(Cow::Borrowed("flatten()"), true, indent_of(cx, map_span)).into_owned(),
+            Applicability::MachineApplicable,
+        );
 
-        // filter(|x| ...is_some())...
-        && let ExprKind::Closure(&Closure { body: filter_body_id, .. }) = filter_arg.kind
-        && let filter_body = cx.tcx.hir().body(filter_body_id)
-        && let [filter_param] = filter_body.params
-        // optional ref pattern: `filter(|&x| ..)`
-        && let (filter_pat, is_filter_param_ref) = if let PatKind::Ref(ref_pat, _) = filter_param.pat.kind {
-            (ref_pat, true)
-        } else {
-            (filter_param.pat, false)
-        }
+        return;
+    }
 
-        && let PatKind::Binding(_, filter_param_id, _, None) = filter_pat.kind
-        && let Some(mut offending_expr) = OffendingFilterExpr::hir(cx, filter_body.value, filter_param_id)
-
-        && let ExprKind::Closure(&Closure { body: map_body_id, .. }) = map_arg.kind
-        && let map_body = cx.tcx.hir().body(map_body_id)
-        && let [map_param] = map_body.params
-        && let PatKind::Binding(_, map_param_id, map_param_ident, None) = map_param.pat.kind
-
-        && let Some(check_result) =
-            offending_expr.check_map_call(cx, map_body, map_param_id, filter_param_id, is_filter_param_ref)
-    {
+    if let Some((map_param_ident, check_result)) = is_find_or_filter(cx, map_recv, filter_arg, map_arg) {
         let span = filter_span.with_hi(expr.span.hi());
         let (filter_name, lint) = if is_find {
             ("find", MANUAL_FIND_MAP)
@@ -385,7 +385,7 @@ pub(super) fn check(
                 )
             },
         };
-        span_lint_and_then(cx, lint, span, &msg, |diag| {
+        span_lint_and_then(cx, lint, span, msg, |diag| {
             diag.span_suggestion(span, "try", sugg, applicability);
 
             if let Some((note, span)) = note_and_span {
@@ -393,6 +393,40 @@ pub(super) fn check(
             }
         });
     }
+}
+
+fn is_find_or_filter<'a>(
+    cx: &LateContext<'a>,
+    map_recv: &Expr<'_>,
+    filter_arg: &Expr<'_>,
+    map_arg: &Expr<'_>,
+) -> Option<(Ident, CheckResult<'a>)> {
+    if is_trait_method(cx, map_recv, sym::Iterator)
+        // filter(|x| ...is_some())...
+        && let ExprKind::Closure(&Closure { body: filter_body_id, .. }) = filter_arg.kind
+        && let filter_body = cx.tcx.hir().body(filter_body_id)
+        && let [filter_param] = filter_body.params
+        // optional ref pattern: `filter(|&x| ..)`
+        && let (filter_pat, is_filter_param_ref) = if let PatKind::Ref(ref_pat, _) = filter_param.pat.kind {
+            (ref_pat, true)
+        } else {
+            (filter_param.pat, false)
+        }
+
+        && let PatKind::Binding(_, filter_param_id, _, None) = filter_pat.kind
+        && let Some(mut offending_expr) = OffendingFilterExpr::hir(cx, filter_body.value, filter_param_id)
+
+        && let ExprKind::Closure(&Closure { body: map_body_id, .. }) = map_arg.kind
+        && let map_body = cx.tcx.hir().body(map_body_id)
+        && let [map_param] = map_body.params
+        && let PatKind::Binding(_, map_param_id, map_param_ident, None) = map_param.pat.kind
+
+        && let Some(check_result) =
+            offending_expr.check_map_call(cx, map_body, map_param_id, filter_param_id, is_filter_param_ref)
+    {
+        return Some((map_param_ident, check_result));
+    }
+    None
 }
 
 fn acceptable_methods(method: &PathSegment<'_>) -> bool {

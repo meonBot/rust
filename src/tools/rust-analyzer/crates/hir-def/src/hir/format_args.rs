@@ -1,11 +1,14 @@
 //! Parses `format_args` input.
-use std::mem;
 
+use either::Either;
 use hir_expand::name::Name;
-use rustc_dependencies::parse_format as parse;
+use intern::Symbol;
+use rustc_parse_format as parse;
+use span::SyntaxContextId;
+use stdx::TupleExt;
 use syntax::{
     ast::{self, IsString},
-    AstToken, SmolStr, TextRange,
+    TextRange,
 };
 
 use crate::hir::ExprId;
@@ -14,6 +17,7 @@ use crate::hir::ExprId;
 pub struct FormatArgs {
     pub template: Box<[FormatArgsPiece]>,
     pub arguments: FormatArguments,
+    pub orphans: Vec<ExprId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,11 +30,11 @@ pub struct FormatArguments {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatArgsPiece {
-    Literal(Box<str>),
+    Literal(Symbol),
     Placeholder(FormatPlaceholder),
 }
 
-#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatPlaceholder {
     /// Index into [`FormatArgs::arguments`].
     pub argument: FormatArgPosition,
@@ -42,11 +46,11 @@ pub struct FormatPlaceholder {
     pub format_options: FormatOptions,
 }
 
-#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatArgPosition {
     /// Which argument this position refers to (Ok),
     /// or would've referred to if it existed (Err).
-    pub index: Result<usize, usize>,
+    pub index: Result<usize, Either<usize, Name>>,
     /// What kind of position this is. See [`FormatArgPositionKind`].
     pub kind: FormatArgPositionKind,
     /// The span of the name or number.
@@ -85,7 +89,7 @@ pub enum FormatTrait {
     UpperHex,
 }
 
-#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct FormatOptions {
     /// The width. E.g. `{:5}` or `{:width$}`.
     pub width: Option<FormatCount>,
@@ -130,7 +134,7 @@ pub enum FormatAlignment {
     Center,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormatCount {
     /// `{:5}` or `{:.5}`
     Literal(usize),
@@ -164,23 +168,33 @@ enum PositionUsedAs {
 }
 use PositionUsedAs::*;
 
+#[allow(clippy::unnecessary_lazy_evaluations)]
 pub(crate) fn parse(
     s: &ast::String,
     fmt_snippet: Option<String>,
     mut args: FormatArgumentsCollector,
     is_direct_literal: bool,
-    mut synth: impl FnMut(Name) -> ExprId,
+    mut synth: impl FnMut(Name, Option<TextRange>) -> ExprId,
+    mut record_usage: impl FnMut(Name, Option<TextRange>),
+    call_ctx: SyntaxContextId,
 ) -> FormatArgs {
-    let text = s.text();
+    let Ok(text) = s.value() else {
+        return FormatArgs {
+            template: Default::default(),
+            arguments: args.finish(),
+            orphans: vec![],
+        };
+    };
     let str_style = match s.quote_offsets() {
         Some(offsets) => {
-            let raw = u32::from(offsets.quotes.0.len()) - 1;
-            (raw != 0).then_some(raw as usize)
+            let raw = usize::from(offsets.quotes.0.len()) - 1;
+            // subtract 1 for the `r` prefix
+            (raw != 0).then(|| raw - 1)
         }
         None => None,
     };
     let mut parser =
-        parse::Parser::new(text, str_style, fmt_snippet, false, parse::ParseMode::Format);
+        parse::Parser::new(&text, str_style, fmt_snippet, false, parse::ParseMode::Format);
 
     let mut pieces = Vec::new();
     while let Some(piece) = parser.next() {
@@ -193,7 +207,11 @@ pub(crate) fn parse(
     let is_source_literal = parser.is_source_literal;
     if !parser.errors.is_empty() {
         // FIXME: Diagnose
-        return FormatArgs { template: Default::default(), arguments: args.finish() };
+        return FormatArgs {
+            template: Default::default(),
+            arguments: args.finish(),
+            orphans: vec![],
+        };
     }
 
     let to_span = |inner_span: parse::InnerSpan| {
@@ -204,7 +222,7 @@ pub(crate) fn parse(
 
     let mut used = vec![false; args.explicit_args().len()];
     let mut invalid_refs = Vec::new();
-    let mut numeric_refences_to_named_arg = Vec::new();
+    let mut numeric_references_to_named_arg = Vec::new();
 
     enum ArgRef<'a> {
         Index(usize),
@@ -221,18 +239,19 @@ pub(crate) fn parse(
                     used[index] = true;
                     if arg.kind.ident().is_some() {
                         // This was a named argument, but it was used as a positional argument.
-                        numeric_refences_to_named_arg.push((index, span, used_as));
+                        numeric_references_to_named_arg.push((index, span, used_as));
                     }
                     Ok(index)
                 } else {
                     // Doesn't exist as an explicit argument.
-                    invalid_refs.push((index, span, used_as, kind));
-                    Err(index)
+                    invalid_refs.push((Either::Left(index), span, used_as, kind));
+                    Err(Either::Left(index))
                 }
             }
-            ArgRef::Name(name, _span) => {
-                let name = Name::new_text_dont_use(SmolStr::new(name));
+            ArgRef::Name(name, span) => {
+                let name = Name::new(name, call_ctx);
                 if let Some((index, _)) = args.by_name(&name) {
+                    record_usage(name, span);
                     // Name found in `args`, so we resolve it to its index.
                     if index < args.explicit_args().len() {
                         // Mark it as used, if it was an explicit argument.
@@ -245,13 +264,17 @@ pub(crate) fn parse(
                         // For the moment capturing variables from format strings expanded from macros is
                         // disabled (see RFC #2795)
                         // FIXME: Diagnose
+                        invalid_refs.push((Either::Right(name.clone()), span, used_as, kind));
+                        Err(Either::Right(name))
+                    } else {
+                        record_usage(name.clone(), span);
+                        Ok(args.add(FormatArgument {
+                            kind: FormatArgumentKind::Captured(name.clone()),
+                            // FIXME: This is problematic, we might want to synthesize a dummy
+                            // expression proper and/or desugar these.
+                            expr: synth(name, span),
+                        }))
                     }
-                    Ok(args.add(FormatArgument {
-                        kind: FormatArgumentKind::Captured(name.clone()),
-                        // FIXME: This is problematic, we might want to synthesize a dummy
-                        // expression proper and/or desugar these.
-                        expr: synth(name),
-                    }))
                 }
             }
         };
@@ -264,15 +287,14 @@ pub(crate) fn parse(
 
     for piece in pieces {
         match piece {
-            parse::Piece::String(s) => {
+            parse::Piece::Lit(s) => {
                 unfinished_literal.push_str(s);
             }
             parse::Piece::NextArgument(arg) => {
                 let parse::Argument { position, position_span, format } = *arg;
                 if !unfinished_literal.is_empty() {
-                    template.push(FormatArgsPiece::Literal(
-                        mem::take(&mut unfinished_literal).into_boxed_str(),
-                    ));
+                    template.push(FormatArgsPiece::Literal(Symbol::intern(&unfinished_literal)));
+                    unfinished_literal.clear();
                 }
 
                 let span = parser.arg_places.get(placeholder_index).and_then(|&s| to_span(s));
@@ -392,7 +414,7 @@ pub(crate) fn parse(
     }
 
     if !unfinished_literal.is_empty() {
-        template.push(FormatArgsPiece::Literal(unfinished_literal.into_boxed_str()));
+        template.push(FormatArgsPiece::Literal(Symbol::intern(&unfinished_literal)));
     }
 
     if !invalid_refs.is_empty() {
@@ -413,10 +435,14 @@ pub(crate) fn parse(
         // FIXME: Diagnose
     }
 
-    FormatArgs { template: template.into_boxed_slice(), arguments: args.finish() }
+    FormatArgs {
+        template: template.into_boxed_slice(),
+        arguments: args.finish(),
+        orphans: unused.into_iter().map(TupleExt::head).collect(),
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FormatArgumentsCollector {
     arguments: Vec<FormatArgument>,
     num_unnamed_args: usize,
@@ -435,7 +461,7 @@ impl FormatArgumentsCollector {
     }
 
     pub fn new() -> Self {
-        Self { arguments: vec![], names: vec![], num_unnamed_args: 0, num_explicit_args: 0 }
+        Default::default()
     }
 
     pub fn add(&mut self, arg: FormatArgument) -> usize {

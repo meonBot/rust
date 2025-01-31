@@ -1,13 +1,17 @@
 //! Suggests shortening `Foo { field: field }` to `Foo { field }` in both
 //! expressions and patterns.
 
-use ide_db::{base_db::FileId, source_change::SourceChange};
+use ide_db::text_edit::TextEdit;
+use ide_db::{source_change::SourceChange, EditionedFileId, FileRange};
 use syntax::{ast, match_ast, AstNode, SyntaxNode};
-use text_edit::TextEdit;
 
 use crate::{fix, Diagnostic, DiagnosticCode};
 
-pub(crate) fn field_shorthand(acc: &mut Vec<Diagnostic>, file_id: FileId, node: &SyntaxNode) {
+pub(crate) fn field_shorthand(
+    acc: &mut Vec<Diagnostic>,
+    file_id: EditionedFileId,
+    node: &SyntaxNode,
+) {
     match_ast! {
         match node {
             ast::RecordExpr(it) => check_expr_field_shorthand(acc, file_id, it),
@@ -19,7 +23,7 @@ pub(crate) fn field_shorthand(acc: &mut Vec<Diagnostic>, file_id: FileId, node: 
 
 fn check_expr_field_shorthand(
     acc: &mut Vec<Diagnostic>,
-    file_id: FileId,
+    file_id: EditionedFileId,
     record_expr: ast::RecordExpr,
 ) {
     let record_field_list = match record_expr.record_expr_field_list() {
@@ -49,7 +53,7 @@ fn check_expr_field_shorthand(
             Diagnostic::new(
                 DiagnosticCode::Clippy("redundant_field_names"),
                 "Shorthand struct initialization",
-                field_range,
+                FileRange { file_id: file_id.into(), range: field_range },
             )
             .with_fixes(Some(vec![fix(
                 "use_expr_field_shorthand",
@@ -63,7 +67,7 @@ fn check_expr_field_shorthand(
 
 fn check_pat_field_shorthand(
     acc: &mut Vec<Diagnostic>,
-    file_id: FileId,
+    file_id: EditionedFileId,
     record_pat: ast::RecordPat,
 ) {
     let record_pat_field_list = match record_pat.record_pat_field_list() {
@@ -93,7 +97,7 @@ fn check_pat_field_shorthand(
             Diagnostic::new(
                 DiagnosticCode::Clippy("redundant_field_names"),
                 "Shorthand struct pattern",
-                field_range,
+                FileRange { file_id: file_id.into(), range: field_range },
             )
             .with_fixes(Some(vec![fix(
                 "use_pat_field_shorthand",

@@ -1,8 +1,9 @@
 //! Errors emitted by symbol_mangling.
 
-use rustc_errors::{ErrorGuaranteed, IntoDiagnostic};
-use rustc_span::Span;
 use std::fmt;
+
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level};
+use rustc_span::Span;
 
 pub struct TestOutput {
     pub span: Span,
@@ -13,17 +14,12 @@ pub struct TestOutput {
 // This diagnostic doesn't need translation because (a) it doesn't contain any
 // natural language, and (b) it's only used in tests. So we construct it
 // manually and avoid the fluent machinery.
-impl IntoDiagnostic<'_> for TestOutput {
-    fn into_diagnostic(
-        self,
-        handler: &'_ rustc_errors::Handler,
-    ) -> rustc_errors::DiagnosticBuilder<'_, ErrorGuaranteed> {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for TestOutput {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
         let TestOutput { span, kind, content } = self;
 
         #[allow(rustc::untranslatable_diagnostic)]
-        let mut diag = handler.struct_err(format!("{kind}({content})"));
-        diag.set_span(span);
-        diag
+        Diag::new(dcx, level, format!("{kind}({content})")).with_span(span)
     }
 }
 

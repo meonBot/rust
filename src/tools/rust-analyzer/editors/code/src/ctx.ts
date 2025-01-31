@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import * as lc from "vscode-languageclient/node";
+import type * as lc from "vscode-languageclient/node";
 import * as ra from "./lsp_ext";
 
 import { Config, prepareVSCodeConfig } from "./config";
@@ -19,9 +19,13 @@ import {
     RustDependenciesProvider,
     type DependencyId,
 } from "./dependencies_provider";
+import { SyntaxTreeProvider, type SyntaxElement } from "./syntax_tree_provider";
 import { execRevealDependency } from "./commands";
 import { PersistentState } from "./persistent_state";
 import { bootstrap } from "./bootstrap";
+import { prepareTestExplorer } from "./test_explorer";
+import { spawn } from "node:child_process";
+import { text } from "node:stream/consumers";
 import type { RustAnalyzerExtensionApi } from "./main";
 
 // We only support local folders, not eg. Live Share (`vlsl:` scheme), so don't activate if
@@ -67,32 +71,56 @@ export type CtxInit = Ctx & {
 
 export class Ctx implements RustAnalyzerExtensionApi {
     readonly statusBar: vscode.StatusBarItem;
-    config: Config;
+    readonly config: Config;
     readonly workspace: Workspace;
+    readonly version: string;
 
     private _client: lc.LanguageClient | undefined;
     private _serverPath: string | undefined;
     private traceOutputChannel: vscode.OutputChannel | undefined;
+    private testController: vscode.TestController | undefined;
     private outputChannel: vscode.OutputChannel | undefined;
     private clientSubscriptions: Disposable[];
     private state: PersistentState;
     private commandFactories: Record<string, CommandFactory>;
     private commandDisposables: Disposable[];
     private unlinkedFiles: vscode.Uri[];
-    private _dependencies: RustDependenciesProvider | undefined;
-    private _treeView: vscode.TreeView<Dependency | DependencyFile | DependencyId> | undefined;
+    private _dependenciesProvider: RustDependenciesProvider | undefined;
+    private _dependencyTreeView:
+        | vscode.TreeView<Dependency | DependencyFile | DependencyId>
+        | undefined;
+    private _syntaxTreeProvider: SyntaxTreeProvider | undefined;
+    private _syntaxTreeView: vscode.TreeView<SyntaxElement> | undefined;
     private lastStatus: ServerStatusParams | { health: "stopped" } = { health: "stopped" };
+    private _serverVersion: string;
+    private statusBarActiveEditorListener: Disposable;
+
+    get serverPath(): string | undefined {
+        return this._serverPath;
+    }
+
+    get serverVersion(): string | undefined {
+        return this._serverVersion;
+    }
 
     get client() {
         return this._client;
     }
 
-    get treeView() {
-        return this._treeView;
+    get dependencyTreeView() {
+        return this._dependencyTreeView;
     }
 
-    get dependencies() {
-        return this._dependencies;
+    get dependenciesProvider() {
+        return this._dependenciesProvider;
+    }
+
+    get syntaxTreeView() {
+        return this._syntaxTreeView;
+    }
+
+    get syntaxTreeProvider() {
+        return this._syntaxTreeProvider;
     }
 
     constructor(
@@ -101,14 +129,26 @@ export class Ctx implements RustAnalyzerExtensionApi {
         workspace: Workspace,
     ) {
         extCtx.subscriptions.push(this);
+        this.version = extCtx.extension.packageJSON.version ?? "<unknown>";
+        this._serverVersion = "<not running>";
+        this.config = new Config(extCtx.subscriptions);
         this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+        this.updateStatusBarVisibility(vscode.window.activeTextEditor);
+        this.statusBarActiveEditorListener = vscode.window.onDidChangeActiveTextEditor((editor) =>
+            this.updateStatusBarVisibility(editor),
+        );
+        if (this.config.testExplorer) {
+            this.testController = vscode.tests.createTestController(
+                "rustAnalyzerTestController",
+                "Rust Analyzer test controller",
+            );
+        }
         this.workspace = workspace;
         this.clientSubscriptions = [];
         this.commandDisposables = [];
         this.commandFactories = commandFactories;
         this.unlinkedFiles = [];
         this.state = new PersistentState(extCtx.globalState);
-        this.config = new Config(extCtx);
 
         this.updateCommands("disable");
         this.setServerStatus({
@@ -119,6 +159,8 @@ export class Ctx implements RustAnalyzerExtensionApi {
     dispose() {
         this.config.dispose();
         this.statusBar.dispose();
+        this.statusBarActiveEditorListener.dispose();
+        this.testController?.dispose();
         void this.disposeClient();
         this.commandDisposables.forEach((disposable) => disposable.dispose());
     }
@@ -163,17 +205,18 @@ export class Ctx implements RustAnalyzerExtensionApi {
         }
 
         if (!this._client) {
-            this._serverPath = await bootstrap(this.extCtx, this.config, this.state).catch(
-                (err) => {
-                    let message = "bootstrap error. ";
-
-                    message +=
-                        'See the logs in "OUTPUT > Rust Analyzer Client" (should open automatically). ';
-                    message +=
-                        'To enable verbose logs use { "rust-analyzer.trace.extension": true }';
-
-                    log.error("Bootstrap error", err);
-                    throw new Error(message);
+            this._serverPath = await this.bootstrap();
+            text(spawn(this._serverPath, ["--version"]).stdout.setEncoding("utf-8")).then(
+                (data) => {
+                    const prefix = `rust-analyzer `;
+                    this._serverVersion = data
+                        .slice(data.startsWith(prefix) ? prefix.length : 0)
+                        .trim();
+                    this.refreshServerStatus();
+                },
+                (_) => {
+                    this._serverVersion = "<unknown>";
+                    this.refreshServerStatus();
                 },
             );
             const newEnv = Object.assign({}, process.env, this.config.serverExtraEnv);
@@ -187,15 +230,6 @@ export class Ctx implements RustAnalyzerExtensionApi {
             };
 
             let rawInitializationOptions = vscode.workspace.getConfiguration("rust-analyzer");
-            if (this.config.discoverProjectRunner) {
-                const command = `${this.config.discoverProjectRunner}.discoverWorkspaceCommand`;
-                log.info(`running command: ${command}`);
-                const uris = vscode.workspace.textDocuments
-                    .filter(isRustDocument)
-                    .map((document) => document.uri);
-                const projects: JsonProject[] = await vscode.commands.executeCommand(command, uris);
-                this.setWorkspaces(projects);
-            }
 
             if (this.workspace.kind === "Detached Files") {
                 rawInitializationOptions = {
@@ -204,16 +238,7 @@ export class Ctx implements RustAnalyzerExtensionApi {
                 };
             }
 
-            const initializationOptions = prepareVSCodeConfig(
-                rawInitializationOptions,
-                (key, obj) => {
-                    // we only want to set discovered workspaces on the right key
-                    // and if a workspace has been discovered.
-                    if (key === "linkedProjects" && this.config.discoveredWorkspaces.length > 0) {
-                        obj["linkedProjects"] = this.config.discoveredWorkspaces;
-                    }
-                },
-            );
+            const initializationOptions = prepareVSCodeConfig(rawInitializationOptions);
 
             this._client = await createClient(
                 this.traceOutputChannel,
@@ -237,6 +262,20 @@ export class Ctx implements RustAnalyzerExtensionApi {
         return this._client;
     }
 
+    private async bootstrap(): Promise<string> {
+        return bootstrap(this.extCtx, this.config, this.state).catch((err) => {
+            let message = "bootstrap error. ";
+
+            message +=
+                'See the logs in "OUTPUT > Rust Analyzer Client" (should open automatically). ';
+            message +=
+                'To enable verbose logs, click the gear icon in the "OUTPUT" tab and select "Debug".';
+
+            log.error("Bootstrap error", err);
+            throw new Error(message);
+        });
+    }
+
     async start() {
         log.info("Starting language client");
         const client = await this.getOrCreateClient();
@@ -246,8 +285,14 @@ export class Ctx implements RustAnalyzerExtensionApi {
         await client.start();
         this.updateCommands();
 
+        if (this.testController) {
+            prepareTestExplorer(this, this.testController, client);
+        }
         if (this.config.showDependenciesExplorer) {
             this.prepareTreeDependenciesView(client);
+        }
+        if (this.config.showSyntaxTree) {
+            this.prepareSyntaxTreeView(client);
         }
     }
 
@@ -256,13 +301,13 @@ export class Ctx implements RustAnalyzerExtensionApi {
             ...this,
             client: client,
         };
-        this._dependencies = new RustDependenciesProvider(ctxInit);
-        this._treeView = vscode.window.createTreeView("rustDependencies", {
-            treeDataProvider: this._dependencies,
+        this._dependenciesProvider = new RustDependenciesProvider(ctxInit);
+        this._dependencyTreeView = vscode.window.createTreeView("rustDependencies", {
+            treeDataProvider: this._dependenciesProvider,
             showCollapseAll: true,
         });
 
-        this.pushExtCleanup(this._treeView);
+        this.pushExtCleanup(this._dependencyTreeView);
         vscode.window.onDidChangeActiveTextEditor(async (e) => {
             // we should skip documents that belong to the current workspace
             if (this.shouldRevealDependency(e)) {
@@ -274,7 +319,7 @@ export class Ctx implements RustAnalyzerExtensionApi {
             }
         });
 
-        this.treeView?.onDidChangeVisibility(async (e) => {
+        this.dependencyTreeView?.onDidChangeVisibility(async (e) => {
             if (e.visible) {
                 const activeEditor = vscode.window.activeTextEditor;
                 if (this.shouldRevealDependency(activeEditor)) {
@@ -293,8 +338,65 @@ export class Ctx implements RustAnalyzerExtensionApi {
             e !== undefined &&
             isRustEditor(e) &&
             !isDocumentInWorkspace(e.document) &&
-            (this.treeView?.visible || false)
+            (this.dependencyTreeView?.visible || false)
         );
+    }
+
+    private prepareSyntaxTreeView(client: lc.LanguageClient) {
+        const ctxInit: CtxInit = {
+            ...this,
+            client: client,
+        };
+        this._syntaxTreeProvider = new SyntaxTreeProvider(ctxInit);
+        this._syntaxTreeView = vscode.window.createTreeView("rustSyntaxTree", {
+            treeDataProvider: this._syntaxTreeProvider,
+            showCollapseAll: true,
+        });
+
+        this.pushExtCleanup(this._syntaxTreeView);
+
+        vscode.window.onDidChangeActiveTextEditor(async () => {
+            if (this.syntaxTreeView?.visible) {
+                await this.syntaxTreeProvider?.refresh();
+            }
+        });
+
+        vscode.workspace.onDidChangeTextDocument(async (e) => {
+            if (
+                vscode.window.activeTextEditor?.document !== e.document ||
+                e.contentChanges.length === 0
+            ) {
+                return;
+            }
+
+            if (this.syntaxTreeView?.visible) {
+                await this.syntaxTreeProvider?.refresh();
+            }
+        });
+
+        vscode.window.onDidChangeTextEditorSelection(async (e) => {
+            if (!this.syntaxTreeView?.visible || !isRustEditor(e.textEditor)) {
+                return;
+            }
+
+            const selection = e.selections[0];
+            if (selection === undefined) {
+                return;
+            }
+
+            const start = e.textEditor.document.offsetAt(selection.start);
+            const end = e.textEditor.document.offsetAt(selection.end);
+            const result = this.syntaxTreeProvider?.getElementByRange(start, end);
+            if (result !== undefined) {
+                await this.syntaxTreeView?.reveal(result);
+            }
+        });
+
+        this._syntaxTreeView.onDidChangeVisibility(async (e) => {
+            if (e.visible) {
+                await this.syntaxTreeProvider?.refresh();
+            }
+        });
     }
 
     async restart() {
@@ -318,6 +420,8 @@ export class Ctx implements RustAnalyzerExtensionApi {
         }
         log.info("Disposing language client");
         this.updateCommands("disable");
+        // we give the server 100ms to stop gracefully
+        await this.client?.stop(100).catch((_) => {});
         await this.disposeClient();
     }
 
@@ -340,23 +444,6 @@ export class Ctx implements RustAnalyzerExtensionApi {
 
     get subscriptions(): Disposable[] {
         return this.extCtx.subscriptions;
-    }
-
-    get serverPath(): string | undefined {
-        return this._serverPath;
-    }
-
-    setWorkspaces(workspaces: JsonProject[]) {
-        this.config.discoveredWorkspaces = workspaces;
-    }
-
-    async notifyRustAnalyzer(): Promise<void> {
-        // this is a workaround to avoid needing writing the `rust-project.json` into
-        // a workspace-level VS Code-specific settings folder. We'd like to keep the
-        // `rust-project.json` entirely in-memory.
-        await this.client?.sendNotification(lc.DidChangeConfigurationNotification.type, {
-            settings: "",
-        });
     }
 
     private updateCommands(forceDisable?: "disable") {
@@ -398,12 +485,10 @@ export class Ctx implements RustAnalyzerExtensionApi {
         let icon = "";
         const status = this.lastStatus;
         const statusBar = this.statusBar;
-        statusBar.show();
         statusBar.tooltip = new vscode.MarkdownString("", true);
         statusBar.tooltip.isTrusted = true;
         switch (status.health) {
             case "ok":
-                statusBar.tooltip.appendText(status.message ?? "Ready");
                 statusBar.color = undefined;
                 statusBar.backgroundColor = undefined;
                 if (this.config.statusBarClickAction === "stopServer") {
@@ -411,12 +496,10 @@ export class Ctx implements RustAnalyzerExtensionApi {
                 } else {
                     statusBar.command = "rust-analyzer.openLogs";
                 }
-                this.dependencies?.refresh();
+                this.dependenciesProvider?.refresh();
+                void this.syntaxTreeProvider?.refresh();
                 break;
             case "warning":
-                if (status.message) {
-                    statusBar.tooltip.appendText(status.message);
-                }
                 statusBar.color = new vscode.ThemeColor("statusBarItem.warningForeground");
                 statusBar.backgroundColor = new vscode.ThemeColor(
                     "statusBarItem.warningBackground",
@@ -425,9 +508,6 @@ export class Ctx implements RustAnalyzerExtensionApi {
                 icon = "$(warning) ";
                 break;
             case "error":
-                if (status.message) {
-                    statusBar.tooltip.appendText(status.message);
-                }
                 statusBar.color = new vscode.ThemeColor("statusBarItem.errorForeground");
                 statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
                 statusBar.command = "rust-analyzer.openLogs";
@@ -446,34 +526,54 @@ export class Ctx implements RustAnalyzerExtensionApi {
                 statusBar.text = "$(stop-circle) rust-analyzer";
                 return;
         }
+        if (status.message) {
+            statusBar.tooltip.appendMarkdown(status.message);
+        }
         if (statusBar.tooltip.value) {
             statusBar.tooltip.appendMarkdown("\n\n---\n\n");
         }
-        statusBar.tooltip.appendMarkdown("\n\n[Open Logs](command:rust-analyzer.openLogs)");
+
+        const toggleCheckOnSave = this.config.checkOnSave ? "Disable" : "Enable";
         statusBar.tooltip.appendMarkdown(
-            `\n\n[${
-                this.config.checkOnSave ? "Disable" : "Enable"
-            } Check on Save](command:rust-analyzer.toggleCheckOnSave)`,
+            `[Extension Info](command:rust-analyzer.serverVersion "Show version and server binary info"): Version ${this.version}, Server Version ${this._serverVersion}` +
+                "\n\n---\n\n" +
+                '[$(terminal) Open Logs](command:rust-analyzer.openLogs "Open the server logs")' +
+                "\n\n" +
+                `[$(settings) ${toggleCheckOnSave} Check on Save](command:rust-analyzer.toggleCheckOnSave "Temporarily ${toggleCheckOnSave.toLowerCase()} check on save functionality")` +
+                "\n\n" +
+                '[$(refresh) Reload Workspace](command:rust-analyzer.reloadWorkspace "Reload and rediscover workspaces")' +
+                "\n\n" +
+                '[$(symbol-property) Rebuild Build Dependencies](command:rust-analyzer.rebuildProcMacros "Rebuild build scripts and proc-macros")' +
+                "\n\n" +
+                '[$(stop-circle) Stop server](command:rust-analyzer.stopServer "Stop the server")' +
+                "\n\n" +
+                '[$(debug-restart) Restart server](command:rust-analyzer.restartServer "Restart the server")',
         );
-        statusBar.tooltip.appendMarkdown(
-            "\n\n[Reload Workspace](command:rust-analyzer.reloadWorkspace)",
-        );
-        statusBar.tooltip.appendMarkdown(
-            "\n\n[Rebuild Proc Macros](command:rust-analyzer.rebuildProcMacros)",
-        );
-        statusBar.tooltip.appendMarkdown(
-            "\n\n[Restart server](command:rust-analyzer.restartServer)",
-        );
-        statusBar.tooltip.appendMarkdown("\n\n[Stop server](command:rust-analyzer.stopServer)");
-        if (!status.quiescent) icon = "$(sync~spin) ";
+        if (!status.quiescent) icon = "$(loading~spin) ";
         statusBar.text = `${icon}rust-analyzer`;
+    }
+
+    private updateStatusBarVisibility(editor: vscode.TextEditor | undefined) {
+        const showStatusBar = this.config.statusBarShowStatusBar;
+        if (showStatusBar == null || showStatusBar === "never") {
+            this.statusBar.hide();
+        } else if (showStatusBar === "always") {
+            this.statusBar.show();
+        } else {
+            const documentSelector = showStatusBar.documentSelector;
+            if (editor != null && vscode.languages.match(documentSelector, editor.document) > 0) {
+                this.statusBar.show();
+            } else {
+                this.statusBar.hide();
+            }
+        }
     }
 
     pushExtCleanup(d: Disposable) {
         this.extCtx.subscriptions.push(d);
     }
 
-    private pushClientCleanup(d: Disposable) {
+    pushClientCleanup(d: Disposable) {
         this.clientSubscriptions.push(d);
     }
 }

@@ -1,4 +1,4 @@
-   LL|       |// compile-flags: --edition=2021
+   LL|       |//@ edition: 2021
    LL|       |
    LL|       |// Demonstrate that `sort_subviews.py` can sort instantiation groups into a
    LL|       |// predictable order, while preserving their heterogeneous contents.
@@ -27,7 +27,7 @@
   |   LL|      1|    if cond {
   |   LL|      1|        println!("{}", std::any::type_name::<T>());
   |   LL|      1|    }
-  |                   ^0
+  |                  ^0
   |   LL|      1|}
   ------------------
   | sort_groups::generic_fn::<()>:

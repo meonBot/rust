@@ -1,7 +1,7 @@
 //@no-rustfix
 
 #![deny(clippy::transmute_ptr_to_ptr)]
-#![allow(dead_code)]
+#![allow(dead_code, clippy::missing_transmute_annotations)]
 
 fn main() {
     unsafe {
@@ -12,7 +12,7 @@ fn main() {
         let b: &[u8] = unsafe { std::mem::transmute(a) };
         //~^ ERROR: transmute from a reference to a reference
         let bytes = &[1u8, 2u8, 3u8, 4u8] as &[u8];
-        let alt_slice: &[u32] = unsafe { core::mem::transmute(bytes) };
+        let alt_slice: &[u32] = unsafe { std::mem::transmute(bytes) };
         //~^ ERROR: transmute from a reference to a reference
     }
 }

@@ -1,6 +1,5 @@
-#![feature(core_intrinsics)]
-#![feature(coverage_attribute)]
-// compile-flags: --edition=2021
+#![feature(core_intrinsics, coverage_attribute)]
+//@ edition: 2021
 
 // <https://github.com/rust-lang/rust/issues/116171>
 // If we instrument a function for coverage, but all of its counter-increment

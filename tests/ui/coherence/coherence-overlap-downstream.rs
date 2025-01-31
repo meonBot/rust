@@ -1,6 +1,3 @@
-// revisions: old next
-//[next] compile-flags: -Ztrait-solver=next
-
 // Tests that we consider `T: Sugar + Fruit` to be ambiguous, even
 // though no impls are found.
 

@@ -1,5 +1,5 @@
 error[E0308]: mismatched types
-  --> $DIR/issue-88360.rs:15:9
+  --> $DIR/issue-88360.rs:16:9
    |
 LL | trait SuperTrait<T>
    |                  - found this type parameter
@@ -9,8 +9,8 @@ LL |     fn copy(&self) -> Self::Gat<'_> where T: Copy {
 LL |         *self.test()
    |         ^^^^^^^^^^^^ expected `&T`, found type parameter `T`
    |
-   = note:   expected reference `&T`
-           found type parameter `T`
+   = note:   expected reference `&_`
+           found type parameter `_`
 help: consider removing deref here
    |
 LL -         *self.test()

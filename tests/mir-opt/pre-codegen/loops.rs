@@ -1,6 +1,6 @@
 // skip-filecheck
-// compile-flags: -O -Zmir-opt-level=2 -g
-// needs-unwind
+//@ compile-flags: -O -Zmir-opt-level=2 -g
+//@ needs-unwind
 
 #![crate_type = "lib"]
 

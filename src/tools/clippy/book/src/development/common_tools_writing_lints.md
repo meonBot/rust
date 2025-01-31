@@ -37,7 +37,7 @@ impl LateLintPass<'_> for MyStructLint {
         // Get type of `expr`
         let ty = cx.typeck_results().expr_ty(expr);
         // Match its kind to enter its type
-        match ty.kind {
+        match ty.kind() {
             ty::Adt(adt_def, _) if adt_def.is_struct() => println!("Our `expr` is a struct!"),
             _ => ()
         }
@@ -68,7 +68,7 @@ impl<'tcx> LateLintPass<'tcx> for MyStructLint {
         // Check our expr is calling a method
         if let hir::ExprKind::MethodCall(path, _, _self_arg, ..) = &expr.kind
             // Check the name of this method is `some_method`
-            && path.ident.name == sym!(some_method)
+            && path.ident.name.as_str() == "some_method"
             // Optionally, check the type of the self argument.
             // - See "Checking for a specific type"
         {
@@ -167,7 +167,7 @@ impl<'tcx> LateLintPass<'tcx> for MyTypeImpl {
         // Check if item is a method/function
         if let ImplItemKind::Fn(ref signature, _) = impl_item.kind
             // Check the method is named `some_method`
-            && impl_item.ident.name == sym!(some_method)
+            && impl_item.ident.name.as_str() == "some_method"
             // We can also check it has a parameter `self`
             && signature.decl.implicit_self.has_implicit_self()
             // We can go further and even check if its return type is `String`
@@ -265,10 +265,10 @@ functions to deal with macros:
    ```
 
 [Ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.Ty.html
-[TyKind]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/enum.TyKind.html
+[TyKind]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_type_ir/ty_kind/enum.TyKind.html
 [TypeckResults]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TypeckResults.html
 [expr_ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TypeckResults.html#method.expr_ty
 [LateContext]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_lint/struct.LateContext.html
 [TyCtxt]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html
-[pat_ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TypeckResults.html#method.pat_ty
+[pat_ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TypeckResults.html#method.pat_ty
 [paths]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_utils/paths/index.html

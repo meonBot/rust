@@ -1,6 +1,10 @@
-use syntax::ast::{self, AstNode};
+use ide_db::syntax_helpers::suggest_name;
+use syntax::{
+    ast::{self, make, AstNode},
+    ted,
+};
 
-use crate::{utils::suggest_name, AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, AssistKind, Assists};
 
 // Assist: replace_is_some_with_if_let_some
 //
@@ -16,7 +20,7 @@ use crate::{utils::suggest_name, AssistContext, AssistId, AssistKind, Assists};
 // ```
 // fn main() {
 //     let x = Some(1);
-//     if let Some(${0:x}) = x {}
+//     if let Some(${0:x1}) = x {}
 // }
 // ```
 pub(crate) fn replace_is_method_with_if_let_method(
@@ -36,13 +40,14 @@ pub(crate) fn replace_is_method_with_if_let_method(
         "is_some" | "is_ok" => {
             let receiver = call_expr.receiver()?;
 
+            let mut name_generator = suggest_name::NameGenerator::new_from_scope_locals(
+                ctx.sema.scope(if_expr.syntax()),
+            );
             let var_name = if let ast::Expr::PathExpr(path_expr) = receiver.clone() {
-                path_expr.path()?.to_string()
+                name_generator.suggest_name(&path_expr.path()?.to_string())
             } else {
-                suggest_name::for_variable(&receiver, &ctx.sema)
+                name_generator.for_variable(&receiver, &ctx.sema)
             };
-
-            let target = call_expr.syntax().text_range();
 
             let (assist_id, message, text) = if name_ref.text() == "is_some" {
                 ("replace_is_some_with_if_let_some", "Replace `is_some` with `if let Some`", "Some")
@@ -50,13 +55,30 @@ pub(crate) fn replace_is_method_with_if_let_method(
                 ("replace_is_ok_with_if_let_ok", "Replace `is_ok` with `if let Ok`", "Ok")
             };
 
-            acc.add(AssistId(assist_id, AssistKind::RefactorRewrite), message, target, |edit| {
-                let var_name = format!("${{0:{}}}", var_name);
-                let replacement = format!("let {}({}) = {}", text, var_name, receiver);
-                edit.replace(target, replacement);
-            })
+            acc.add(
+                AssistId(assist_id, AssistKind::RefactorRewrite),
+                message,
+                call_expr.syntax().text_range(),
+                |edit| {
+                    let call_expr = edit.make_mut(call_expr);
+
+                    let var_pat = make::ident_pat(false, false, make::name(&var_name));
+                    let pat = make::tuple_struct_pat(make::ext::ident_path(text), [var_pat.into()]);
+                    let let_expr = make::expr_let(pat.into(), receiver).clone_for_update();
+
+                    if let Some(cap) = ctx.config.snippet_cap {
+                        if let Some(ast::Pat::TupleStructPat(pat)) = let_expr.pat() {
+                            if let Some(first_var) = pat.fields().next() {
+                                edit.add_placeholder_snippet(cap, first_var);
+                            }
+                        }
+                    }
+
+                    ted::replace(call_expr.syntax(), let_expr.syntax());
+                },
+            )
         }
-        _ => return None,
+        _ => None,
     }
 }
 
@@ -79,7 +101,7 @@ fn main() {
             r#"
 fn main() {
     let x = Some(1);
-    if let Some(${0:x}) = x {}
+    if let Some(${0:x1}) = x {}
 }
 "#,
         );
@@ -131,7 +153,7 @@ fn main() {
             r#"
 fn main() {
     let x = Ok(1);
-    if let Ok(${0:x}) = x {}
+    if let Ok(${0:x1}) = x {}
 }
 "#,
         );

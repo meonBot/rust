@@ -7,16 +7,63 @@ const EXPECTED = [
         'query': 'iterator<something> -> u32',
         'correction': null,
         'others': [
-            { 'path': 'assoc_type', 'name': 'my_fn' },
-            { 'path': 'assoc_type::my', 'name': 'other_fn' },
+            {
+                'path': 'assoc_type::my',
+                'name': 'other_fn',
+                'displayType': 'X -> `u32`',
+                'displayMappedNames': '',
+                'displayWhereClause': 'X: `Iterator`<`Something`>',
+            },
+            {
+                'path': 'assoc_type',
+                'name': 'my_fn',
+                'displayType': 'X -> `u32`',
+                'displayMappedNames': '',
+                'displayWhereClause': 'X: `Iterator`<Item=`Something`>',
+            },
         ],
     },
     {
         'query': 'iterator<something>',
         'correction': null,
         'in_args': [
-            { 'path': 'assoc_type', 'name': 'my_fn' },
-            { 'path': 'assoc_type::my', 'name': 'other_fn' },
+            {
+                'path': 'assoc_type::my',
+                'name': 'other_fn',
+                'displayType': 'X -> u32',
+                'displayMappedNames': '',
+                'displayWhereClause': 'X: `Iterator`<`Something`>',
+            },
+            {
+                'path': 'assoc_type',
+                'name': 'my_fn',
+                'displayType': 'X -> u32',
+                'displayMappedNames': '',
+                'displayWhereClause': 'X: `Iterator`<Item=`Something`>',
+            },
+        ],
+    },
+    {
+        'query': 'something',
+        'correction': null,
+        'others': [
+            { 'path': 'assoc_type', 'name': 'Something' },
+        ],
+        'in_args': [
+            {
+                'path': 'assoc_type::my',
+                'name': 'other_fn',
+                'displayType': '`X` -> u32',
+                'displayMappedNames': '',
+                'displayWhereClause': 'X: Iterator<`Something`>',
+            },
+            {
+                'path': 'assoc_type',
+                'name': 'my_fn',
+                'displayType': '`X` -> u32',
+                'displayMappedNames': '',
+                'displayWhereClause': 'X: Iterator<Item=`Something`>',
+            },
         ],
     },
     // if I write an explicit binding, only it shows up

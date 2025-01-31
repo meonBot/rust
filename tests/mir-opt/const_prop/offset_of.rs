@@ -1,8 +1,8 @@
 // skip-filecheck
-// unit-test: ConstProp
+//@ test-mir-pass: GVN
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 
-#![feature(offset_of, offset_of_enum)]
+#![feature(offset_of_enum)]
 
 use std::marker::PhantomData;
 use std::mem::offset_of;
@@ -31,7 +31,7 @@ struct Delta<T> {
 enum Epsilon {
     A(u8, u16),
     B,
-    C { c: u32 }
+    C { c: u32 },
 }
 
 enum Zeta<T> {
@@ -39,7 +39,7 @@ enum Zeta<T> {
     B(char),
 }
 
-// EMIT_MIR offset_of.concrete.ConstProp.diff
+// EMIT_MIR offset_of.concrete.GVN.diff
 fn concrete() {
     let x = offset_of!(Alpha, x);
     let y = offset_of!(Alpha, y);
@@ -50,7 +50,7 @@ fn concrete() {
     let eC = offset_of!(Epsilon, C.c);
 }
 
-// EMIT_MIR offset_of.generic.ConstProp.diff
+// EMIT_MIR offset_of.generic.GVN.diff
 fn generic<T>() {
     let gx = offset_of!(Gamma<T>, x);
     let gy = offset_of!(Gamma<T>, y);

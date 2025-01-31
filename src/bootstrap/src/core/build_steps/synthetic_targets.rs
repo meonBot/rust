@@ -7,12 +7,12 @@
 //! one of the target specs already defined in this module, or create new ones by adding a new step
 //! that calls create_synthetic_target.
 
+use crate::Compiler;
 use crate::core::builder::{Builder, ShouldRun, Step};
 use crate::core::config::TargetSelection;
-use crate::Compiler;
-use std::process::{Command, Stdio};
+use crate::utils::exec::command;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MirOptPanicAbortSyntheticTarget {
     pub(crate) compiler: Compiler,
     pub(crate) base: TargetSelection,
@@ -56,17 +56,16 @@ fn create_synthetic_target(
         return TargetSelection::create_synthetic(&name, path.to_str().unwrap());
     }
 
-    let mut cmd = Command::new(builder.rustc(compiler));
+    let mut cmd = command(builder.rustc(compiler));
     cmd.arg("--target").arg(base.rustc_target_arg());
     cmd.args(["-Zunstable-options", "--print", "target-spec-json"]);
-    cmd.stdout(Stdio::piped());
 
-    let output = cmd.spawn().unwrap().wait_with_output().unwrap();
-    if !output.status.success() {
-        panic!("failed to gather the target spec for {base}");
-    }
+    // If `rust.channel` is set to either beta or stable, rustc will complain that
+    // we cannot use nightly features. So `RUSTC_BOOTSTRAP` is needed here.
+    cmd.env("RUSTC_BOOTSTRAP", "1");
 
-    let mut spec: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let output = cmd.run_capture(builder).stdout();
+    let mut spec: serde_json::Value = serde_json::from_slice(output.as_bytes()).unwrap();
     let spec_map = spec.as_object_mut().unwrap();
 
     // The `is-builtin` attribute of a spec needs to be removed, otherwise rustc will complain.
@@ -74,9 +73,6 @@ fn create_synthetic_target(
 
     customize(spec_map);
 
-    std::fs::write(&path, &serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
-    let target = TargetSelection::create_synthetic(&name, path.to_str().unwrap());
-    crate::utils::cc_detect::find_target(builder, target);
-
-    target
+    std::fs::write(&path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    TargetSelection::create_synthetic(&name, path.to_str().unwrap())
 }

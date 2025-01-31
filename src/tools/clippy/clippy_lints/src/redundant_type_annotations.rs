@@ -11,7 +11,7 @@ declare_clippy_lint! {
     /// ### What it does
     /// Warns about needless / redundant type annotations.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Code without type annotations is shorter and in most cases
     /// more idiomatic and easier to modify.
     ///
@@ -59,7 +59,7 @@ fn is_same_type<'tcx>(cx: &LateContext<'tcx>, ty_resolved_path: hir::def::Res, f
 
 fn func_hir_id_to_func_ty<'tcx>(cx: &LateContext<'tcx>, hir_id: hir::hir_id::HirId) -> Option<Ty<'tcx>> {
     if let Some((defkind, func_defid)) = cx.typeck_results().type_dependent_def(hir_id)
-        && defkind == hir::def::DefKind::AssocFn
+        && defkind == DefKind::AssocFn
         && let Some(init_ty) = cx.tcx.type_of(func_defid).no_bound_vars()
     {
         Some(init_ty)
@@ -131,7 +131,7 @@ fn extract_primty(ty_kind: &hir::TyKind<'_>) -> Option<hir::PrimTy> {
 }
 
 impl LateLintPass<'_> for RedundantTypeAnnotations {
-    fn check_local<'tcx>(&mut self, cx: &LateContext<'tcx>, local: &'tcx rustc_hir::Local<'tcx>) {
+    fn check_local<'tcx>(&mut self, cx: &LateContext<'tcx>, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         if !is_lint_allowed(cx, REDUNDANT_TYPE_ANNOTATIONS, local.hir_id)
             // type annotation part
             && !local.span.from_expansion()
@@ -188,7 +188,6 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                     match init_lit.node {
                         // In these cases the annotation is redundant
                         LitKind::Str(..)
-                        | LitKind::ByteStr(..)
                         | LitKind::Byte(..)
                         | LitKind::Char(..)
                         | LitKind::Bool(..)
@@ -201,11 +200,21 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                                 span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
                             }
                         },
-                        LitKind::Err => (),
+                        LitKind::Err(_) => (),
+                        LitKind::ByteStr(..) => {
+                            // We only lint if the type annotation is an array type (e.g. &[u8; 4]).
+                            // If instead it is a slice (e.g. &[u8]) it may not be redundant, so we
+                            // don't lint.
+                            if let hir::TyKind::Ref(_, mut_ty) = ty.kind
+                                && matches!(mut_ty.ty.kind, hir::TyKind::Array(..))
+                            {
+                                span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
+                            }
+                        },
                     }
                 },
                 _ => (),
             }
-        };
+        }
     }
 }

@@ -16,7 +16,6 @@ $ rustup component add rustc-codegen-cranelift-preview --toolchain nightly
 
 Once it is installed, you can enable it with one of the following approaches:
 - `CARGO_PROFILE_DEV_CODEGEN_BACKEND=cranelift cargo +nightly build -Zcodegen-backend`
-- `RUSTFLAGS="-Zcodegen-backend=cranelift" cargo +nightly build`
 - Add the following to `.cargo/config.toml`:
     ```toml
     [unstable]
@@ -62,6 +61,26 @@ $ ./test.sh
 
 For more docs on how to build and test see [build_system/usage.txt](build_system/usage.txt) or the help message of `./y.sh`.
 
+## Platform support
+
+|OS \ architecture|x86\_64|AArch64|Riscv64|s390x (System-Z)|
+|---|---|---|---|---|
+|Linux|✅|✅|✅[^no-rustup]|✅[^no-rustup]|
+|FreeBSD|✅[^no-rustup]|❓|❓|❓|
+|AIX|❌[^xcoff]|N/A|N/A|❌[^xcoff]|
+|Other unixes|❓|❓|❓|❓|
+|macOS|✅|✅|N/A|N/A|
+|Windows|✅|❌|N/A|N/A|
+
+✅: Fully supported and tested
+❓: Maybe supported, not tested
+❌: Not supported at all
+
+Not all targets are available as rustup component for nightly. See notes in the platform support matrix.
+
+[^xcoff]: XCOFF object file format is not supported.
+[^no-rustup]: Not available as rustup component for nightly. You can build it yourself.
+
 ## Usage
 
 rustc_codegen_cranelift can be used as a near-drop-in replacement for `cargo build` or `cargo run` for existing projects.
@@ -80,30 +99,7 @@ For additional ways to use rustc_codegen_cranelift like the JIT mode see [usage.
 
 ## Building and testing with changes in rustc code
 
-This is useful when changing code in `rustc_codegen_cranelift` as part of changing [main Rust repository](https://github.com/rust-lang/rust/).
-This can happen, for example, when you are implementing a new compiler intrinsic.
-
-Instruction below uses `$RustCheckoutDir` as substitute for any folder where you cloned Rust repository.
-
-You need to do this steps to successfully compile and use the cranelift backend with your changes in rustc code:
-
-1. `cd $RustCheckoutDir`
-2. Run `python x.py setup` and choose option for compiler (`b`).
-3. Build compiler and necessary tools: `python x.py build --stage=2 compiler library/std src/tools/rustdoc src/tools/rustfmt`
-   * (Optional) You can also build cargo by adding `src/tools/cargo` to previous command.
-4. Copy cargo from a nightly toolchain: `cp $(rustup +nightly which cargo) ./build/host/stage2/bin/cargo`. Note that you would need to do this every time you rebuilt `rust` repository.
-5. Link your new `rustc` to toolchain: `rustup toolchain link stage2 ./build/host/stage2/`.
-6. (Windows only) compile the build system: `rustc +stage2 -O build_system/main.rs -o y.exe`.
-7. You need to prefix every `./y.sh` (or `y` if you built `build_system/main.rs` as `y`) command by `rustup run stage2` to make cg_clif use your local changes in rustc.
-  * `rustup run stage2 ./y.sh prepare`
-  * `rustup run stage2 ./y.sh build`
-  * (Optional) run tests: `rustup run stage2 ./y.sh test`
-8. Now you can use your cg_clif build to compile other Rust programs, e.g. you can open any Rust crate and run commands like `$RustCheckoutDir/compiler/rustc_codegen_cranelift/dist/cargo-clif build --release`.
-
-## Configuration
-
-See the documentation on the `BackendConfig` struct in [config.rs](src/config.rs) for all
-configuration options.
+See [rustc_testing.md](docs/rustc_testing.md).
 
 ## Not yet supported
 

@@ -1,16 +1,20 @@
 use ide_db::{
     assists::{AssistId, AssistKind},
     defs::Definition,
-    search::{FileReference, SearchScope, UsageSearchResult},
+    search::{FileReference, SearchScope},
+    syntax_helpers::suggest_name,
+    text_edit::TextRange,
 };
 use itertools::Itertools;
 use syntax::{
-    ast::{self, make, AstNode, FieldExpr, HasName, IdentPat, MethodCallExpr},
-    ted, T,
+    ast::{self, make, AstNode, FieldExpr, HasName, IdentPat},
+    ted,
 };
-use text_edit::TextRange;
 
-use crate::assist_context::{AssistContext, Assists, SourceChangeBuilder};
+use crate::{
+    assist_context::{AssistContext, Assists, SourceChangeBuilder},
+    utils::ref_field_expr::determine_ref_and_parens,
+};
 
 // Assist: destructure_tuple_binding
 //
@@ -84,8 +88,8 @@ fn destructure_tuple_edit_impl(
     data: &TupleData,
     in_sub_pattern: bool,
 ) {
-    let assignment_edit = edit_tuple_assignment(ctx, edit, &data, in_sub_pattern);
-    let current_file_usages_edit = edit_tuple_usages(&data, edit, ctx, in_sub_pattern);
+    let assignment_edit = edit_tuple_assignment(ctx, edit, data, in_sub_pattern);
+    let current_file_usages_edit = edit_tuple_usages(data, edit, ctx, in_sub_pattern);
 
     assignment_edit.apply();
     if let Some(usages_edit) = current_file_usages_edit {
@@ -119,31 +123,32 @@ fn collect_data(ident_pat: IdentPat, ctx: &AssistContext<'_>) -> Option<TupleDat
         return None;
     }
 
-    let name = ident_pat.name()?.to_string();
-
-    let usages = ctx.sema.to_def(&ident_pat).map(|def| {
+    let usages = ctx.sema.to_def(&ident_pat).and_then(|def| {
         Definition::Local(def)
             .usages(&ctx.sema)
             .in_scope(&SearchScope::single_file(ctx.file_id()))
             .all()
+            .iter()
+            .next()
+            .map(|(_, refs)| refs.to_vec())
     });
 
-    let field_names = (0..field_types.len())
-        .map(|i| generate_name(ctx, i, &name, &ident_pat, &usages))
+    let mut name_generator =
+        suggest_name::NameGenerator::new_from_scope_locals(ctx.sema.scope(ident_pat.syntax()));
+
+    let field_names = field_types
+        .into_iter()
+        .enumerate()
+        .map(|(id, ty)| {
+            match name_generator.for_type(&ty, ctx.db(), ctx.edition()) {
+                Some(name) => name,
+                None => name_generator.suggest_name(&format!("_{}", id)),
+            }
+            .to_string()
+        })
         .collect::<Vec<_>>();
 
     Some(TupleData { ident_pat, ref_type, field_names, usages })
-}
-
-fn generate_name(
-    _ctx: &AssistContext<'_>,
-    index: usize,
-    _tuple_name: &str,
-    _ident_pat: &IdentPat,
-    _usages: &Option<UsageSearchResult>,
-) -> String {
-    // FIXME: detect if name already used
-    format!("_{index}")
 }
 
 enum RefType {
@@ -154,7 +159,7 @@ struct TupleData {
     ident_pat: IdentPat,
     ref_type: Option<RefType>,
     field_names: Vec<String>,
-    usages: Option<UsageSearchResult>,
+    usages: Option<Vec<FileReference>>,
 }
 fn edit_tuple_assignment(
     ctx: &AssistContext<'_>,
@@ -210,42 +215,23 @@ fn edit_tuple_usages(
     ctx: &AssistContext<'_>,
     in_sub_pattern: bool,
 ) -> Option<Vec<EditTupleUsage>> {
-    let mut current_file_usages = None;
+    // We need to collect edits first before actually applying them
+    // as mapping nodes to their mutable node versions requires an
+    // unmodified syntax tree.
+    //
+    // We also defer editing usages in the current file first since
+    // tree mutation in the same file breaks when `builder.edit_file`
+    // is called
 
-    if let Some(usages) = data.usages.as_ref() {
-        // We need to collect edits first before actually applying them
-        // as mapping nodes to their mutable node versions requires an
-        // unmodified syntax tree.
-        //
-        // We also defer editing usages in the current file first since
-        // tree mutation in the same file breaks when `builder.edit_file`
-        // is called
+    let edits = data
+        .usages
+        .as_ref()?
+        .as_slice()
+        .iter()
+        .filter_map(|r| edit_tuple_usage(ctx, edit, r, data, in_sub_pattern))
+        .collect_vec();
 
-        if let Some((_, refs)) = usages.iter().find(|(file_id, _)| **file_id == ctx.file_id()) {
-            current_file_usages = Some(
-                refs.iter()
-                    .filter_map(|r| edit_tuple_usage(ctx, edit, r, data, in_sub_pattern))
-                    .collect_vec(),
-            );
-        }
-
-        for (file_id, refs) in usages.iter() {
-            if *file_id == ctx.file_id() {
-                continue;
-            }
-
-            edit.edit_file(*file_id);
-
-            let tuple_edits = refs
-                .iter()
-                .filter_map(|r| edit_tuple_usage(ctx, edit, r, data, in_sub_pattern))
-                .collect_vec();
-
-            tuple_edits.into_iter().for_each(|tuple_edit| tuple_edit.apply(edit))
-        }
-    }
-
-    current_file_usages
+    Some(edits)
 }
 fn edit_tuple_usage(
     ctx: &AssistContext<'_>,
@@ -258,7 +244,7 @@ fn edit_tuple_usage(
         Some(index) => Some(edit_tuple_field_usage(ctx, builder, data, index)),
         None if in_sub_pattern => {
             cov_mark::hit!(destructure_tuple_call_with_subpattern);
-            return None;
+            None
         }
         None => Some(EditTupleUsage::NoIndex(usage.range)),
     }
@@ -274,7 +260,7 @@ fn edit_tuple_field_usage(
     let field_name = make::expr_path(make::ext::ident_path(field_name));
 
     if data.ref_type.is_some() {
-        let (replace_expr, ref_data) = handle_ref_field_usage(ctx, &index.field_expr);
+        let (replace_expr, ref_data) = determine_ref_and_parens(ctx, &index.field_expr);
         let replace_expr = builder.make_mut(replace_expr);
         EditTupleUsage::ReplaceExpr(replace_expr, ref_data.wrap_expr(field_name))
     } else {
@@ -359,119 +345,6 @@ fn detect_tuple_index(usage: &FileReference, data: &TupleData) -> Option<TupleIn
     } else {
         None
     }
-}
-
-struct RefData {
-    needs_deref: bool,
-    needs_parentheses: bool,
-}
-impl RefData {
-    fn wrap_expr(&self, mut expr: ast::Expr) -> ast::Expr {
-        if self.needs_deref {
-            expr = make::expr_prefix(T![*], expr);
-        }
-
-        if self.needs_parentheses {
-            expr = make::expr_paren(expr);
-        }
-
-        return expr;
-    }
-}
-fn handle_ref_field_usage(ctx: &AssistContext<'_>, field_expr: &FieldExpr) -> (ast::Expr, RefData) {
-    let s = field_expr.syntax();
-    let mut ref_data = RefData { needs_deref: true, needs_parentheses: true };
-    let mut target_node = field_expr.clone().into();
-
-    let parent = match s.parent().map(ast::Expr::cast) {
-        Some(Some(parent)) => parent,
-        Some(None) => {
-            ref_data.needs_parentheses = false;
-            return (target_node, ref_data);
-        }
-        None => return (target_node, ref_data),
-    };
-
-    match parent {
-        ast::Expr::ParenExpr(it) => {
-            // already parens in place -> don't replace
-            ref_data.needs_parentheses = false;
-            // there might be a ref outside: `&(t.0)` -> can be removed
-            if let Some(it) = it.syntax().parent().and_then(ast::RefExpr::cast) {
-                ref_data.needs_deref = false;
-                target_node = it.into();
-            }
-        }
-        ast::Expr::RefExpr(it) => {
-            // `&*` -> cancel each other out
-            ref_data.needs_deref = false;
-            ref_data.needs_parentheses = false;
-            // might be surrounded by parens -> can be removed too
-            match it.syntax().parent().and_then(ast::ParenExpr::cast) {
-                Some(parent) => target_node = parent.into(),
-                None => target_node = it.into(),
-            };
-        }
-        // higher precedence than deref `*`
-        // https://doc.rust-lang.org/reference/expressions.html#expression-precedence
-        // -> requires parentheses
-        ast::Expr::PathExpr(_it) => {}
-        ast::Expr::MethodCallExpr(it) => {
-            // `field_expr` is `self_param` (otherwise it would be in `ArgList`)
-
-            // test if there's already auto-ref in place (`value` -> `&value`)
-            // -> no method accepting `self`, but `&self` -> no need for deref
-            //
-            // other combinations (`&value` -> `value`, `&&value` -> `&value`, `&value` -> `&&value`) might or might not be able to auto-ref/deref,
-            // but there might be trait implementations an added `&` might resolve to
-            // -> ONLY handle auto-ref from `value` to `&value`
-            fn is_auto_ref(ctx: &AssistContext<'_>, call_expr: &MethodCallExpr) -> bool {
-                fn impl_(ctx: &AssistContext<'_>, call_expr: &MethodCallExpr) -> Option<bool> {
-                    let rec = call_expr.receiver()?;
-                    let rec_ty = ctx.sema.type_of_expr(&rec)?.original();
-                    // input must be actual value
-                    if rec_ty.is_reference() {
-                        return Some(false);
-                    }
-
-                    // doesn't resolve trait impl
-                    let f = ctx.sema.resolve_method_call(call_expr)?;
-                    let self_param = f.self_param(ctx.db())?;
-                    // self must be ref
-                    match self_param.access(ctx.db()) {
-                        hir::Access::Shared | hir::Access::Exclusive => Some(true),
-                        hir::Access::Owned => Some(false),
-                    }
-                }
-                impl_(ctx, call_expr).unwrap_or(false)
-            }
-
-            if is_auto_ref(ctx, &it) {
-                ref_data.needs_deref = false;
-                ref_data.needs_parentheses = false;
-            }
-        }
-        ast::Expr::FieldExpr(_it) => {
-            // `t.0.my_field`
-            ref_data.needs_deref = false;
-            ref_data.needs_parentheses = false;
-        }
-        ast::Expr::IndexExpr(_it) => {
-            // `t.0[1]`
-            ref_data.needs_deref = false;
-            ref_data.needs_parentheses = false;
-        }
-        ast::Expr::TryExpr(_it) => {
-            // `t.0?`
-            // requires deref and parens: `(*_0)`
-        }
-        // lower precedence than deref `*` -> no parens
-        _ => {
-            ref_data.needs_parentheses = false;
-        }
-    };
-
-    (target_node, ref_data)
 }
 
 #[cfg(test)]
@@ -1255,7 +1128,10 @@ fn main {
             destructure_tuple_binding_impl(acc, ctx, false)
         }
 
-        pub(crate) fn check_in_place_assist(ra_fixture_before: &str, ra_fixture_after: &str) {
+        pub(crate) fn check_in_place_assist(
+            #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
+            #[rust_analyzer::rust_fixture] ra_fixture_after: &str,
+        ) {
             check_assist_by_label(
                 in_place_assist,
                 ra_fixture_before,
@@ -1265,7 +1141,10 @@ fn main {
             );
         }
 
-        pub(crate) fn check_sub_pattern_assist(ra_fixture_before: &str, ra_fixture_after: &str) {
+        pub(crate) fn check_sub_pattern_assist(
+            #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
+            #[rust_analyzer::rust_fixture] ra_fixture_after: &str,
+        ) {
             check_assist_by_label(
                 assist,
                 ra_fixture_before,
@@ -1879,14 +1758,14 @@ struct S4 {
 }
 
 fn foo() -> Option<()> {
-    let ($0_0, _1, _2, _3, _4, _5) = &(0, (1,"1"), Some(2), [3;3], S4 { value: 4 }, &5);
+    let ($0_0, _1, _2, _3, s4, _5) = &(0, (1,"1"), Some(2), [3;3], S4 { value: 4 }, &5);
     let v: i32 = *_0;           // deref, no parens
     let v: &i32 = _0;         // no deref, no parens, remove `&`
     f1(*_0);                    // deref, no parens
     f2(_0);                   // `&*` -> cancel out -> no deref, no parens
     // https://github.com/rust-lang/rust-analyzer/issues/1109#issuecomment-658868639
     // let v: i32 = t.1.0;      // no deref, no parens
-    let v: i32 = _4.value;     // no deref, no parens
+    let v: i32 = s4.value;     // no deref, no parens
     (*_0).do_stuff();             // deref, parens
     let v: i32 = (*_2)?;          // deref, parens
     let v: i32 = _3[0];        // no deref, no parens
@@ -1925,8 +1804,8 @@ impl S {
 }
 
 fn main() {
-    let ($0_0, _1) = &(S,2);
-    let s = _0.f();
+    let ($0s, _1) = &(S,2);
+    let s = s.f();
 }
                 "#,
             )
@@ -1955,8 +1834,8 @@ impl S {
 }
 
 fn main() {
-    let ($0_0, _1) = &(S,2);
-    let s = (*_0).f();
+    let ($0s, _1) = &(S,2);
+    let s = (*s).f();
 }
                 "#,
             )
@@ -1992,8 +1871,8 @@ impl T for &S {
 }
 
 fn main() {
-    let ($0_0, _1) = &(S,2);
-    let s = (*_0).f();
+    let ($0s, _1) = &(S,2);
+    let s = (*s).f();
 }
                 "#,
             )
@@ -2033,8 +1912,8 @@ impl T for &S {
 }
 
 fn main() {
-    let ($0_0, _1) = &(S,2);
-    let s = (*_0).f();
+    let ($0s, _1) = &(S,2);
+    let s = (*s).f();
 }
                 "#,
             )
@@ -2061,8 +1940,8 @@ impl S {
     fn do_stuff(&self) -> i32 { 42 }
 }
 fn main() {
-    let ($0_0, _1) = &(S,&S);
-    let v = _0.do_stuff();
+    let ($0s, s1) = &(S,&S);
+    let v = s.do_stuff();
 }
                 "#,
             )
@@ -2083,7 +1962,7 @@ fn main() {
     // `t.0` gets auto-refed -> no deref needed -> no parens
     let v = t.0.do_stuff();         // no deref, no parens
     let v = &t.0.do_stuff();        // `&` is for result -> no deref, no parens
-    // deref: `_1` is `&&S`, but method called is on `&S` -> there might be a method accepting `&&S`
+    // deref: `s1` is `&&S`, but method called is on `&S` -> there might be a method accepting `&&S`
     let v = t.1.do_stuff();         // deref, parens
 }
                 "#,
@@ -2094,13 +1973,13 @@ impl S {
     fn do_stuff(&self) -> i32 { 42 }
 }
 fn main() {
-    let ($0_0, _1) = &(S,&S);
-    let v = _0.do_stuff();      // no deref, remove parens
+    let ($0s, s1) = &(S,&S);
+    let v = s.do_stuff();      // no deref, remove parens
     // `t.0` gets auto-refed -> no deref needed -> no parens
-    let v = _0.do_stuff();         // no deref, no parens
-    let v = &_0.do_stuff();        // `&` is for result -> no deref, no parens
-    // deref: `_1` is `&&S`, but method called is on `&S` -> there might be a method accepting `&&S`
-    let v = (*_1).do_stuff();         // deref, parens
+    let v = s.do_stuff();         // no deref, no parens
+    let v = &s.do_stuff();        // `&` is for result -> no deref, no parens
+    // deref: `s1` is `&&S`, but method called is on `&S` -> there might be a method accepting `&&S`
+    let v = (*s1).do_stuff();         // deref, parens
 }
                 "#,
             )

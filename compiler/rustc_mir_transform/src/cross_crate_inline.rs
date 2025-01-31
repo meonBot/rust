@@ -1,16 +1,16 @@
-use crate::inline;
-use crate::pass_manager as pm;
-use rustc_attr::InlineAttr;
+use rustc_attr_parsing::InlineAttr;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config::InliningThreshold;
-use rustc_session::config::OptLevel;
+use rustc_session::config::{InliningThreshold, OptLevel};
+use rustc_span::sym;
 
-pub fn provide(providers: &mut Providers) {
+use crate::{inline, pass_manager as pm};
+
+pub(super) fn provide(providers: &mut Providers) {
     providers.cross_crate_inlinable = cross_crate_inlinable;
 }
 
@@ -22,19 +22,42 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         return false;
     }
 
+    // This just reproduces the logic from Instance::requires_inline.
+    match tcx.def_kind(def_id) {
+        DefKind::Ctor(..) | DefKind::Closure | DefKind::SyntheticCoroutineBody => return true,
+        DefKind::Fn | DefKind::AssocFn => {}
+        _ => return false,
+    }
+
+    // From this point on, it is valid to return true or false.
+    if tcx.sess.opts.unstable_opts.cross_crate_inline_threshold == InliningThreshold::Always {
+        return true;
+    }
+
+    if tcx.has_attr(def_id, sym::rustc_intrinsic) {
+        // Intrinsic fallback bodies are always cross-crate inlineable.
+        // To ensure that the MIR inliner doesn't cluelessly try to inline fallback
+        // bodies even when the backend would implement something better, we stop
+        // the MIR inliner from ever inlining an intrinsic.
+        return true;
+    }
+
     // Obey source annotations first; this is important because it means we can use
     // #[inline(never)] to force code generation.
     match codegen_fn_attrs.inline {
         InlineAttr::Never => return false,
-        InlineAttr::Hint | InlineAttr::Always => return true,
+        InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force { .. } => return true,
         _ => {}
     }
 
-    // This just reproduces the logic from Instance::requires_inline.
-    match tcx.def_kind(def_id) {
-        DefKind::Ctor(..) | DefKind::Closure => return true,
-        DefKind::Fn | DefKind::AssocFn => {}
-        _ => return false,
+    let sig = tcx.fn_sig(def_id).instantiate_identity();
+    for ty in sig.inputs().skip_binder().iter().chain(std::iter::once(&sig.output().skip_binder()))
+    {
+        // FIXME(f16_f128): in order to avoid crashes building `core`, always inline to skip
+        // codegen if the function is not used.
+        if ty == &tcx.types.f16 || ty == &tcx.types.f128 {
+            return true;
+        }
     }
 
     // Don't do any inference when incremental compilation is enabled; the additional inlining that
@@ -46,8 +69,9 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     // Don't do any inference if codegen optimizations are disabled and also MIR inlining is not
     // enabled. This ensures that we do inference even if someone only passes -Zinline-mir,
     // which is less confusing than having to also enable -Copt-level=1.
-    if matches!(tcx.sess.opts.optimize, OptLevel::No) && !pm::should_run_pass(tcx, &inline::Inline)
-    {
+    let inliner_will_run = pm::should_run_pass(tcx, &inline::Inline, pm::Optimizations::Allowed)
+        || inline::ForceInline::should_run_pass_for_callee(tcx, def_id.to_def_id());
+    if matches!(tcx.sess.opts.optimize, OptLevel::No) && !inliner_will_run {
         return false;
     }
 

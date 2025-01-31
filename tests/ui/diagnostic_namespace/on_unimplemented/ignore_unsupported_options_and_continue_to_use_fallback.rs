@@ -1,5 +1,5 @@
-#![feature(diagnostic_namespace)]
-
+//@ reference: attributes.diagnostic.on_unimplemented.repetition
+//@ reference: attributes.diagnostic.on_unimplemented.syntax
 #[diagnostic::on_unimplemented(
     if(Self = "()"),
     //~^WARN malformed `on_unimplemented` attribute

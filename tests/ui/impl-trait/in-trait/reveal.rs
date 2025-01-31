@@ -1,7 +1,4 @@
-// check-pass
-
-#![feature(lint_reasons)]
-#![allow(incomplete_features)]
+//@ check-pass
 
 pub trait Foo {
     fn f() -> Box<impl Sized>;

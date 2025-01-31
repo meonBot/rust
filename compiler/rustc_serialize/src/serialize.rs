@@ -1,14 +1,16 @@
 //! Support code for encoding and decoding types.
 
-use smallvec::{Array, SmallVec};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
+use std::num::NonZero;
 use std::path;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use smallvec::{Array, SmallVec};
 use thin_vec::ThinVec;
 
 /// A byte that [cannot occur in UTF8 sequences][utf8]. Used to mark the end of a string.
@@ -70,14 +72,6 @@ pub trait Encoder {
     }
 
     fn emit_raw_bytes(&mut self, s: &[u8]);
-
-    fn emit_enum_variant<F>(&mut self, v_id: usize, f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        self.emit_usize(v_id);
-        f(self);
-    }
 }
 
 // Note: all the methods in this trait are infallible, which may be surprising.
@@ -131,10 +125,6 @@ pub trait Decoder {
     }
 
     fn read_raw_bytes(&mut self, len: usize) -> &[u8];
-
-    // Although there is an `emit_enum_variant` method in `Encoder`, the code
-    // patterns in decoding are different enough to encoding that there is no
-    // need for a corresponding `read_enum_variant` method here.
 
     fn peek_byte(&self) -> u8;
     fn position(&self) -> usize;
@@ -228,15 +218,15 @@ impl<D: Decoder> Decodable<D> for ! {
     }
 }
 
-impl<S: Encoder> Encodable<S> for ::std::num::NonZeroU32 {
+impl<S: Encoder> Encodable<S> for NonZero<u32> {
     fn encode(&self, s: &mut S) {
         s.emit_u32(self.get());
     }
 }
 
-impl<D: Decoder> Decodable<D> for ::std::num::NonZeroU32 {
+impl<D: Decoder> Decodable<D> for NonZero<u32> {
     fn decode(d: &mut D) -> Self {
-        ::std::num::NonZeroU32::new(d.read_u32()).unwrap()
+        NonZero::new(d.read_u32()).unwrap()
     }
 }
 
@@ -263,7 +253,7 @@ impl<S: Encoder> Encodable<S> for () {
 }
 
 impl<D: Decoder> Decodable<D> for () {
-    fn decode(_: &mut D) -> () {}
+    fn decode(_: &mut D) {}
 }
 
 impl<S: Encoder, T> Encodable<S> for PhantomData<T> {
@@ -298,7 +288,7 @@ impl<D: Decoder, T: Decodable<D>> Decodable<D> for Rc<T> {
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for [T] {
     default fn encode(&self, s: &mut S) {
         s.emit_usize(self.len());
-        for e in self.iter() {
+        for e in self {
             e.encode(s);
         }
     }
@@ -335,7 +325,7 @@ impl<D: Decoder, const N: usize> Decodable<D> for [u8; N] {
     }
 }
 
-impl<'a, S: Encoder, T: Encodable<S>> Encodable<S> for Cow<'a, [T]>
+impl<S: Encoder, T: Encodable<S>> Encodable<S> for Cow<'_, [T]>
 where
     [T]: ToOwned<Owned = Vec<T>>,
 {
@@ -355,14 +345,14 @@ where
     }
 }
 
-impl<'a, S: Encoder> Encodable<S> for Cow<'a, str> {
+impl<S: Encoder> Encodable<S> for Cow<'_, str> {
     fn encode(&self, s: &mut S) {
         let val: &str = self;
         val.encode(s)
     }
 }
 
-impl<'a, D: Decoder> Decodable<D> for Cow<'a, str> {
+impl<D: Decoder> Decodable<D> for Cow<'_, str> {
     fn decode(d: &mut D) -> Cow<'static, str> {
         let v: String = Decodable::decode(d);
         Cow::Owned(v)
@@ -372,15 +362,18 @@ impl<'a, D: Decoder> Decodable<D> for Cow<'a, str> {
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for Option<T> {
     fn encode(&self, s: &mut S) {
         match *self {
-            None => s.emit_enum_variant(0, |_| {}),
-            Some(ref v) => s.emit_enum_variant(1, |s| v.encode(s)),
+            None => s.emit_u8(0),
+            Some(ref v) => {
+                s.emit_u8(1);
+                v.encode(s);
+            }
         }
     }
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Option<T> {
     fn decode(d: &mut D) -> Option<T> {
-        match d.read_usize() {
+        match d.read_u8() {
             0 => None,
             1 => Some(Decodable::decode(d)),
             _ => panic!("Encountered invalid discriminant while decoding `Option`."),
@@ -391,15 +384,21 @@ impl<D: Decoder, T: Decodable<D>> Decodable<D> for Option<T> {
 impl<S: Encoder, T1: Encodable<S>, T2: Encodable<S>> Encodable<S> for Result<T1, T2> {
     fn encode(&self, s: &mut S) {
         match *self {
-            Ok(ref v) => s.emit_enum_variant(0, |s| v.encode(s)),
-            Err(ref v) => s.emit_enum_variant(1, |s| v.encode(s)),
+            Ok(ref v) => {
+                s.emit_u8(0);
+                v.encode(s);
+            }
+            Err(ref v) => {
+                s.emit_u8(1);
+                v.encode(s);
+            }
         }
     }
 }
 
 impl<D: Decoder, T1: Decodable<D>, T2: Decodable<D>> Decodable<D> for Result<T1, T2> {
     fn decode(d: &mut D) -> Result<T1, T2> {
-        match d.read_usize() {
+        match d.read_u8() {
             0 => Ok(T1::decode(d)),
             1 => Err(T2::decode(d)),
             _ => panic!("Encountered invalid discriminant while decoding `Result`."),
@@ -528,7 +527,7 @@ impl<D: Decoder, T: Decodable<D>> Decodable<D> for ThinVec<T> {
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for VecDeque<T> {
     fn encode(&self, s: &mut S) {
         s.emit_usize(self.len());
-        for e in self.iter() {
+        for e in self {
             e.encode(s);
         }
     }
@@ -548,7 +547,7 @@ where
 {
     fn encode(&self, e: &mut S) {
         e.emit_usize(self.len());
-        for (key, val) in self.iter() {
+        for (key, val) in self {
             key.encode(e);
             val.encode(e);
         }
@@ -572,7 +571,7 @@ where
 {
     fn encode(&self, s: &mut S) {
         s.emit_usize(self.len());
-        for e in self.iter() {
+        for e in self {
             e.encode(s);
         }
     }
@@ -596,7 +595,7 @@ where
 {
     fn encode(&self, e: &mut E) {
         e.emit_usize(self.len());
-        for (key, val) in self.iter() {
+        for (key, val) in self {
             key.encode(e);
             val.encode(e);
         }
@@ -622,7 +621,7 @@ where
 {
     fn encode(&self, s: &mut E) {
         s.emit_usize(self.len());
-        for e in self.iter() {
+        for e in self {
             e.encode(s);
         }
     }
@@ -647,7 +646,7 @@ where
 {
     fn encode(&self, e: &mut E) {
         e.emit_usize(self.len());
-        for (key, val) in self.iter() {
+        for (key, val) in self {
             key.encode(e);
             val.encode(e);
         }
@@ -673,7 +672,7 @@ where
 {
     fn encode(&self, s: &mut E) {
         s.emit_usize(self.len());
-        for e in self.iter() {
+        for e in self {
             e.encode(s);
         }
     }

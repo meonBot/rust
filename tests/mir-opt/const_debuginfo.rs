@@ -1,12 +1,14 @@
-// unit-test: ConstDebugInfo
-// compile-flags: -C overflow-checks=no -Zmir-enable-passes=+ConstProp
+//@ test-mir-pass: SingleUseConsts
+//@ compile-flags: -C overflow-checks=no -Zmir-enable-passes=+GVN -Zdump-mir-exclude-alloc-bytes
+
+#![allow(unused)]
 
 struct Point {
     x: u32,
     y: u32,
 }
 
-// EMIT_MIR const_debuginfo.main.ConstDebugInfo.diff
+// EMIT_MIR const_debuginfo.main.SingleUseConsts.diff
 fn main() {
     // CHECK-LABEL: fn main(
     // CHECK: debug x => const 1_u8;
@@ -15,7 +17,7 @@ fn main() {
     // CHECK: debug sum => const 6_u8;
     // CHECK: debug s => const "hello, world!";
     // CHECK: debug f => {{_.*}};
-    // CHECK: debug o => {{_.*}};
+    // CHECK: debug o => const Option::<u16>::Some(99_u16);
     // CHECK: debug p => const Point
     // CHECK: debug a => const 64_u32;
     let x = 1u8;

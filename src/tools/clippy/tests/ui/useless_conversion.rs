@@ -1,5 +1,9 @@
 #![deny(clippy::useless_conversion)]
 #![allow(clippy::needless_if, clippy::unnecessary_wraps)]
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#![allow(static_mut_refs)]
+
+use std::ops::ControlFlow;
 
 fn test_generic<T: Copy>(val: T) -> T {
     let _ = T::from(val);
@@ -241,7 +245,7 @@ mod issue11300 {
         foo2::<(), _>([1, 2, 3].into_iter());
 
         // This should lint. Removing the `.into_iter()` means that `I` gets substituted with `[i32; 3]`,
-        // and `i32: Helper2<[i32, 3]>` is true, so this call is indeed unncessary.
+        // and `i32: Helper2<[i32, 3]>` is true, so this call is indeed unnecessary.
         foo3([1, 2, 3].into_iter());
     }
 
@@ -253,7 +257,7 @@ mod issue11300 {
 
         S1.foo([1, 2].into_iter());
 
-        // ICE that occured in itertools
+        // ICE that occurred in itertools
         trait Itertools {
             fn interleave_shortest<J>(self, other: J)
             where
@@ -293,5 +297,101 @@ struct Foo<const C: char>;
 impl From<Foo<'a'>> for Foo<'b'> {
     fn from(_s: Foo<'a'>) -> Self {
         Foo
+    }
+}
+
+fn direct_application() {
+    let _: Result<(), std::io::Error> = test_issue_3913().map(Into::into);
+    //~^ useless_conversion
+    let _: Result<(), std::io::Error> = test_issue_3913().map_err(Into::into);
+    //~^ useless_conversion
+    let _: Result<(), std::io::Error> = test_issue_3913().map(From::from);
+    //~^ useless_conversion
+    let _: Result<(), std::io::Error> = test_issue_3913().map_err(From::from);
+    //~^ useless_conversion
+
+    let c: ControlFlow<()> = ControlFlow::Continue(());
+    let _: ControlFlow<()> = c.map_break(Into::into);
+    //~^ useless_conversion
+    let c: ControlFlow<()> = ControlFlow::Continue(());
+    let _: ControlFlow<()> = c.map_continue(Into::into);
+    //~^ useless_conversion
+
+    struct Absorb;
+    impl From<()> for Absorb {
+        fn from(_: ()) -> Self {
+            Self
+        }
+    }
+    impl From<std::io::Error> for Absorb {
+        fn from(_: std::io::Error) -> Self {
+            Self
+        }
+    }
+    let _: Vec<u32> = [1u32].into_iter().map(Into::into).collect();
+    //~^ useless_conversion
+
+    // No lint for those
+    let _: Result<Absorb, std::io::Error> = test_issue_3913().map(Into::into);
+    let _: Result<(), Absorb> = test_issue_3913().map_err(Into::into);
+    let _: Result<Absorb, std::io::Error> = test_issue_3913().map(From::from);
+    let _: Result<(), Absorb> = test_issue_3913().map_err(From::from);
+}
+
+fn gen_identity<T>(x: [T; 3]) -> Vec<T> {
+    x.into_iter().map(Into::into).collect()
+    //~^ useless_conversion
+}
+
+mod issue11819 {
+    fn takes_into_iter(_: impl IntoIterator<Item = String>) {}
+
+    pub struct MyStruct<T> {
+        my_field: T,
+    }
+
+    impl<T> MyStruct<T> {
+        pub fn with_ref<'a>(&'a mut self)
+        where
+            &'a T: IntoIterator<Item = String>,
+        {
+            takes_into_iter(self.my_field.into_iter());
+            //~^ useless_conversion
+        }
+
+        pub fn with_ref_mut<'a>(&'a mut self)
+        where
+            &'a mut T: IntoIterator<Item = String>,
+        {
+            takes_into_iter(self.my_field.into_iter());
+            //~^ useless_conversion
+        }
+
+        pub fn with_deref<Y>(&mut self)
+        where
+            T: std::ops::Deref<Target = Y>,
+            Y: IntoIterator<Item = String> + Copy,
+        {
+            takes_into_iter(self.my_field.into_iter());
+            //~^ useless_conversion
+        }
+
+        pub fn with_reborrow<'a, Y: 'a>(&'a mut self)
+        where
+            T: std::ops::Deref<Target = Y>,
+            &'a Y: IntoIterator<Item = String>,
+        {
+            takes_into_iter(self.my_field.into_iter());
+            //~^ useless_conversion
+        }
+
+        pub fn with_reborrow_mut<'a, Y: 'a>(&'a mut self)
+        where
+            T: std::ops::Deref<Target = Y> + std::ops::DerefMut,
+            &'a mut Y: IntoIterator<Item = String>,
+        {
+            takes_into_iter(self.my_field.into_iter());
+            //~^ useless_conversion
+        }
     }
 }

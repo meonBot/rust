@@ -14,14 +14,14 @@
 use crate::def_path_res;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::intravisit::{walk_qpath, walk_ty, Visitor};
-use rustc_hir::{self as hir, Expr, ExprKind, GenericArgs, HirId, Node, PathSegment, QPath, TyKind};
+use rustc_hir::intravisit::{InferKind, Visitor, VisitorExt, walk_qpath, walk_ty};
+use rustc_hir::{self as hir, AmbigArg, Expr, ExprKind, GenericArgs, HirId, Node, PathSegment, QPath, TyKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::{self, AdtDef, GenericArgKind, Ty};
 use rustc_span::{Span, Symbol};
 
 mod certainty;
-use certainty::{join, meet, Certainty, Meet};
+use certainty::{Certainty, Meet, join, meet};
 
 pub fn expr_type_is_certain(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     expr_type_certainty(cx, expr).is_certain()
@@ -38,7 +38,7 @@ fn expr_type_certainty(cx: &LateContext<'_>, expr: &Expr<'_>) -> Certainty {
 
         ExprKind::Call(callee, args) => {
             let lhs = expr_type_certainty(cx, callee);
-            let rhs = if type_is_inferrable_from_arguments(cx, expr) {
+            let rhs = if type_is_inferable_from_arguments(cx, expr) {
                 meet(args.iter().map(|arg| expr_type_certainty(cx, arg)))
             } else {
                 Certainty::Uncertain
@@ -55,9 +55,9 @@ fn expr_type_certainty(cx: &LateContext<'_>, expr: &Expr<'_>) -> Certainty {
                 && let Some(self_ty_def_id) = adt_def_id(self_ty(cx, method_def_id))
             {
                 receiver_type_certainty = receiver_type_certainty.with_def_id(self_ty_def_id);
-            };
+            }
             let lhs = path_segment_certainty(cx, receiver_type_certainty, method, false);
-            let rhs = if type_is_inferrable_from_arguments(cx, expr) {
+            let rhs = if type_is_inferable_from_arguments(cx, expr) {
                 meet(
                     std::iter::once(receiver_type_certainty).chain(args.iter().map(|arg| expr_type_certainty(cx, arg))),
                 )
@@ -90,7 +90,7 @@ fn expr_type_certainty(cx: &LateContext<'_>, expr: &Expr<'_>) -> Certainty {
     if let Some(def_id) = adt_def_id(expr_ty) {
         certainty.with_def_id(def_id)
     } else {
-        certainty
+        certainty.clear_def_id()
     }
 }
 
@@ -108,7 +108,7 @@ impl<'cx, 'tcx> CertaintyVisitor<'cx, 'tcx> {
     }
 }
 
-impl<'cx, 'tcx> Visitor<'cx> for CertaintyVisitor<'cx, 'tcx> {
+impl<'cx> Visitor<'cx> for CertaintyVisitor<'cx, '_> {
     fn visit_qpath(&mut self, qpath: &'cx QPath<'_>, hir_id: HirId, _: Span) {
         self.certainty = self.certainty.meet(qpath_certainty(self.cx, qpath, true));
         if self.certainty != Certainty::Uncertain {
@@ -116,13 +116,14 @@ impl<'cx, 'tcx> Visitor<'cx> for CertaintyVisitor<'cx, 'tcx> {
         }
     }
 
-    fn visit_ty(&mut self, ty: &'cx hir::Ty<'_>) {
-        if matches!(ty.kind, TyKind::Infer) {
-            self.certainty = Certainty::Uncertain;
-        }
+    fn visit_ty(&mut self, ty: &'cx hir::Ty<'_, AmbigArg>) {
         if self.certainty != Certainty::Uncertain {
             walk_ty(self, ty);
         }
+    }
+
+    fn visit_infer(&mut self, _inf_id: HirId, _inf_span: Span, _kind: InferKind<'cx>) -> Self::Result {
+        self.certainty = Certainty::Uncertain;
     }
 }
 
@@ -139,7 +140,7 @@ fn type_certainty(cx: &LateContext<'_>, ty: &hir::Ty<'_>) -> Certainty {
     }
 
     let mut visitor = CertaintyVisitor::new(cx);
-    visitor.visit_ty(ty);
+    visitor.visit_ty_unambig(ty);
     visitor.certainty
 }
 
@@ -176,7 +177,7 @@ fn qpath_certainty(cx: &LateContext<'_>, qpath: &QPath<'_>, resolves_to_type: bo
             .get(*lang_item)
             .map_or(Certainty::Uncertain, |def_id| {
                 let generics = cx.tcx.generics_of(def_id);
-                if generics.parent_count == 0 && generics.params.is_empty() {
+                if generics.is_empty() {
                     Certainty::Certain(if resolves_to_type { Some(def_id) } else { None })
                 } else {
                     Certainty::Uncertain
@@ -206,8 +207,9 @@ fn path_segment_certainty(
             // Checking `res_generics_def_id(..)` before calling `generics_of` avoids an ICE.
             if cx.tcx.res_generics_def_id(path_segment.res).is_some() {
                 let generics = cx.tcx.generics_of(def_id);
-                let count = generics.params.len() - usize::from(generics.host_effect_index.is_some());
-                let lhs = if (parent_certainty.is_certain() || generics.parent_count == 0) && count == 0 {
+
+                let own_count = generics.own_params.len();
+                let lhs = if (parent_certainty.is_certain() || generics.parent_count == 0) && own_count == 0 {
                     Certainty::Certain(None)
                 } else {
                     Certainty::Uncertain
@@ -237,12 +239,12 @@ fn path_segment_certainty(
         },
 
         // `get_parent` because `hir_id` refers to a `Pat`, and we're interested in the node containing the `Pat`.
-        Res::Local(hir_id) => match cx.tcx.hir().get_parent(hir_id) {
+        Res::Local(hir_id) => match cx.tcx.parent_hir_node(hir_id) {
             // An argument's type is always certain.
             Node::Param(..) => Certainty::Certain(None),
             // A local's type is certain if its type annotation is certain or it has an initializer whose
             // type is certain.
-            Node::Local(local) => {
+            Node::LetStmt(local) => {
                 let lhs = local.ty.map_or(Certainty::Uncertain, |ty| type_certainty(cx, ty));
                 let rhs = local
                     .init
@@ -271,7 +273,7 @@ fn update_res(cx: &LateContext<'_>, parent_certainty: Certainty, path_segment: &
     {
         let mut def_path = cx.get_def_path(def_id);
         def_path.push(path_segment.ident.name);
-        let reses = def_path_res(cx, &def_path.iter().map(Symbol::as_str).collect::<Vec<_>>());
+        let reses = def_path_res(cx.tcx, &def_path.iter().map(Symbol::as_str).collect::<Vec<_>>());
         if let [res] = reses.as_slice() { Some(*res) } else { None }
     } else {
         None
@@ -279,7 +281,7 @@ fn update_res(cx: &LateContext<'_>, parent_certainty: Certainty, path_segment: &
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn type_is_inferrable_from_arguments(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+fn type_is_inferable_from_arguments(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let Some(callee_def_id) = (match expr.kind {
         ExprKind::Call(callee, _) => {
             let callee_ty = cx.typeck_results().expr_ty(callee);
@@ -299,12 +301,11 @@ fn type_is_inferrable_from_arguments(cx: &LateContext<'_>, expr: &Expr<'_>) -> b
     let fn_sig = cx.tcx.fn_sig(callee_def_id).skip_binder();
 
     // Check that all type parameters appear in the functions input types.
-    (0..(generics.parent_count + generics.params.len()) as u32).all(|index| {
-        Some(index as usize) == generics.host_effect_index
-            || fn_sig
-                .inputs()
-                .iter()
-                .any(|input_ty| contains_param(*input_ty.skip_binder(), index))
+    (0..(generics.parent_count + generics.own_params.len()) as u32).all(|index| {
+        fn_sig
+            .inputs()
+            .iter()
+            .any(|input_ty| contains_param(*input_ty.skip_binder(), index))
     })
 }
 

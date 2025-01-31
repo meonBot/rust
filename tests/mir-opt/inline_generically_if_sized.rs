@@ -1,6 +1,6 @@
 // skip-filecheck
-// unit-test: Inline
-// compile-flags: --crate-type=lib -C panic=abort
+//@ test-mir-pass: Inline
+//@ compile-flags: --crate-type=lib -C panic=abort
 
 trait Foo {
     fn bar(&self) -> i32;

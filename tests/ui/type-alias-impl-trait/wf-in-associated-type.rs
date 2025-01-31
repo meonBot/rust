@@ -1,10 +1,10 @@
 // WF check for impl Trait in associated type position.
 //
-// revisions: pass pass_next fail
-// [pass] check-pass
-// [pass_next] compile-flags: -Ztrait-solver=next
-// [pass_next] check-pass
-// [fail] check-fail
+//@ revisions: pass pass_next fail
+//@ [pass] check-pass
+//@ [pass_next] compile-flags: -Znext-solver
+//@ [pass_next] check-pass
+//@ [fail] check-fail
 
 #![feature(impl_trait_in_assoc_type)]
 
@@ -36,10 +36,10 @@ mod fail {
 
     impl<'a, T> Trait<'a, T> for () {
         type Opaque = impl Sized + 'a;
-        //[fail]~^ ERROR the parameter type `T` may not live long enough
-        //[fail]~| ERROR the parameter type `T` may not live long enough
         fn constrain_opaque(req: &'a T) -> Self::Opaque {
             req
+            //[fail]~^ ERROR the parameter type `T` may not live long enough
+            //[fail]~| ERROR the parameter type `T` may not live long enough
         }
     }
 }

@@ -1,17 +1,19 @@
-use crate::MirPass;
+use rustc_abi::{FIRST_VARIANT, FieldIdx};
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
-use rustc_index::bit_set::{BitSet, GrowableBitSet};
+use rustc_hir::LangItem;
 use rustc_index::IndexVec;
+use rustc_index::bit_set::{DenseBitSet, GrowableBitSet};
+use rustc_middle::bug;
 use rustc_middle::mir::patch::MirPatch;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{excluded_locals, iter_fields};
-use rustc_target::abi::{FieldIdx, FIRST_VARIANT};
+use tracing::{debug, instrument};
 
-pub struct ScalarReplacementOfAggregates;
+pub(super) struct ScalarReplacementOfAggregates;
 
-impl<'tcx> MirPass<'tcx> for ScalarReplacementOfAggregates {
+impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
         sess.mir_opt_level() >= 2
     }
@@ -26,12 +28,12 @@ impl<'tcx> MirPass<'tcx> for ScalarReplacementOfAggregates {
         }
 
         let mut excluded = excluded_locals(body);
-        let param_env = tcx.param_env_reveal_all_normalized(body.source.def_id());
+        let typing_env = body.typing_env(tcx);
         loop {
             debug!(?excluded);
-            let escaping = escaping_locals(tcx, param_env, &excluded, body);
+            let escaping = escaping_locals(tcx, typing_env, &excluded, body);
             debug!(?escaping);
-            let replacements = compute_flattening(tcx, param_env, body, escaping);
+            let replacements = compute_flattening(tcx, typing_env, body, escaping);
             debug!(?replacements);
             let all_dead_locals = replace_flattened_locals(tcx, body, replacements);
             if !all_dead_locals.is_empty() {
@@ -46,6 +48,10 @@ impl<'tcx> MirPass<'tcx> for ScalarReplacementOfAggregates {
             }
         }
     }
+
+    fn is_required(&self) -> bool {
+        false
+    }
 }
 
 /// Identify all locals that are not eligible for SROA.
@@ -57,10 +63,10 @@ impl<'tcx> MirPass<'tcx> for ScalarReplacementOfAggregates {
 ///   client code.
 fn escaping_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
-    excluded: &BitSet<Local>,
+    typing_env: ty::TypingEnv<'tcx>,
+    excluded: &DenseBitSet<Local>,
     body: &Body<'tcx>,
-) -> BitSet<Local> {
+) -> DenseBitSet<Local> {
     let is_excluded_ty = |ty: Ty<'tcx>| {
         if ty.is_union() || ty.is_enum() {
             return true;
@@ -70,6 +76,11 @@ fn escaping_locals<'tcx>(
                 // Exclude #[repr(simd)] types so that they are not de-optimized into an array
                 return true;
             }
+            if tcx.is_lang_item(def.did(), LangItem::DynMetadata) {
+                // codegen wants to see the `DynMetadata<T>`,
+                // not the inner reference-to-opaque-type.
+                return true;
+            }
             // We already excluded unions and enums, so this ADT must have one variant
             let variant = def.variant(FIRST_VARIANT);
             if variant.fields.len() > 1 {
@@ -77,7 +88,7 @@ fn escaping_locals<'tcx>(
                 // niche, so we do not want to automatically exclude it.
                 return false;
             }
-            let Ok(layout) = tcx.layout_of(param_env.and(ty)) else {
+            let Ok(layout) = tcx.layout_of(typing_env.as_query_input(ty)) else {
                 // We can't get the layout
                 return true;
             };
@@ -90,7 +101,7 @@ fn escaping_locals<'tcx>(
         false
     };
 
-    let mut set = BitSet::new_empty(body.local_decls.len());
+    let mut set = DenseBitSet::new_empty(body.local_decls.len());
     set.insert_range(RETURN_PLACE..=Local::from_usize(body.arg_count));
     for (local, decl) in body.local_decls().iter_enumerated() {
         if excluded.contains(local) || is_excluded_ty(decl.ty) {
@@ -102,7 +113,7 @@ fn escaping_locals<'tcx>(
     return visitor.set;
 
     struct EscapeVisitor {
-        set: BitSet<Local>,
+        set: DenseBitSet<Local>,
     }
 
     impl<'tcx> Visitor<'tcx> for EscapeVisitor {
@@ -189,9 +200,9 @@ impl<'tcx> ReplacementMap<'tcx> {
 /// The replacement will be done later in `ReplacementVisitor`.
 fn compute_flattening<'tcx>(
     tcx: TyCtxt<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     body: &mut Body<'tcx>,
-    escaping: BitSet<Local>,
+    escaping: DenseBitSet<Local>,
 ) -> ReplacementMap<'tcx> {
     let mut fragments = IndexVec::from_elem(None, &body.local_decls);
 
@@ -201,7 +212,7 @@ fn compute_flattening<'tcx>(
         }
         let decl = body.local_decls[local].clone();
         let ty = decl.ty;
-        iter_fields(ty, tcx, param_env, |variant, field, field_ty| {
+        iter_fields(ty, tcx, typing_env, |variant, field, field_ty| {
             if variant.is_some() {
                 // Downcasts are currently not supported.
                 return;
@@ -219,8 +230,8 @@ fn replace_flattened_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &mut Body<'tcx>,
     replacements: ReplacementMap<'tcx>,
-) -> BitSet<Local> {
-    let mut all_dead_locals = BitSet::new_empty(replacements.fragments.len());
+) -> DenseBitSet<Local> {
+    let mut all_dead_locals = DenseBitSet::new_empty(replacements.fragments.len());
     for (local, replacements) in replacements.fragments.iter_enumerated() {
         if replacements.is_some() {
             all_dead_locals.insert(local);
@@ -260,7 +271,7 @@ struct ReplacementVisitor<'tcx, 'll> {
     /// Work to do.
     replacements: &'ll ReplacementMap<'tcx>,
     /// This is used to check that we are not leaving references to replaced locals behind.
-    all_dead_locals: BitSet<Local>,
+    all_dead_locals: DenseBitSet<Local>,
     patch: MirPatch<'tcx>,
 }
 

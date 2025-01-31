@@ -396,6 +396,7 @@ pub trait AsMut<T: ?Sized> {
 /// For example, take this code:
 ///
 /// ```
+/// # #![allow(non_local_definitions)]
 /// struct Wrapper<T>(Vec<T>);
 /// impl<T> From<Wrapper<T>> for Vec<T> {
 ///     fn from(w: Wrapper<T>) -> Vec<T> {
@@ -442,6 +443,7 @@ pub trait AsMut<T: ?Sized> {
 /// [`Vec`]: ../../std/vec/struct.Vec.html
 #[rustc_diagnostic_item = "Into"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[doc(search_unbox)]
 pub trait Into<T>: Sized {
     /// Converts this type into the (usually inferred) input type.
     #[must_use]
@@ -465,10 +467,10 @@ pub trait Into<T>: Sized {
 /// Prefer using [`Into`] over using `From` when specifying trait bounds on a generic function.
 /// This way, types that directly implement [`Into`] can be used as arguments as well.
 ///
-/// The `From` is also very useful when performing error handling. When constructing a function
+/// The `From` trait is also very useful when performing error handling. When constructing a function
 /// that is capable of failing, the return type will generally be of the form `Result<T, E>`.
-/// The `From` trait simplifies error handling by allowing a function to return a single error type
-/// that encapsulate multiple error types. See the "Examples" section and [the book][book] for more
+/// `From` simplifies error handling by allowing a function to return a single error type
+/// that encapsulates multiple error types. See the "Examples" section and [the book][book] for more
 /// details.
 ///
 /// **Note: This trait must not fail**. The `From` trait is intended for perfect conversions.
@@ -576,6 +578,7 @@ pub trait Into<T>: Sized {
     all(_Self = "&str", T = "alloc::string::String"),
     note = "to coerce a `{T}` into a `{Self}`, use `&*` as a prefix",
 ))]
+#[doc(search_unbox)]
 pub trait From<T>: Sized {
     /// Converts to this type from the input type.
     #[rustc_diagnostic_item = "from_fn"]
@@ -753,6 +756,7 @@ where
     /// That is, this conversion is whatever the implementation of
     /// <code>[From]&lt;T&gt; for U</code> chooses to do.
     #[inline]
+    #[track_caller]
     fn into(self) -> U {
         U::from(self)
     }

@@ -1,9 +1,9 @@
 use crate::spec::{
-    add_link_args, cvs, Cc, LinkSelfContainedDefault, LinkerFlavor, PanicStrategy, RelocModel,
-    TargetOptions, TlsModel,
+    Cc, LinkSelfContainedDefault, LinkerFlavor, PanicStrategy, RelocModel, TargetOptions, TlsModel,
+    add_link_args, cvs,
 };
 
-pub fn options() -> TargetOptions {
+pub(crate) fn options() -> TargetOptions {
     macro_rules! args {
         ($prefix:literal) => {
             &[
@@ -38,9 +38,6 @@ pub fn options() -> TargetOptions {
                 // supposed to be imported and have all other symbols generate errors if
                 // they remain undefined.
                 concat!($prefix, "--allow-undefined"),
-                // Rust code should never have warnings, and warnings are often
-                // indicative of bugs, let's prevent them.
-                concat!($prefix, "--fatal-warnings"),
                 // LLD only implements C++-like demangling, which doesn't match our own
                 // mangling scheme. Tell LLD to not demangle anything and leave it up to
                 // us to demangle these symbols later. Currently rustc does not perform
@@ -82,9 +79,6 @@ pub fn options() -> TargetOptions {
         // Wasm doesn't have atomics yet, so tell LLVM that we're in a single
         // threaded model which will legalize atomics to normal operations.
         singlethread: true,
-
-        // no dynamic linking, no need for default visibility!
-        default_hidden_visibility: true,
 
         // Symbol visibility takes care of this for the WebAssembly.
         // Additionally the only known linker, LLD, doesn't support the script

@@ -6,11 +6,13 @@ ARM64e macOS (11.0+, Big Sur+)
 
 ## Target maintainers
 
-- Artyom Tetyukhin ([@arttet](https://github.com/https://github.com/arttet))
+- Artyom Tetyukhin ([@arttet](https://github.com/arttet))
 
 ## Requirements
 
 Target for `macOS` on late-generation `M` series Apple chips.
+
+See the docs on [`*-apple-darwin`](apple-darwin.md) for general macOS requirements.
 
 ## Building the target
 
@@ -18,7 +20,7 @@ You can build Rust with support for the targets by adding it to the `target` lis
 
 ```toml
 [build]
-target = [ "arm64e-apple-darwin" ]
+target = ["arm64e-apple-darwin"]
 ```
 
 ## Building Rust programs

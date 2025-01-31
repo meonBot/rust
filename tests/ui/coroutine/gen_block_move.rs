@@ -1,5 +1,5 @@
-// compile-flags: --edition 2024 -Zunstable-options
-// run-rustfix
+//@ edition: 2024
+//@ run-rustfix
 #![feature(gen_blocks)]
 
 fn moved() -> impl Iterator<Item = u32> {

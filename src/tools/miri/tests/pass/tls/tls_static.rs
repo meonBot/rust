@@ -7,8 +7,11 @@
 //! dereferencing the pointer on `t2` resolves to `t1`'s thread-local. In this
 //! test, we also check that thread-locals act as per-thread statics.
 
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#![allow(static_mut_refs)]
 #![feature(thread_local)]
 
+use std::ptr::addr_of_mut;
 use std::thread;
 
 #[thread_local]
@@ -21,8 +24,8 @@ static mut C: u8 = 0;
 #[thread_local]
 static READ_ONLY: u8 = 42;
 
-unsafe fn get_a_ref() -> *mut u8 {
-    &mut A
+unsafe fn get_a_ptr() -> *mut u8 {
+    addr_of_mut!(A)
 }
 
 struct Sender(*mut u8);
@@ -33,12 +36,12 @@ fn main() {
     let _val = READ_ONLY;
 
     let ptr = unsafe {
-        let x = get_a_ref();
+        let x = get_a_ptr();
         *x = 5;
         assert_eq!(A, 5);
         B = 15;
         C = 25;
-        Sender(&mut A)
+        Sender(addr_of_mut!(A))
     };
 
     thread::spawn(move || unsafe {
@@ -49,18 +52,18 @@ fn main() {
         assert_eq!(C, 25);
         B = 14;
         C = 24;
-        let y = get_a_ref();
+        let y = get_a_ptr();
         assert_eq!(*y, 0);
         *y = 4;
         assert_eq!(*ptr.0, 5);
         assert_eq!(A, 4);
-        assert_eq!(*get_a_ref(), 4);
+        assert_eq!(*get_a_ptr(), 4);
     })
     .join()
     .unwrap();
 
     unsafe {
-        assert_eq!(*get_a_ref(), 5);
+        assert_eq!(*get_a_ptr(), 5);
         assert_eq!(A, 5);
         assert_eq!(B, 15);
         assert_eq!(C, 24);

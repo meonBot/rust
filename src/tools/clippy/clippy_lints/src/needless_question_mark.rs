@@ -3,7 +3,7 @@ use clippy_utils::path_res;
 use clippy_utils::source::snippet;
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::{Block, Body, CoroutineKind, CoroutineSource, Expr, ExprKind, LangItem, MatchSource, QPath};
+use rustc_hir::{Block, Body, Expr, ExprKind, LangItem, MatchSource, QPath};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
 
@@ -86,22 +86,20 @@ impl LateLintPass<'_> for NeedlessQuestionMark {
     }
 
     fn check_body(&mut self, cx: &LateContext<'_>, body: &'_ Body<'_>) {
-        if let Some(CoroutineKind::Async(CoroutineSource::Fn)) = body.coroutine_kind {
-            if let ExprKind::Block(
-                Block {
-                    expr:
-                        Some(Expr {
-                            kind: ExprKind::DropTemps(async_body),
-                            ..
-                        }),
-                    ..
-                },
-                _,
-            ) = body.value.kind
-            {
-                if let ExprKind::Block(Block { expr: Some(expr), .. }, ..) = async_body.kind {
-                    check(cx, expr);
-                }
+        if let ExprKind::Block(
+            Block {
+                expr:
+                    Some(Expr {
+                        kind: ExprKind::DropTemps(async_body),
+                        ..
+                    }),
+                ..
+            },
+            _,
+        ) = body.value.kind
+        {
+            if let ExprKind::Block(Block { expr: Some(expr), .. }, ..) = async_body.kind {
+                check(cx, expr.peel_blocks());
             }
         } else {
             check(cx, body.value.peel_blocks());
@@ -133,7 +131,7 @@ fn check(cx: &LateContext<'_>, expr: &Expr<'_>) {
             NEEDLESS_QUESTION_MARK,
             expr.span,
             "question mark operator is useless here",
-            &format!("try removing question mark and `{sugg_remove}`"),
+            format!("try removing question mark and `{sugg_remove}`"),
             format!("{}", snippet(cx, inner_expr.span, r#""...""#)),
             Applicability::MachineApplicable,
         );

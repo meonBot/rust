@@ -1,13 +1,12 @@
 //@compile-flags: -Zmiri-symbolic-alignment-check
 //@revisions: call_unaligned_ptr read_unaligned_ptr
-#![feature(strict_provenance)]
 
 #[path = "../../utils/mod.rs"]
 mod utils;
 
 #[repr(align(8))]
 #[derive(Copy, Clone)]
-struct Align8(u64);
+struct Align8(#[allow(dead_code)] u64);
 
 fn main() {
     let buffer = [0u32; 128]; // get some 4-aligned memory
@@ -17,11 +16,7 @@ fn main() {
     let _val = unsafe { buffer.read() };
 
     // Let's find a place to promise alignment 8.
-    let align8 = if buffer.addr() % 8 == 0 {
-        buffer
-    } else {
-        buffer.wrapping_add(1)
-    };
+    let align8 = if buffer.addr() % 8 == 0 { buffer } else { buffer.wrapping_add(1) };
     assert!(align8.addr() % 8 == 0);
     unsafe { utils::miri_promise_symbolic_alignment(align8.cast(), 8) };
     // Promising the alignment down to 1 *again* still must not hurt.
@@ -39,13 +34,9 @@ fn main() {
     if cfg!(read_unaligned_ptr) {
         #[repr(align(16))]
         #[derive(Copy, Clone)]
-        struct Align16(u128);
+        struct Align16(#[allow(dead_code)] u128);
 
-        let align16 = if align8.addr() % 16 == 0 {
-            align8
-        } else {
-            align8.wrapping_add(2)
-        };
+        let align16 = if align8.addr() % 16 == 0 { align8 } else { align8.wrapping_add(2) };
         assert!(align16.addr() % 16 == 0);
 
         let _val = unsafe { align8.cast::<Align16>().read() };

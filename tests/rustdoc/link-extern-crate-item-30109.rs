@@ -1,6 +1,6 @@
-// build-aux-docs
-// aux-build:issue-30109-1.rs
-// ignore-cross-compile
+//@ build-aux-docs
+//@ aux-build:issue-30109-1.rs
+//@ ignore-cross-compile
 
 // https://github.com/rust-lang/rust/issues/30109
 #![crate_name="issue_30109"]
@@ -11,7 +11,7 @@ pub mod quux {
 
     pub trait Foo {}
 
-    // @has issue_30109/quux/trait.Foo.html \
+    //@ has issue_30109/quux/trait.Foo.html \
     //          '//a/@href' '../issue_30109_1/struct.Bar.html'
     impl Foo for Bar {}
 }

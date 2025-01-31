@@ -1,4 +1,6 @@
+use either::Either;
 use hir::ModuleDef;
+use ide_db::text_edit::TextRange;
 use ide_db::{
     assists::{AssistId, AssistKind},
     defs::Definition,
@@ -16,11 +18,13 @@ use syntax::{
         edit_in_place::{AttrsOwnerEdit, Indent},
         make, HasName,
     },
-    ted, AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T,
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T,
 };
-use text_edit::TextRange;
 
-use crate::assist_context::{AssistContext, Assists};
+use crate::{
+    assist_context::{AssistContext, Assists},
+    utils,
+};
 
 // Assist: bool_to_enum
 //
@@ -73,7 +77,11 @@ pub(crate) fn bool_to_enum(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
 
             let usages = definition.usages(&ctx.sema).all();
             add_enum_def(edit, ctx, &usages, target_node, &target_module);
-            replace_usages(edit, ctx, &usages, definition, &target_module);
+            let mut delayed_mutations = Vec::new();
+            replace_usages(edit, ctx, usages, definition, &target_module, &mut delayed_mutations);
+            for (scope, path) in delayed_mutations {
+                insert_use(&scope, path, &ctx.config.insert_use);
+            }
         },
     )
 }
@@ -88,29 +96,32 @@ struct BoolNodeData {
 
 /// Attempts to find an appropriate node to apply the action to.
 fn find_bool_node(ctx: &AssistContext<'_>) -> Option<BoolNodeData> {
-    let name: ast::Name = ctx.find_node_at_offset()?;
+    let name = ctx.find_node_at_offset::<ast::Name>()?;
 
-    if let Some(let_stmt) = name.syntax().ancestors().find_map(ast::LetStmt::cast) {
-        let bind_pat = match let_stmt.pat()? {
-            ast::Pat::IdentPat(pat) => pat,
-            _ => {
-                cov_mark::hit!(not_applicable_in_non_ident_pat);
-                return None;
-            }
-        };
-        let def = ctx.sema.to_def(&bind_pat)?;
+    if let Some(ident_pat) = name.syntax().parent().and_then(ast::IdentPat::cast) {
+        let def = ctx.sema.to_def(&ident_pat)?;
         if !def.ty(ctx.db()).is_bool() {
             cov_mark::hit!(not_applicable_non_bool_local);
             return None;
         }
 
-        Some(BoolNodeData {
-            target_node: let_stmt.syntax().clone(),
-            name,
-            ty_annotation: let_stmt.ty(),
-            initializer: let_stmt.initializer(),
-            definition: Definition::Local(def),
-        })
+        let local_definition = Definition::Local(def);
+        match ident_pat.syntax().parent().and_then(Either::<ast::Param, ast::LetStmt>::cast)? {
+            Either::Left(param) => Some(BoolNodeData {
+                target_node: param.syntax().clone(),
+                name,
+                ty_annotation: param.ty(),
+                initializer: None,
+                definition: local_definition,
+            }),
+            Either::Right(let_stmt) => Some(BoolNodeData {
+                target_node: let_stmt.syntax().clone(),
+                name,
+                ty_annotation: let_stmt.ty(),
+                initializer: let_stmt.initializer(),
+                definition: local_definition,
+            }),
+        }
     } else if let Some(const_) = name.syntax().parent().and_then(ast::Const::cast) {
         let def = ctx.sema.to_def(&const_)?;
         if !def.ty(ctx.db()).is_bool() {
@@ -169,8 +180,8 @@ fn replace_bool_expr(edit: &mut SourceChangeBuilder, expr: ast::Expr) {
 
 /// Converts an expression of type `bool` to one of the new enum type.
 fn bool_expr_to_enum_expr(expr: ast::Expr) -> ast::Expr {
-    let true_expr = make::expr_path(make::path_from_text("Bool::True")).clone_for_update();
-    let false_expr = make::expr_path(make::path_from_text("Bool::False")).clone_for_update();
+    let true_expr = make::expr_path(make::path_from_text("Bool::True"));
+    let false_expr = make::expr_path(make::path_from_text("Bool::False"));
 
     if let ast::Expr::Literal(literal) = &expr {
         match literal.kind() {
@@ -184,7 +195,7 @@ fn bool_expr_to_enum_expr(expr: ast::Expr) -> ast::Expr {
             make::tail_only_block_expr(true_expr),
             Some(ast::ElseBranch::Block(make::tail_only_block_expr(false_expr))),
         )
-        .clone_for_update()
+        .into()
     }
 }
 
@@ -192,21 +203,20 @@ fn bool_expr_to_enum_expr(expr: ast::Expr) -> ast::Expr {
 fn replace_usages(
     edit: &mut SourceChangeBuilder,
     ctx: &AssistContext<'_>,
-    usages: &UsageSearchResult,
+    usages: UsageSearchResult,
     target_definition: Definition,
     target_module: &hir::Module,
+    delayed_mutations: &mut Vec<(ImportScope, ast::Path)>,
 ) {
-    for (file_id, references) in usages.iter() {
-        edit.edit_file(*file_id);
+    for (file_id, references) in usages {
+        edit.edit_file(file_id.file_id());
 
-        let refs_with_imports =
-            augment_references_with_imports(edit, ctx, references, target_module);
+        let refs_with_imports = augment_references_with_imports(ctx, references, target_module);
 
         refs_with_imports.into_iter().rev().for_each(
-            |FileReferenceWithImport { range, old_name, new_name, import_data }| {
+            |FileReferenceWithImport { range, name, import_data }| {
                 // replace the usages in patterns and expressions
-                if let Some(ident_pat) = old_name.syntax().ancestors().find_map(ast::IdentPat::cast)
-                {
+                if let Some(ident_pat) = name.syntax().ancestors().find_map(ast::IdentPat::cast) {
                     cov_mark::hit!(replaces_record_pat_shorthand);
 
                     let definition = ctx.sema.to_def(&ident_pat).map(Definition::Local);
@@ -214,36 +224,36 @@ fn replace_usages(
                         replace_usages(
                             edit,
                             ctx,
-                            &def.usages(&ctx.sema).all(),
+                            def.usages(&ctx.sema).all(),
                             target_definition,
                             target_module,
+                            delayed_mutations,
                         )
                     }
-                } else if let Some(initializer) = find_assignment_usage(&new_name) {
+                } else if let Some(initializer) = find_assignment_usage(&name) {
                     cov_mark::hit!(replaces_assignment);
 
                     replace_bool_expr(edit, initializer);
-                } else if let Some((prefix_expr, inner_expr)) = find_negated_usage(&new_name) {
+                } else if let Some((prefix_expr, inner_expr)) = find_negated_usage(&name) {
                     cov_mark::hit!(replaces_negation);
 
                     edit.replace(
                         prefix_expr.syntax().text_range(),
-                        format!("{} == Bool::False", inner_expr),
+                        format!("{inner_expr} == Bool::False"),
                     );
-                } else if let Some((record_field, initializer)) = old_name
+                } else if let Some((record_field, initializer)) = name
                     .as_name_ref()
                     .and_then(ast::RecordExprField::for_field_name)
                     .and_then(|record_field| ctx.sema.resolve_record_field(&record_field))
                     .and_then(|(got_field, _, _)| {
-                        find_record_expr_usage(&new_name, got_field, target_definition)
+                        find_record_expr_usage(&name, got_field, target_definition)
                     })
                 {
                     cov_mark::hit!(replaces_record_expr);
 
-                    let record_field = edit.make_mut(record_field);
                     let enum_expr = bool_expr_to_enum_expr(initializer);
-                    record_field.replace_expr(enum_expr);
-                } else if let Some(pat) = find_record_pat_field_usage(&old_name) {
+                    utils::replace_record_field_expr(ctx, edit, record_field, enum_expr);
+                } else if let Some(pat) = find_record_pat_field_usage(&name) {
                     match pat {
                         ast::Pat::IdentPat(ident_pat) => {
                             cov_mark::hit!(replaces_record_pat);
@@ -253,9 +263,10 @@ fn replace_usages(
                                 replace_usages(
                                     edit,
                                     ctx,
-                                    &def.usages(&ctx.sema).all(),
+                                    def.usages(&ctx.sema).all(),
                                     target_definition,
                                     target_module,
+                                    delayed_mutations,
                                 )
                             }
                         }
@@ -270,40 +281,44 @@ fn replace_usages(
                         }
                         _ => (),
                     }
-                } else if let Some((ty_annotation, initializer)) = find_assoc_const_usage(&new_name)
-                {
+                } else if let Some((ty_annotation, initializer)) = find_assoc_const_usage(&name) {
                     edit.replace(ty_annotation.syntax().text_range(), "Bool");
                     replace_bool_expr(edit, initializer);
-                } else if let Some(receiver) = find_method_call_expr_usage(&new_name) {
+                } else if let Some(receiver) = find_method_call_expr_usage(&name) {
                     edit.replace(
                         receiver.syntax().text_range(),
-                        format!("({} == Bool::True)", receiver),
+                        format!("({receiver} == Bool::True)"),
                     );
-                } else if new_name.syntax().ancestors().find_map(ast::UseTree::cast).is_none() {
+                } else if name.syntax().ancestors().find_map(ast::UseTree::cast).is_none() {
                     // for any other usage in an expression, replace it with a check that it is the true variant
-                    if let Some((record_field, expr)) = new_name
-                        .as_name_ref()
-                        .and_then(ast::RecordExprField::for_field_name)
-                        .and_then(|record_field| {
-                            record_field.expr().map(|expr| (record_field, expr))
-                        })
+                    if let Some((record_field, expr)) =
+                        name.as_name_ref().and_then(ast::RecordExprField::for_field_name).and_then(
+                            |record_field| record_field.expr().map(|expr| (record_field, expr)),
+                        )
                     {
-                        record_field.replace_expr(
+                        utils::replace_record_field_expr(
+                            ctx,
+                            edit,
+                            record_field,
                             make::expr_bin_op(
                                 expr,
                                 ast::BinaryOp::CmpOp(ast::CmpOp::Eq { negated: false }),
                                 make::expr_path(make::path_from_text("Bool::True")),
-                            )
-                            .clone_for_update(),
+                            ),
                         );
                     } else {
-                        edit.replace(range, format!("{} == Bool::True", new_name.text()));
+                        edit.replace(range, format!("{} == Bool::True", name.text()));
                     }
                 }
 
                 // add imports across modules where needed
                 if let Some((import_scope, path)) = import_data {
-                    insert_use(&import_scope, path, &ctx.config.insert_use);
+                    let scope = match import_scope {
+                        ImportScope::File(it) => ImportScope::File(edit.make_mut(it)),
+                        ImportScope::Module(it) => ImportScope::Module(edit.make_mut(it)),
+                        ImportScope::Block(it) => ImportScope::Block(edit.make_mut(it)),
+                    };
+                    delayed_mutations.push((scope, path));
                 }
             },
         )
@@ -312,46 +327,46 @@ fn replace_usages(
 
 struct FileReferenceWithImport {
     range: TextRange,
-    old_name: ast::NameLike,
-    new_name: ast::NameLike,
+    name: ast::NameLike,
     import_data: Option<(ImportScope, ast::Path)>,
 }
 
 fn augment_references_with_imports(
-    edit: &mut SourceChangeBuilder,
     ctx: &AssistContext<'_>,
-    references: &[FileReference],
+    references: Vec<FileReference>,
     target_module: &hir::Module,
 ) -> Vec<FileReferenceWithImport> {
     let mut visited_modules = FxHashSet::default();
 
+    let cfg = ctx.config.import_path_config();
+
+    let edition = target_module.krate().edition(ctx.db());
     references
-        .iter()
+        .into_iter()
         .filter_map(|FileReference { range, name, .. }| {
-            ctx.sema.scope(name.syntax()).map(|scope| (*range, name, scope.module()))
+            let name = name.into_name_like()?;
+            ctx.sema.scope(name.syntax()).map(|scope| (range, name, scope.module()))
         })
         .map(|(range, name, ref_module)| {
-            let old_name = name.clone();
-            let new_name = edit.make_mut(name.clone());
-
             // if the referenced module is not the same as the target one and has not been seen before, add an import
             let import_data = if ref_module.nearest_non_block_module(ctx.db()) != *target_module
                 && !visited_modules.contains(&ref_module)
             {
                 visited_modules.insert(ref_module);
 
-                let import_scope =
-                    ImportScope::find_insert_use_container(new_name.syntax(), &ctx.sema);
+                let import_scope = ImportScope::find_insert_use_container(name.syntax(), &ctx.sema);
                 let path = ref_module
-                    .find_use_path_prefixed(
+                    .find_use_path(
                         ctx.sema.db,
                         ModuleDef::Module(*target_module),
                         ctx.config.insert_use.prefix_kind,
-                        ctx.config.prefer_no_std,
-                        ctx.config.prefer_prelude,
+                        cfg,
                     )
                     .map(|mod_path| {
-                        make::path_concat(mod_path_to_ast(&mod_path), make::path_from_text("Bool"))
+                        make::path_concat(
+                            mod_path_to_ast(&mod_path, edition),
+                            make::path_from_text("Bool"),
+                        )
                     });
 
                 import_scope.zip(path)
@@ -359,7 +374,7 @@ fn augment_references_with_imports(
                 None
             };
 
-            FileReferenceWithImport { range, old_name, new_name, import_data }
+            FileReferenceWithImport { range, name, import_data }
         })
         .collect()
 }
@@ -404,13 +419,12 @@ fn find_record_expr_usage(
     let record_field = ast::RecordExprField::for_field_name(name_ref)?;
     let initializer = record_field.expr()?;
 
-    if let Definition::Field(expected_field) = target_definition {
-        if got_field != expected_field {
-            return None;
+    match target_definition {
+        Definition::Field(expected_field) if got_field == expected_field => {
+            Some((record_field, initializer))
         }
+        _ => None,
     }
-
-    Some((record_field, initializer))
 }
 
 fn find_record_pat_field_usage(name: &ast::NameLike) -> Option<ast::Pat> {
@@ -425,9 +439,7 @@ fn find_record_pat_field_usage(name: &ast::NameLike) -> Option<ast::Pat> {
 
 fn find_assoc_const_usage(name: &ast::NameLike) -> Option<(ast::Type, ast::Expr)> {
     let const_ = name.syntax().parent().and_then(ast::Const::cast)?;
-    if const_.syntax().parent().and_then(ast::AssocItemList::cast).is_none() {
-        return None;
-    }
+    const_.syntax().parent().and_then(ast::AssocItemList::cast)?;
 
     Some((const_.ty()?, const_.body()?))
 }
@@ -450,27 +462,39 @@ fn add_enum_def(
     usages: &UsageSearchResult,
     target_node: SyntaxNode,
     target_module: &hir::Module,
-) {
+) -> Option<()> {
+    let insert_before = node_to_insert_before(target_node);
+
+    if ctx
+        .sema
+        .scope(&insert_before)?
+        .module()
+        .scope(ctx.db(), Some(*target_module))
+        .iter()
+        .any(|(name, _)| name.as_str() == "Bool")
+    {
+        return None;
+    }
+
     let make_enum_pub = usages
         .iter()
         .flat_map(|(_, refs)| refs)
         .filter_map(|FileReference { name, .. }| {
+            let name = name.clone().into_name_like()?;
             ctx.sema.scope(name.syntax()).map(|scope| scope.module())
         })
         .any(|module| module.nearest_non_block_module(ctx.db()) != *target_module);
     let enum_def = make_bool_enum(make_enum_pub);
 
-    let insert_before = node_to_insert_before(target_node);
     let indent = IndentLevel::from_node(&insert_before);
     enum_def.reindent_to(indent);
 
-    ted::insert_all(
-        ted::Position::before(&edit.make_syntax_mut(insert_before)),
-        vec![
-            enum_def.syntax().clone().into(),
-            make::tokens::whitespace(&format!("\n\n{indent}")).into(),
-        ],
+    edit.insert(
+        insert_before.text_range().start(),
+        format!("{}\n\n{indent}", enum_def.syntax().text()),
     );
+
+    Some(())
 }
 
 /// Finds where to put the new enum definition.
@@ -489,9 +513,11 @@ fn make_bool_enum(make_pub: bool) -> ast::Enum {
     let enum_def = make::enum_(
         if make_pub { Some(make::visibility_pub()) } else { None },
         make::name("Bool"),
+        None,
+        None,
         make::variant_list(vec![
-            make::variant(make::name("True"), None),
-            make::variant(make::name("False"), None),
+            make::variant(None, make::name("True"), None, None),
+            make::variant(None, make::name("False"), None, None),
         ]),
     )
     .clone_for_update();
@@ -519,6 +545,125 @@ mod tests {
     use super::*;
 
     use crate::tests::{check_assist, check_assist_not_applicable};
+
+    #[test]
+    fn parameter_with_first_param_usage() {
+        check_assist(
+            bool_to_enum,
+            r#"
+fn function($0foo: bool, bar: bool) {
+    if foo {
+        println!("foo");
+    }
+}
+"#,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn function(foo: Bool, bar: bool) {
+    if foo == Bool::True {
+        println!("foo");
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn no_duplicate_enums() {
+        check_assist(
+            bool_to_enum,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn function(foo: bool, $0bar: bool) {
+    if bar {
+        println!("bar");
+    }
+}
+"#,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn function(foo: bool, bar: Bool) {
+    if bar == Bool::True {
+        println!("bar");
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn parameter_with_last_param_usage() {
+        check_assist(
+            bool_to_enum,
+            r#"
+fn function(foo: bool, $0bar: bool) {
+    if bar {
+        println!("bar");
+    }
+}
+"#,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn function(foo: bool, bar: Bool) {
+    if bar == Bool::True {
+        println!("bar");
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn parameter_with_middle_param_usage() {
+        check_assist(
+            bool_to_enum,
+            r#"
+fn function(foo: bool, $0bar: bool, baz: bool) {
+    if bar {
+        println!("bar");
+    }
+}
+"#,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn function(foo: bool, bar: Bool, baz: bool) {
+    if bar == Bool::True {
+        println!("bar");
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn parameter_with_closure_usage() {
+        check_assist(
+            bool_to_enum,
+            r#"
+fn main() {
+    let foo = |$0bar: bool| bar;
+}
+"#,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn main() {
+    let foo = |bar: Bool| bar == Bool::True;
+}
+"#,
+        )
+    }
 
     #[test]
     fn local_variable_with_usage() {
@@ -787,12 +932,83 @@ fn main() {
 
     #[test]
     fn local_variable_non_ident_pat() {
-        cov_mark::check!(not_applicable_in_non_ident_pat);
         check_assist_not_applicable(
             bool_to_enum,
             r#"
 fn main() {
     let ($0foo, bar) = (true, false);
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn local_var_init_struct_usage() {
+        check_assist(
+            bool_to_enum,
+            r#"
+struct Foo {
+    foo: bool,
+}
+
+fn main() {
+    let $0foo = true;
+    let s = Foo { foo };
+}
+"#,
+            r#"
+struct Foo {
+    foo: bool,
+}
+
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn main() {
+    let foo = Bool::True;
+    let s = Foo { foo: foo == Bool::True };
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn local_var_init_struct_usage_in_macro() {
+        check_assist(
+            bool_to_enum,
+            r#"
+struct Struct {
+    boolean: bool,
+}
+
+macro_rules! identity {
+    ($body:expr) => {
+        $body
+    }
+}
+
+fn new() -> Struct {
+    let $0boolean = true;
+    identity![Struct { boolean }]
+}
+"#,
+            r#"
+struct Struct {
+    boolean: bool,
+}
+
+macro_rules! identity {
+    ($body:expr) => {
+        $body
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn new() -> Struct {
+    let boolean = Bool::True;
+    identity![Struct { boolean: boolean == Bool::True }]
 }
 "#,
         )
@@ -882,6 +1098,7 @@ fn main() {
 
     #[test]
     fn field_enum_cross_file() {
+        // FIXME: The import is missing
         check_assist(
             bool_to_enum,
             r#"
@@ -919,7 +1136,7 @@ fn foo() {
 }
 
 //- /main.rs
-use foo::{Foo, Bool};
+use foo::Foo;
 
 mod foo;
 
@@ -1320,6 +1537,46 @@ fn main() {
     }
 
     #[test]
+    fn field_in_macro() {
+        check_assist(
+            bool_to_enum,
+            r#"
+struct Struct {
+    $0boolean: bool,
+}
+
+fn boolean(x: Struct) {
+    let Struct { boolean } = x;
+}
+
+macro_rules! identity { ($body:expr) => { $body } }
+
+fn new() -> Struct {
+    identity!(Struct { boolean: true })
+}
+"#,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+struct Struct {
+    boolean: Bool,
+}
+
+fn boolean(x: Struct) {
+    let Struct { boolean } = x;
+}
+
+macro_rules! identity { ($body:expr) => { $body } }
+
+fn new() -> Struct {
+    identity!(Struct { boolean: Bool::True })
+}
+"#,
+        )
+    }
+
+    #[test]
     fn field_non_bool() {
         cov_mark::check!(not_applicable_non_bool_field);
         check_assist_not_applicable(
@@ -1416,7 +1673,7 @@ mod foo {
 }
 "#,
             r#"
-use crate::foo::Bool;
+use foo::Bool;
 
 fn main() {
     use foo::FOO;
@@ -1497,7 +1754,7 @@ pub mod bar {
 "#,
             r#"
 //- /main.rs
-use crate::foo::bar::Bool;
+use foo::bar::Bool;
 
 mod foo;
 
@@ -1555,7 +1812,7 @@ impl Foo {
 }
 
 //- /foo.rs
-use crate::{Foo, Bool};
+use crate::{Bool, Foo};
 
 fn foo() -> bool {
     Foo::BOOL == Bool::True

@@ -17,7 +17,7 @@ pub(crate) fn trait_impl_missing_assoc_item(
             hir::AssocItem::Const(_) => "`const ",
             hir::AssocItem::TypeAlias(_) => "`type ",
         })?;
-        f(&name.display(ctx.sema.db))?;
+        f(&name.display(ctx.sema.db, ctx.edition))?;
         f(&"`")
     });
     Diagnostic::new(
@@ -25,7 +25,7 @@ pub(crate) fn trait_impl_missing_assoc_item(
         format!("not all trait items implemented, missing: {missing}"),
         adjusted_display_range::<ast::Impl>(
             ctx,
-            InFile { file_id: d.file_id, value: d.impl_.syntax_node_ptr() },
+            InFile { file_id: d.file_id, value: d.impl_ },
             &|impl_| impl_.trait_().map(|t| t.syntax().text_range()),
         ),
     )
@@ -111,5 +111,19 @@ impl Trait for () {
 
 "#,
         );
+    }
+
+    #[test]
+    fn negative_impl() {
+        check_diagnostics(
+            r#"
+trait Trait {
+    fn item();
+}
+
+// Negative impls don't require any items (in fact, the forbid providing any)
+impl !Trait for () {}
+"#,
+        )
     }
 }

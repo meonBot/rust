@@ -1,41 +1,25 @@
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-use crate::borrow_set::{BorrowData, BorrowSet, TwoPhaseActivation};
-use crate::places_conflict;
-use crate::AccessDepth;
-use crate::BorrowIndex;
+use std::ops::ControlFlow;
+
+use rustc_abi::FieldIdx;
 use rustc_data_structures::graph::dominators::Dominators;
-use rustc_middle::mir::BorrowKind;
 use rustc_middle::mir::{BasicBlock, Body, Location, Place, PlaceRef, ProjectionElem};
 use rustc_middle::ty::TyCtxt;
-use rustc_target::abi::FieldIdx;
+use tracing::debug;
 
-/// Returns `true` if the borrow represented by `kind` is
-/// allowed to be split into separate Reservation and
-/// Activation phases.
-pub(super) fn allow_two_phase_borrow(kind: BorrowKind) -> bool {
-    kind.allows_two_phase_borrow()
-}
-
-/// Control for the path borrow checking code
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(super) enum Control {
-    Continue,
-    Break,
-}
+use crate::borrow_set::{BorrowData, BorrowSet, TwoPhaseActivation};
+use crate::{AccessDepth, BorrowIndex, places_conflict};
 
 /// Encapsulates the idea of iterating over every borrow that involves a particular path
 pub(super) fn each_borrow_involving_path<'tcx, F, I, S>(
     s: &mut S,
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
-    _location: Location,
     access_place: (AccessDepth, Place<'tcx>),
     borrow_set: &BorrowSet<'tcx>,
     is_candidate: I,
     mut op: F,
 ) where
-    F: FnMut(&mut S, BorrowIndex, &BorrowData<'tcx>) -> Control,
+    F: FnMut(&mut S, BorrowIndex, &BorrowData<'tcx>) -> ControlFlow<()>,
     I: Fn(BorrowIndex) -> bool,
 {
     let (access, place) = access_place;
@@ -66,7 +50,7 @@ pub(super) fn each_borrow_involving_path<'tcx, F, I, S>(
                 i, borrowed, place, access
             );
             let ctrl = op(s, i, borrowed);
-            if ctrl == Control::Break {
+            if matches!(ctrl, ControlFlow::Break(_)) {
                 return;
             }
         }
@@ -164,7 +148,7 @@ pub(crate) fn is_upvar_field_projection<'tcx>(
     match place_ref.last_projection() {
         Some((place_base, ProjectionElem::Field(field, _ty))) => {
             let base_ty = place_base.ty(body, tcx).ty;
-            if (base_ty.is_closure() || base_ty.is_coroutine())
+            if (base_ty.is_closure() || base_ty.is_coroutine() || base_ty.is_coroutine_closure())
                 && (!by_ref || upvars[field.index()].is_by_ref())
             {
                 Some(field)

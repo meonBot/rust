@@ -5,28 +5,26 @@
 //! query, we attempt to actually check the defining anchor, but now we
 //! have a situation where the RPIT gets constrained outside its anchor.
 
-// revisions: current next
-//[next] compile-flags: -Ztrait-solver=next
-//[next] check-pass
-
-//[current] known-bug: #108498
-//[current] failure-status: 101
-//[current] normalize-stderr-test: "DefId\(.*?\]::" -> "DefId("
-//[current] normalize-stderr-test: "(?m)note: .*$" -> ""
-//[current] normalize-stderr-test: "(?m)^ *\d+: .*\n" -> ""
-//[current] normalize-stderr-test: "(?m)^ *at .*\n" -> ""
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
+//@ check-pass
 
 #![feature(type_alias_impl_trait)]
 
-type Opaque = impl Sized;
+mod helper {
+    pub type Opaque = impl Sized;
 
-fn get_rpit() -> impl Clone {}
+    pub fn get_rpit() -> impl Clone {}
+
+    fn test() -> Opaque {
+        super::query(get_rpit);
+        get_rpit()
+    }
+}
+
+use helper::*;
 
 fn query(_: impl FnOnce() -> Opaque) {}
-
-fn test() -> Opaque {
-    query(get_rpit);
-    get_rpit()
-}
 
 fn main() {}

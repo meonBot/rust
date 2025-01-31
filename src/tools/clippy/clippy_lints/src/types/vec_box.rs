@@ -1,22 +1,21 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::paths::ALLOCATOR_GLOBAL;
+use clippy_utils::last_path_segment;
 use clippy_utils::source::snippet;
-use clippy_utils::{last_path_segment, match_def_path};
 use rustc_errors::Applicability;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, GenericArg, QPath, TyKind};
-use rustc_hir_analysis::hir_ty_to_ty;
+use rustc_hir::{self as hir, GenericArg, LangItem, QPath, TyKind};
+use rustc_hir_analysis::lower_ty;
 use rustc_lint::LateContext;
-use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::TypeVisitableExt;
+use rustc_middle::ty::layout::LayoutOf;
 use rustc_span::symbol::sym;
 
 use super::VEC_BOX;
 
-pub(super) fn check(
-    cx: &LateContext<'_>,
+pub(super) fn check<'tcx>(
+    cx: &LateContext<'tcx>,
     hir_ty: &hir::Ty<'_>,
-    qpath: &QPath<'_>,
+    qpath: &QPath<'tcx>,
     def_id: DefId,
     box_size_threshold: u64,
 ) -> bool {
@@ -36,9 +35,10 @@ pub(super) fn check(
             && let Some(GenericArg::Type(boxed_ty)) = last.args.first()
             // extract allocator from the Box for later
             && let boxed_alloc_ty = last.args.get(1)
-            && let ty_ty = hir_ty_to_ty(cx.tcx, boxed_ty)
+            // we don't expect to encounter `_` here so ignore `GenericArg::Infer` is okay
+            && let ty_ty = lower_ty(cx.tcx, boxed_ty.as_unambig_ty())
             && !ty_ty.has_escaping_bound_vars()
-            && ty_ty.is_sized(cx.tcx, cx.param_env)
+            && ty_ty.is_sized(cx.tcx, cx.typing_env())
             && let Ok(ty_ty_size) = cx.layout_of(ty_ty).map(|l| l.size.bytes())
             && ty_ty_size < box_size_threshold
             // https://github.com/rust-lang/rust-clippy/issues/7114
@@ -50,13 +50,14 @@ pub(super) fn check(
                 (None, Some(GenericArg::Type(inner))) | (Some(GenericArg::Type(inner)), None) => {
                     if let TyKind::Path(path) = inner.kind
                         && let Some(did) = cx.qpath_res(&path, inner.hir_id).opt_def_id() {
-                        match_def_path(cx, did, &ALLOCATOR_GLOBAL)
+                        cx.tcx.lang_items().get(LangItem::GlobalAlloc) == Some(did)
                     } else {
                         false
                     }
                 },
                 (Some(GenericArg::Type(l)), Some(GenericArg::Type(r))) =>
-                    hir_ty_to_ty(cx.tcx, l) == hir_ty_to_ty(cx.tcx, r),
+                    // we don't expect to encounter `_` here so ignore `GenericArg::Infer` is okay
+                    lower_ty(cx.tcx, l.as_unambig_ty()) == lower_ty(cx.tcx, r.as_unambig_ty()),
                 _ => false
             }
         {

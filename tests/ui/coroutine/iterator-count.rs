@@ -1,8 +1,7 @@
-// run-pass
+//@ run-pass
 
 #![feature(coroutines, coroutine_trait)]
 
-use std::marker::Unpin;
 use std::ops::{Coroutine, CoroutineState};
 use std::pin::Pin;
 
@@ -22,6 +21,7 @@ impl<T: Coroutine<(), Return = ()> + Unpin> Iterator for W<T> {
 }
 
 fn test() -> impl Coroutine<(), Return = (), Yield = u8> + Unpin {
+    #[coroutine]
     || {
         for i in 1..6 {
             yield i
@@ -33,6 +33,7 @@ fn main() {
     let end = 11;
 
     let closure_test = |start| {
+        #[coroutine]
         move || {
             for i in start..end {
                 yield i

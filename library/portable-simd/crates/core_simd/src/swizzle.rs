@@ -1,4 +1,3 @@
-use crate::simd::intrinsics;
 use crate::simd::{LaneCount, Mask, MaskElement, Simd, SimdElement, SupportedLaneCount};
 
 /// Constructs a new SIMD vector by copying elements from selected elements in other vectors.
@@ -70,12 +69,12 @@ pub macro simd_swizzle {
     }
 }
 
-/// Create a vector from the elements of another vector.
+/// Creates a vector from the elements of another vector.
 pub trait Swizzle<const N: usize> {
     /// Map from the elements of the input vector to the output vector.
     const INDEX: [usize; N];
 
-    /// Create a new vector from the elements of `vector`.
+    /// Creates a new vector from the elements of `vector`.
     ///
     /// Lane `i` of the output is `vector[Self::INDEX[i]]`.
     #[inline]
@@ -86,9 +85,9 @@ pub trait Swizzle<const N: usize> {
         LaneCount<N>: SupportedLaneCount,
         LaneCount<M>: SupportedLaneCount,
     {
-        // Safety: `vector` is a vector, and the index is a const array of u32.
+        // Safety: `vector` is a vector, and the index is a const vector of u32.
         unsafe {
-            intrinsics::simd_shuffle(
+            core::intrinsics::simd::simd_shuffle(
                 vector,
                 vector,
                 const {
@@ -104,13 +103,17 @@ pub trait Swizzle<const N: usize> {
                         output[i] = index as u32;
                         i += 1;
                     }
-                    output
+
+                    // The index list needs to be returned as a vector.
+                    #[repr(simd)]
+                    struct SimdShuffleIdx<const LEN: usize>([u32; LEN]);
+                    SimdShuffleIdx(output)
                 },
             )
         }
     }
 
-    /// Create a new vector from the elements of `first` and `second`.
+    /// Creates a new vector from the elements of `first` and `second`.
     ///
     /// Lane `i` of the output is `concat[Self::INDEX[i]]`, where `concat` is the concatenation of
     /// `first` and `second`.
@@ -122,9 +125,9 @@ pub trait Swizzle<const N: usize> {
         LaneCount<N>: SupportedLaneCount,
         LaneCount<M>: SupportedLaneCount,
     {
-        // Safety: `first` and `second` are vectors, and the index is a const array of u32.
+        // Safety: `first` and `second` are vectors, and the index is a const vector of u32.
         unsafe {
-            intrinsics::simd_shuffle(
+            core::intrinsics::simd::simd_shuffle(
                 first,
                 second,
                 const {
@@ -140,13 +143,17 @@ pub trait Swizzle<const N: usize> {
                         output[i] = index as u32;
                         i += 1;
                     }
-                    output
+
+                    // The index list needs to be returned as a vector.
+                    #[repr(simd)]
+                    struct SimdShuffleIdx<const LEN: usize>([u32; LEN]);
+                    SimdShuffleIdx(output)
                 },
             )
         }
     }
 
-    /// Create a new mask from the elements of `mask`.
+    /// Creates a new mask from the elements of `mask`.
     ///
     /// Element `i` of the output is `concat[Self::INDEX[i]]`, where `concat` is the concatenation of
     /// `first` and `second`.
@@ -162,7 +169,7 @@ pub trait Swizzle<const N: usize> {
         unsafe { Mask::from_int_unchecked(Self::swizzle(mask.to_int())) }
     }
 
-    /// Create a new mask from the elements of `first` and `second`.
+    /// Creates a new mask from the elements of `first` and `second`.
     ///
     /// Element `i` of the output is `concat[Self::INDEX[i]]`, where `concat` is the concatenation of
     /// `first` and `second`.

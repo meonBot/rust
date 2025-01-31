@@ -1,7 +1,7 @@
-// run-pass
-// needs-unwind
+//@ run-pass
+//@ needs-unwind
 
-#![feature(coroutines, coroutine_trait)]
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
 #![feature(if_let_guard)]
 
 #![allow(unused_assignments)]
@@ -103,7 +103,7 @@ fn dynamic_drop(a: &Allocator, c: bool) {
     };
 }
 
-struct TwoPtrs<'a>(Ptr<'a>, #[allow(unused_tuple_struct_fields)] Ptr<'a>);
+struct TwoPtrs<'a>(Ptr<'a>, #[allow(dead_code)] Ptr<'a>);
 fn struct_dynamic_drop(a: &Allocator, c0: bool, c1: bool, c: bool) {
     for i in 0..2 {
         let x;
@@ -176,7 +176,7 @@ fn vec_simple(a: &Allocator) {
 fn coroutine(a: &Allocator, run_count: usize) {
     assert!(run_count < 4);
 
-    let mut gen = || {
+    let mut gen = #[coroutine] || {
         (a.alloc(),
          yield a.alloc(),
          a.alloc(),
@@ -339,6 +339,17 @@ fn if_let_guard(a: &Allocator, c: bool, d: i32) {
     match d == 0 {
         false if let Some(a) = foo => { let b = a; }
         true if let true = { drop(foo.unwrap_or_else(|| a.alloc())); d == 1 } => {}
+        _ => {}
+    }
+}
+
+fn if_let_guard_2(a: &Allocator, num: i32) {
+    let d = a.alloc();
+    match num {
+        #[allow(irrefutable_let_patterns)]
+        1 | 2 if let Ptr(ref _idx, _) = a.alloc() => {
+            a.alloc();
+        }
         _ => {}
     }
 }
@@ -514,6 +525,9 @@ fn main() {
     run_test(|a| if_let_guard(a, false, 0));
     run_test(|a| if_let_guard(a, false, 1));
     run_test(|a| if_let_guard(a, false, 2));
+    run_test(|a| if_let_guard_2(a, 0));
+    run_test(|a| if_let_guard_2(a, 1));
+    run_test(|a| if_let_guard_2(a, 2));
 
     run_test(|a| {
         panic_after_return(a);

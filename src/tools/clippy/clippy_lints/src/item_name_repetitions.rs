@@ -1,14 +1,15 @@
-//! lint on enum variants that are prefixed or suffixed by the same characters
-
+use clippy_config::Conf;
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_hir};
+use clippy_utils::is_bool;
 use clippy_utils::macros::span_is_local;
 use clippy_utils::source::is_present_in_source;
 use clippy_utils::str_utils::{camel_case_split, count_match_end, count_match_start, to_camel_case, to_snake_case};
+use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::{EnumDef, FieldDef, Item, ItemKind, OwnerId, Variant, VariantData};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
-use rustc_span::symbol::Symbol;
 use rustc_span::Span;
+use rustc_span::symbol::Symbol;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -49,11 +50,28 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Detects type names that are prefixed or suffixed by the
-    /// containing module's name.
+    /// Detects public item names that are prefixed or suffixed by the
+    /// containing public module's name.
     ///
     /// ### Why is this bad?
-    /// It requires the user to type the module name twice.
+    /// It requires the user to type the module name twice in each usage,
+    /// especially if they choose to import the module rather than its contents.
+    ///
+    /// Lack of such repetition is also the style used in the Rust standard library;
+    /// e.g. `io::Error` and `fmt::Error` rather than `io::IoError` and `fmt::FmtError`;
+    /// and `array::from_ref` rather than `array::array_from_ref`.
+    ///
+    /// ### Known issues
+    /// Glob re-exports are ignored; e.g. this will not warn even though it should:
+    ///
+    /// ```no_run
+    /// pub mod foo {
+    ///     mod iteration {
+    ///         pub struct FooIter {}
+    ///     }
+    ///     pub use iteration::*; // creates the path `foo::FooIter`
+    /// }
+    /// ```
     ///
     /// ### Example
     /// ```no_run
@@ -70,7 +88,7 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "1.33.0"]
     pub MODULE_NAME_REPETITIONS,
-    pedantic,
+    restriction,
     "type names prefixed/postfixed with their containing module's name"
 }
 
@@ -146,23 +164,23 @@ pub struct ItemNameRepetitions {
     struct_threshold: u64,
     avoid_breaking_exported_api: bool,
     allow_private_module_inception: bool,
+    allowed_prefixes: FxHashSet<String>,
 }
 
 impl ItemNameRepetitions {
-    #[must_use]
-    pub fn new(
-        enum_threshold: u64,
-        struct_threshold: u64,
-        avoid_breaking_exported_api: bool,
-        allow_private_module_inception: bool,
-    ) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
             modules: Vec::new(),
-            enum_threshold,
-            struct_threshold,
-            avoid_breaking_exported_api,
-            allow_private_module_inception,
+            enum_threshold: conf.enum_variant_name_threshold,
+            struct_threshold: conf.struct_field_name_threshold,
+            avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
+            allow_private_module_inception: conf.allow_private_module_inception,
+            allowed_prefixes: conf.allowed_prefixes.iter().map(|s| to_camel_case(s)).collect(),
         }
+    }
+
+    fn is_allowed_prefix(&self, prefix: &str) -> bool {
+        self.allowed_prefixes.contains(prefix)
     }
 }
 
@@ -231,13 +249,17 @@ fn check_fields(cx: &LateContext<'_>, threshold: u64, item: &Item<'_>, fields: &
             (false, _) => ("pre", prefix),
             (true, false) => ("post", postfix),
         };
+        if fields.iter().all(|field| is_bool(field.ty)) {
+            // If all fields are booleans, we don't want to emit this lint.
+            return;
+        }
         span_lint_and_help(
             cx,
             STRUCT_FIELD_NAMES,
             item.span,
-            &format!("all fields have the same {what}fix: `{value}`"),
+            format!("all fields have the same {what}fix: `{value}`"),
             None,
-            &format!("remove the {what}fixes"),
+            format!("remove the {what}fixes"),
         );
     }
 }
@@ -287,8 +309,8 @@ fn check_enum_start(cx: &LateContext<'_>, item_name: &str, variant: &Variant<'_>
     let item_name_chars = item_name.chars().count();
 
     if count_match_start(item_name, name).char_count == item_name_chars
-        && name.chars().nth(item_name_chars).map_or(false, |c| !c.is_lowercase())
-        && name.chars().nth(item_name_chars + 1).map_or(false, |c| !c.is_numeric())
+        && name.chars().nth(item_name_chars).is_some_and(|c| !c.is_lowercase())
+        && name.chars().nth(item_name_chars + 1).is_some_and(|c| !c.is_numeric())
     {
         span_lint_hir(
             cx,
@@ -365,9 +387,9 @@ fn check_variant(cx: &LateContext<'_>, threshold: u64, def: &EnumDef<'_>, item_n
         cx,
         ENUM_VARIANT_NAMES,
         span,
-        &format!("all variants have the same {what}fix: `{value}`"),
+        format!("all variants have the same {what}fix: `{value}`"),
         None,
-        &format!(
+        format!(
             "remove the {what}fixes and use full paths to \
              the variants instead of glob imports"
         ),
@@ -380,17 +402,16 @@ impl LateLintPass<'_> for ItemNameRepetitions {
         assert!(last.is_some());
     }
 
-    #[expect(clippy::similar_names)]
     fn check_item(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
         let item_name = item.ident.name.as_str();
         let item_camel = to_camel_case(item_name);
         if !item.span.from_expansion() && is_present_in_source(cx, item.span) {
-            if let [.., (mod_name, mod_camel, owner_id)] = &*self.modules {
+            if let [.., (mod_name, mod_camel, mod_owner_id)] = &*self.modules {
                 // constants don't have surrounding modules
                 if !mod_camel.is_empty() {
                     if mod_name == &item.ident.name
                         && let ItemKind::Mod(..) = item.kind
-                        && (!self.allow_private_module_inception || cx.tcx.visibility(owner_id.def_id).is_public())
+                        && (!self.allow_private_module_inception || cx.tcx.visibility(mod_owner_id.def_id).is_public())
                     {
                         span_lint(
                             cx,
@@ -399,9 +420,13 @@ impl LateLintPass<'_> for ItemNameRepetitions {
                             "module has the same name as its containing module",
                         );
                     }
+
                     // The `module_name_repetitions` lint should only trigger if the item has the module in its
                     // name. Having the same name is accepted.
-                    if cx.tcx.visibility(item.owner_id).is_public() && item_camel.len() > mod_camel.len() {
+                    if cx.tcx.visibility(item.owner_id).is_public()
+                        && cx.tcx.visibility(mod_owner_id.def_id).is_public()
+                        && item_camel.len() > mod_camel.len()
+                    {
                         let matching = count_match_start(mod_camel, &item_camel);
                         let rmatching = count_match_end(mod_camel, &item_camel);
                         let nchars = mod_camel.chars().count();
@@ -419,7 +444,9 @@ impl LateLintPass<'_> for ItemNameRepetitions {
                                 _ => (),
                             }
                         }
-                        if rmatching.char_count == nchars {
+                        if rmatching.char_count == nchars
+                            && !self.is_allowed_prefix(&item_camel[..item_camel.len() - rmatching.byte_count])
+                        {
                             span_lint(
                                 cx,
                                 MODULE_NAME_REPETITIONS,
@@ -436,7 +463,7 @@ impl LateLintPass<'_> for ItemNameRepetitions {
         {
             match item.kind {
                 ItemKind::Enum(def, _) => check_variant(cx, self.enum_threshold, &def, item_name, item.span),
-                ItemKind::Struct(VariantData::Struct(fields, _), _) => {
+                ItemKind::Struct(VariantData::Struct { fields, .. }, _) => {
                     check_fields(cx, self.struct_threshold, item, fields);
                 },
                 _ => (),

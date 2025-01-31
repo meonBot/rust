@@ -105,7 +105,7 @@ fn replace_usages(
     target_module: &hir::Module,
 ) {
     for (file_id, references) in usages.iter() {
-        edit.edit_file(*file_id);
+        edit.edit_file(file_id.file_id());
 
         let refs_with_imports =
             augment_references_with_imports(edit, ctx, references, struct_name, target_module);
@@ -183,13 +183,16 @@ fn augment_references_with_imports(
 ) -> Vec<(ast::NameLike, Option<(ImportScope, ast::Path)>)> {
     let mut visited_modules = FxHashSet::default();
 
+    let cfg = ctx.config.import_path_config();
+
     references
         .iter()
         .filter_map(|FileReference { name, .. }| {
+            let name = name.clone().into_name_like()?;
             ctx.sema.scope(name.syntax()).map(|scope| (name, scope.module()))
         })
         .map(|(name, ref_module)| {
-            let new_name = edit.make_mut(name.clone());
+            let new_name = edit.make_mut(name);
 
             // if the referenced module is not the same as the target one and has not been seen before, add an import
             let import_data = if ref_module.nearest_non_block_module(ctx.db()) != *target_module
@@ -200,16 +203,15 @@ fn augment_references_with_imports(
                 let import_scope =
                     ImportScope::find_insert_use_container(new_name.syntax(), &ctx.sema);
                 let path = ref_module
-                    .find_use_path_prefixed(
+                    .find_use_path(
                         ctx.sema.db,
                         ModuleDef::Module(*target_module),
                         ctx.config.insert_use.prefix_kind,
-                        ctx.config.prefer_no_std,
-                        ctx.config.prefer_prelude,
+                        cfg,
                     )
                     .map(|mod_path| {
                         make::path_concat(
-                            mod_path_to_ast(&mod_path),
+                            mod_path_to_ast(&mod_path, target_module.krate().edition(ctx.db())),
                             make::path_from_text(struct_name),
                         )
                     });
@@ -238,6 +240,7 @@ fn add_tuple_struct_def(
         .iter()
         .flat_map(|(_, refs)| refs)
         .filter_map(|FileReference { name, .. }| {
+            let name = name.clone().into_name_like()?;
             ctx.sema.scope(name.syntax()).map(|scope| scope.module())
         })
         .any(|module| module.nearest_non_block_module(ctx.db()) != *target_module);
@@ -809,7 +812,7 @@ pub mod bar {
 "#,
             r#"
 //- /main.rs
-use crate::foo::bar::BarResult;
+use foo::bar::BarResult;
 
 mod foo;
 

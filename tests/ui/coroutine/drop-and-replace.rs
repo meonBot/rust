@@ -1,10 +1,10 @@
-// run-pass
+//@ run-pass
 // Regression test for incorrect DropAndReplace behavior introduced in #60840
 // and fixed in #61373. When combined with the optimization implemented in
 // #60187, this produced incorrect code for coroutines when a saved local was
 // re-assigned.
 
-#![feature(coroutines, coroutine_trait)]
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
 
 use std::ops::{Coroutine, CoroutineState};
 use std::pin::Pin;
@@ -17,7 +17,8 @@ impl Drop for Foo {
 }
 
 fn main() {
-    let mut a = || {
+    let mut a = #[coroutine]
+    || {
         let mut x = Foo(4);
         yield;
         assert_eq!(x.0, 4);

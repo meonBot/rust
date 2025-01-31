@@ -1,15 +1,15 @@
-//! Documentation attribute related utilties.
+//! Documentation attribute related utilities.
 use either::Either;
 use hir::{
     db::{DefDatabase, HirDatabase},
-    resolve_doc_path_on, AttrId, AttrSourceMap, AttrsWithOwner, HasAttrs, InFile,
+    resolve_doc_path_on, sym, AttrId, AttrSourceMap, AttrsWithOwner, HasAttrs, InFile,
 };
 use itertools::Itertools;
+use span::{TextRange, TextSize};
 use syntax::{
     ast::{self, IsString},
     AstToken,
 };
-use text_edit::{TextRange, TextSize};
 
 /// Holds documentation
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -91,8 +91,10 @@ pub fn docs_with_rangemap(
     db: &dyn DefDatabase,
     attrs: &AttrsWithOwner,
 ) -> Option<(Documentation, DocsRangeMap)> {
-    let docs =
-        attrs.by_key("doc").attrs().filter_map(|attr| attr.string_value().map(|s| (s, attr.id)));
+    let docs = attrs
+        .by_key(&sym::doc)
+        .attrs()
+        .filter_map(|attr| attr.string_value_unescape().map(|s| (s, attr.id)));
     let indent = doc_indent(attrs);
     let mut buf = String::new();
     let mut mapping = Vec::new();
@@ -132,21 +134,19 @@ pub fn docs_with_rangemap(
 }
 
 pub fn docs_from_attrs(attrs: &hir::Attrs) -> Option<String> {
-    let docs = attrs.by_key("doc").attrs().filter_map(|attr| attr.string_value());
+    let docs = attrs.by_key(&sym::doc).attrs().filter_map(|attr| attr.string_value_unescape());
     let indent = doc_indent(attrs);
     let mut buf = String::new();
     for doc in docs {
         // str::lines doesn't yield anything for the empty string
         if !doc.is_empty() {
-            buf.extend(Itertools::intersperse(
-                doc.lines().map(|line| {
-                    line.char_indices()
-                        .nth(indent)
-                        .map_or(line, |(offset, _)| &line[offset..])
-                        .trim_end()
-                }),
-                "\n",
-            ));
+            // We don't trim trailing whitespace from doc comments as multiple trailing spaces
+            // indicates a hard line break in Markdown.
+            let lines = doc.lines().map(|line| {
+                line.char_indices().nth(indent).map_or(line, |(offset, _)| &line[offset..])
+            });
+
+            buf.extend(Itertools::intersperse(lines, "\n"));
         }
         buf.push('\n');
     }
@@ -178,7 +178,7 @@ macro_rules! impl_has_docs {
 
 impl_has_docs![
     Variant, Field, Static, Const, Trait, TraitAlias, TypeAlias, Macro, Function, Adt, Module,
-    Impl,
+    Impl, Crate,
 ];
 
 macro_rules! impl_has_docs_enum {
@@ -226,9 +226,8 @@ impl HasDocs for hir::AssocItem {
 
 impl HasDocs for hir::ExternCrateDecl {
     fn docs(self, db: &dyn HirDatabase) -> Option<Documentation> {
-        let crate_docs =
-            docs_from_attrs(&self.resolved_crate(db)?.root_module().attrs(db)).map(String::from);
-        let decl_docs = docs_from_attrs(&self.attrs(db)).map(String::from);
+        let crate_docs = docs_from_attrs(&self.resolved_crate(db)?.root_module().attrs(db));
+        let decl_docs = docs_from_attrs(&self.attrs(db));
         match (decl_docs, crate_docs) {
             (None, None) => None,
             (Some(decl_docs), None) => Some(decl_docs),
@@ -269,13 +268,13 @@ fn get_doc_string_in_attr(it: &ast::Attr) -> Option<ast::String> {
 }
 
 fn doc_indent(attrs: &hir::Attrs) -> usize {
-    attrs
-        .by_key("doc")
-        .attrs()
-        .filter_map(|attr| attr.string_value())
-        .flat_map(|s| s.lines())
-        .filter(|line| !line.chars().all(|c| c.is_whitespace()))
-        .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
-        .min()
-        .unwrap_or(0)
+    let mut min = !0;
+    for val in attrs.by_key(&sym::doc).attrs().filter_map(|attr| attr.string_value_unescape()) {
+        if let Some(m) =
+            val.lines().filter_map(|line| line.chars().position(|c| !c.is_whitespace())).min()
+        {
+            min = min.min(m);
+        }
+    }
+    min
 }

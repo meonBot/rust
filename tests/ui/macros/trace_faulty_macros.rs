@@ -1,4 +1,4 @@
-// compile-flags: -Z trace-macros
+//@ compile-flags: -Z trace-macros
 
 #![recursion_limit = "4"]
 
@@ -46,7 +46,7 @@ macro_rules! test {
     (let $p:pat = $e:expr) => {test!(($p,$e))};
     // this should be expr
     //           vvv
-    (($p:pat, $e:pat)) => {let $p = $e;}; //~ ERROR expected expression, found pattern `1 + 1`
+    (($p:pat, $e:pat)) => {let $p = $e;}; //~ ERROR expected expression, found pattern `1+1`
 }
 
 fn foo() {

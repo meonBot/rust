@@ -1,14 +1,14 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::{is_res_lang_ctor, last_path_segment, path_res, MaybePath};
+use clippy_utils::{MaybePath, is_res_lang_ctor, last_path_segment, path_res};
 use rustc_errors::Applicability;
-use rustc_hir as hir;
+use rustc_hir::{self as hir, AmbigArg};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
 use rustc_middle::ty::print::with_forced_trimmed_paths;
 
 use super::UNNECESSARY_LITERAL_UNWRAP;
 
-fn get_ty_from_args<'a>(args: Option<&'a [hir::GenericArg<'a>]>, index: usize) -> Option<&'a hir::Ty<'a>> {
+fn get_ty_from_args<'a>(args: Option<&'a [hir::GenericArg<'a>]>, index: usize) -> Option<&'a hir::Ty<'a, AmbigArg>> {
     let args = args?;
 
     if args.len() <= index {
@@ -16,10 +16,7 @@ fn get_ty_from_args<'a>(args: Option<&'a [hir::GenericArg<'a>]>, index: usize) -
     }
 
     match args[index] {
-        hir::GenericArg::Type(ty) => match ty.kind {
-            hir::TyKind::Infer => None,
-            _ => Some(ty),
-        },
+        hir::GenericArg::Type(ty) => Some(ty),
         _ => None,
     }
 }
@@ -63,7 +60,7 @@ pub(super) fn check(
     let help_message = format!("used `{method}()` on `{constructor}` value");
     let suggestion_message = format!("remove the `{constructor}` and `{method}()`");
 
-    span_lint_and_then(cx, UNNECESSARY_LITERAL_UNWRAP, expr.span, &help_message, |diag| {
+    span_lint_and_then(cx, UNNECESSARY_LITERAL_UNWRAP, expr.span, help_message, |diag| {
         let suggestions = match (constructor, method, ty) {
             ("None", "unwrap", _) => Some(vec![(expr.span, "panic!()".to_string())]),
             ("None", "expect", _) => Some(vec![
@@ -76,7 +73,7 @@ pub(super) fn check(
                     (expr.span.with_lo(call_args[0].span.hi()), String::new()),
                 ];
                 // try to also remove the unsafe block if present
-                if let hir::Node::Block(block) = cx.tcx.hir().get_parent(expr.hir_id)
+                if let hir::Node::Block(block) = cx.tcx.parent_hir_node(expr.hir_id)
                     && let hir::BlockCheckMode::UnsafeBlock(hir::UnsafeSource::UserProvided) = block.rules
                 {
                     suggs.extend([
