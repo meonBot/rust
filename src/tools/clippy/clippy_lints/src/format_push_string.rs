@@ -1,6 +1,6 @@
-use clippy_utils::diagnostics::span_lint_and_help;
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::higher;
 use clippy_utils::ty::is_type_lang_item;
-use clippy_utils::{higher, match_def_path, paths};
 use rustc_hir::{BinOpKind, Expr, ExprKind, LangItem, MatchSource};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
@@ -11,7 +11,7 @@ declare_clippy_lint! {
     /// Detects cases where the result of a `format!` call is
     /// appended to an existing `String`.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Introduces an extra, avoidable heap allocation.
     ///
     /// ### Known problems
@@ -57,7 +57,7 @@ fn is_format(cx: &LateContext<'_>, e: &Expr<'_>) -> bool {
             Some(higher::IfLetOrMatch::Match(_, arms, MatchSource::Normal)) => {
                 arms.iter().any(|arm| is_format(cx, arm.body))
             },
-            Some(higher::IfLetOrMatch::IfLet(_, _, then, r#else)) => {
+            Some(higher::IfLetOrMatch::IfLet(_, _, then, r#else, _)) => {
                 is_format(cx, then) || r#else.is_some_and(|e| is_format(cx, e))
             },
             _ => false,
@@ -70,7 +70,7 @@ impl<'tcx> LateLintPass<'tcx> for FormatPushString {
         let arg = match expr.kind {
             ExprKind::MethodCall(_, _, [arg], _) => {
                 if let Some(fn_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
-                    && match_def_path(cx, fn_def_id, &paths::PUSH_STR)
+                    && cx.tcx.is_diagnostic_item(sym::string_push_str, fn_def_id)
                 {
                     arg
                 } else {
@@ -81,13 +81,15 @@ impl<'tcx> LateLintPass<'tcx> for FormatPushString {
             _ => return,
         };
         if is_format(cx, arg) {
-            span_lint_and_help(
+            #[expect(clippy::collapsible_span_lint_calls, reason = "rust-clippy#7797")]
+            span_lint_and_then(
                 cx,
                 FORMAT_PUSH_STRING,
                 expr.span,
                 "`format!(..)` appended to existing `String`",
-                None,
-                "consider using `write!` to avoid the extra allocation",
+                |diag| {
+                    diag.help("consider using `write!` to avoid the extra allocation");
+                },
             );
         }
     }

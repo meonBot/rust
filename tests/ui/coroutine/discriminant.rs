@@ -1,12 +1,12 @@
 //! Tests that coroutine discriminant sizes and ranges are chosen optimally and that they are
 //! reflected in the output of `mem::discriminant`.
 
-// run-pass
+//@ run-pass
 
 #![feature(coroutines, coroutine_trait, core_intrinsics, discriminant_kind)]
 
 use std::intrinsics::discriminant_value;
-use std::marker::{DiscriminantKind, Unpin};
+use std::marker::DiscriminantKind;
 use std::mem::size_of_val;
 use std::{cmp, ops::*};
 
@@ -86,7 +86,7 @@ fn cycle(
 fn main() {
     // Has only one invalid discr. value.
     let gen_u8_tiny_niche = || {
-        || {
+        #[coroutine] || {
             // 3 reserved variants
 
             yield250!(); // 253 variants
@@ -98,7 +98,7 @@ fn main() {
 
     // Uses all values in the u8 discriminant.
     let gen_u8_full = || {
-        || {
+        #[coroutine] || {
             // 3 reserved variants
 
             yield250!(); // 253 variants
@@ -111,7 +111,7 @@ fn main() {
 
     // Barely needs a u16 discriminant.
     let gen_u16 = || {
-        || {
+        #[coroutine] || {
             // 3 reserved variants
 
             yield250!(); // 253 variants
@@ -124,12 +124,14 @@ fn main() {
     };
 
     assert_eq!(size_of_val(&gen_u8_tiny_niche()), 1);
-    assert_eq!(size_of_val(&Some(gen_u8_tiny_niche())), 1); // uses niche
+    // FIXME(#63818): niches in coroutines are disabled.
+    // assert_eq!(size_of_val(&Some(gen_u8_tiny_niche())), 1); // uses niche
     assert_eq!(size_of_val(&Some(Some(gen_u8_tiny_niche()))), 2); // cannot use niche anymore
     assert_eq!(size_of_val(&gen_u8_full()), 1);
     assert_eq!(size_of_val(&Some(gen_u8_full())), 2); // cannot use niche
     assert_eq!(size_of_val(&gen_u16()), 2);
-    assert_eq!(size_of_val(&Some(gen_u16())), 2); // uses niche
+    // FIXME(#63818): niches in coroutines are disabled.
+    // assert_eq!(size_of_val(&Some(gen_u16())), 2); // uses niche
 
     cycle(gen_u8_tiny_niche(), 254);
     cycle(gen_u8_full(), 255);

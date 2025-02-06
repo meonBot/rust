@@ -12,30 +12,20 @@
 //!
 //! This API is completely unstable and subject to change.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
-#![allow(internal_features)]
-#![feature(associated_type_bounds)]
-#![feature(box_patterns)]
-#![feature(control_flow_enum)]
+#![feature(assert_matches)]
 #![feature(extend_one)]
+#![feature(iterator_try_collect)]
 #![feature(let_chains)]
-#![feature(if_let_guard)]
-#![feature(min_specialization)]
-#![feature(never_type)]
-#![feature(try_blocks)]
+#![feature(rustdoc_internals)]
 #![recursion_limit = "512"] // For rustdoc
-
-#[macro_use]
-extern crate rustc_macros;
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[macro_use]
-extern crate rustc_data_structures;
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate rustc_middle;
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 mod errors;
 pub mod infer;

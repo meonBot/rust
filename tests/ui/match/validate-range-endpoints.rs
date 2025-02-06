@@ -1,6 +1,4 @@
-#![feature(exclusive_range_pattern)]
 #![feature(inline_const_pat)]
-#![allow(incomplete_features)]
 #![allow(overlapping_range_endpoints)]
 
 fn main() {

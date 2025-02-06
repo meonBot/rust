@@ -3,21 +3,22 @@ use clippy_utils::is_from_proc_macro;
 use clippy_utils::ty::needs_ordered_drop;
 use rustc_ast::Mutability;
 use rustc_hir::def::Res;
-use rustc_hir::{BindingAnnotation, ByRef, ExprKind, HirId, Local, Node, Pat, PatKind, QPath};
+use rustc_hir::{BindingMode, ByRef, ExprKind, HirId, LetStmt, Node, Pat, PatKind, QPath};
+use rustc_hir_typeck::expr_use_visitor::PlaceBase;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::lint::in_external_macro;
+use rustc_middle::ty::UpvarCapture;
 use rustc_session::declare_lint_pass;
-use rustc_span::symbol::Ident;
 use rustc_span::DesugaringKind;
+use rustc_span::symbol::Ident;
 
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for redundant redefinitions of local bindings.
     ///
     /// ### Why is this bad?
-    /// Redundant redefinitions of local bindings do not change behavior and are likely to be unintended.
+    /// Redundant redefinitions of local bindings do not change behavior other than variable's lifetimes and are likely to be unintended.
     ///
-    /// Note that although these bindings do not affect your code's meaning, they _may_ affect `rustc`'s stack allocation.
+    /// These rebindings can be intentional to shorten the lifetimes of variables because they affect when the `Drop` implementation is called. Other than that, they do not affect your code's meaning but they _may_ affect `rustc`'s stack allocation.
     ///
     /// ### Example
     /// ```no_run
@@ -39,16 +40,16 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "1.73.0"]
     pub REDUNDANT_LOCALS,
-    correctness,
+    suspicious,
     "redundant redefinition of a local binding"
 }
 declare_lint_pass!(RedundantLocals => [REDUNDANT_LOCALS]);
 
 impl<'tcx> LateLintPass<'tcx> for RedundantLocals {
-    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx Local<'tcx>) {
+    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx LetStmt<'tcx>) {
         if !local.span.is_desugaring(DesugaringKind::Async)
             // the pattern is a single by-value binding
-            && let PatKind::Binding(BindingAnnotation(ByRef::No, mutability), _, ident, None) = local.pat.kind
+            && let PatKind::Binding(BindingMode(ByRef::No, mutability), _, ident, None) = local.pat.kind
             // the binding is not type-ascribed
             && local.ty.is_none()
             // the expression is a resolved path
@@ -59,7 +60,7 @@ impl<'tcx> LateLintPass<'tcx> for RedundantLocals {
             && last_segment.ident == ident
             // resolve the path to its defining binding pattern
             && let Res::Local(binding_id) = cx.qpath_res(&qpath, expr.hir_id)
-            && let Node::Pat(binding_pat) = cx.tcx.hir().get(binding_id)
+            && let Node::Pat(binding_pat) = cx.tcx.hir_node(binding_id)
             // the previous binding has the same mutability
             && find_binding(binding_pat, ident).is_some_and(|bind| bind.1 == mutability)
             // the local does not change the effect of assignments to the binding. see #11290
@@ -67,23 +68,47 @@ impl<'tcx> LateLintPass<'tcx> for RedundantLocals {
             // the local does not affect the code's drop behavior
             && !needs_ordered_drop(cx, cx.typeck_results().expr_ty(expr))
             // the local is user-controlled
-            && !in_external_macro(cx.sess(), local.span)
+            && !local.span.in_external_macro(cx.sess().source_map())
             && !is_from_proc_macro(cx, expr)
+            && !is_by_value_closure_capture(cx, local.hir_id, binding_id)
         {
             span_lint_and_help(
                 cx,
                 REDUNDANT_LOCALS,
                 local.span,
-                &format!("redundant redefinition of a binding `{ident}`"),
+                format!("redundant redefinition of a binding `{ident}`"),
                 Some(binding_pat.span),
-                &format!("`{ident}` is initially defined here"),
+                format!("`{ident}` is initially defined here"),
             );
         }
     }
 }
 
+/// Checks if the enclosing body is a closure and if the given local is captured by value.
+///
+/// In those cases, the redefinition may be necessary to force a move:
+/// ```
+/// fn assert_static<T: 'static>(_: T) {}
+///
+/// let v = String::new();
+/// let closure = || {
+///   let v = v; // <- removing this redefinition makes `closure` no longer `'static`
+///   dbg!(&v);
+/// };
+/// assert_static(closure);
+/// ```
+fn is_by_value_closure_capture(cx: &LateContext<'_>, redefinition: HirId, root_variable: HirId) -> bool {
+    let closure_def_id = cx.tcx.hir().enclosing_body_owner(redefinition);
+
+    cx.tcx.is_closure_like(closure_def_id.to_def_id())
+        && cx.tcx.closure_captures(closure_def_id).iter().any(|c| {
+            matches!(c.info.capture_kind, UpvarCapture::ByValue)
+                && matches!(c.place.base, PlaceBase::Upvar(upvar) if upvar.var_path.hir_id == root_variable)
+        })
+}
+
 /// Find the annotation of a binding introduced by a pattern, or `None` if it's not introduced.
-fn find_binding(pat: &Pat<'_>, name: Ident) -> Option<BindingAnnotation> {
+fn find_binding(pat: &Pat<'_>, name: Ident) -> Option<BindingMode> {
     let mut ret = None;
 
     pat.each_binding_or_first(&mut |annotation, _, _, ident| {

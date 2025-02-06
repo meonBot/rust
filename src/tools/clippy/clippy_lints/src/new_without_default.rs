@@ -1,12 +1,11 @@
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::return_ty;
 use clippy_utils::source::snippet;
-use clippy_utils::sugg::DiagnosticExt;
+use clippy_utils::sugg::DiagExt;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir::HirIdSet;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::lint::in_external_macro;
 use rustc_session::impl_lint_pass;
 use rustc_span::sym;
 
@@ -69,17 +68,13 @@ impl<'tcx> LateLintPass<'tcx> for NewWithoutDefault {
             for assoc_item in *items {
                 if assoc_item.kind == (hir::AssocItemKind::Fn { has_self: false }) {
                     let impl_item = cx.tcx.hir().impl_item(assoc_item.id);
-                    if in_external_macro(cx.sess(), impl_item.span) {
+                    if impl_item.span.in_external_macro(cx.sess().source_map()) {
                         return;
                     }
                     if let hir::ImplItemKind::Fn(ref sig, _) = impl_item.kind {
                         let name = impl_item.ident.name;
                         let id = impl_item.owner_id;
-                        if sig.header.constness == hir::Constness::Const {
-                            // can't be implemented by default
-                            return;
-                        }
-                        if sig.header.unsafety == hir::Unsafety::Unsafe {
+                        if sig.header.is_unsafe() {
                             // can't be implemented for unsafe new
                             return;
                         }
@@ -138,9 +133,7 @@ impl<'tcx> LateLintPass<'tcx> for NewWithoutDefault {
                                 NEW_WITHOUT_DEFAULT,
                                 id.into(),
                                 impl_item.span,
-                                &format!(
-                                    "you should consider adding a `Default` implementation for `{self_type_snip}`"
-                                ),
+                                format!("you should consider adding a `Default` implementation for `{self_type_snip}`"),
                                 |diag| {
                                     diag.suggest_prepend_item(
                                         cx,

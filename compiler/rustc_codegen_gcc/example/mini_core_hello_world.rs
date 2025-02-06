@@ -1,7 +1,7 @@
 // Adapted from https://github.com/sunfishcode/mir2cranelift/blob/master/rust-examples/nocore-hello-world.rs
 
 #![feature(
-    no_core, unboxed_closures, start, lang_items, never_type, linkage,
+    no_core, unboxed_closures, lang_items, never_type, linkage,
     extern_types, thread_local
 )]
 #![no_core]
@@ -98,7 +98,8 @@ fn start<T: Termination + 'static>(
 }
 
 static mut NUM: u8 = 6 * 7;
-static NUM_REF: &'static u8 = unsafe { &NUM };
+
+static NUM_REF: &'static u8 = unsafe { &* &raw const NUM };
 
 macro_rules! assert {
     ($e:expr) => {
@@ -257,13 +258,13 @@ fn main() {
 
     assert_eq!(((|()| 42u8) as fn(()) -> u8)(()), 42);
 
-    extern {
+    extern "C" {
         #[linkage = "weak"]
         static ABC: *const u8;
     }
 
     {
-        extern {
+        extern "C" {
             #[linkage = "weak"]
             static ABC: *const u8;
         }
@@ -429,6 +430,7 @@ pub enum E2<X> {
     V4,
 }
 
+#[allow(unreachable_patterns)]
 fn check_niche_behavior () {
     if let E1::V2 { .. } = (E1::V1 { f: true }) {
         intrinsics::abort();

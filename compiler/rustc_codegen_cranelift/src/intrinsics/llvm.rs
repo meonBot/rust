@@ -1,42 +1,28 @@
 //! Emulate LLVM intrinsics
 
-use rustc_middle::ty::GenericArgsRef;
-
 use crate::intrinsics::*;
 use crate::prelude::*;
 
 pub(crate) fn codegen_llvm_intrinsic_call<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
     intrinsic: &str,
-    generic_args: GenericArgsRef<'tcx>,
-    args: &[mir::Operand<'tcx>],
+    args: &[Spanned<mir::Operand<'tcx>>],
     ret: CPlace<'tcx>,
     target: Option<BasicBlock>,
     span: Span,
 ) {
     if intrinsic.starts_with("llvm.aarch64") {
-        return llvm_aarch64::codegen_aarch64_llvm_intrinsic_call(
-            fx,
-            intrinsic,
-            generic_args,
-            args,
-            ret,
-            target,
-        );
+        return llvm_aarch64::codegen_aarch64_llvm_intrinsic_call(fx, intrinsic, args, ret, target);
     }
     if intrinsic.starts_with("llvm.x86") {
-        return llvm_x86::codegen_x86_llvm_intrinsic_call(
-            fx,
-            intrinsic,
-            generic_args,
-            args,
-            ret,
-            target,
-            span,
-        );
+        return llvm_x86::codegen_x86_llvm_intrinsic_call(fx, intrinsic, args, ret, target, span);
     }
 
     match intrinsic {
+        "llvm.prefetch" => {
+            // Nothing to do. This is merely a perf hint.
+        }
+
         _ if intrinsic.starts_with("llvm.ctlz.v") => {
             intrinsic_args!(fx, args => (a); intrinsic);
 
@@ -70,7 +56,7 @@ pub(crate) fn codegen_llvm_intrinsic_call<'tcx>(
 
         _ => {
             fx.tcx
-                .sess
+                .dcx()
                 .warn(format!("unsupported llvm intrinsic {}; replacing with trap", intrinsic));
             crate::trap::trap_unimplemented(fx, intrinsic);
             return;

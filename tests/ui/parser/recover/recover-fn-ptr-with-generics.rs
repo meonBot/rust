@@ -19,9 +19,9 @@ fn main() {
     type Hmm = fn<>();
     //~^ ERROR function pointer types may not have generic parameters
 
-    let _: extern fn<'a: 'static>();
+    let _: extern "C" fn<'a: 'static>();
     //~^ ERROR function pointer types may not have generic parameters
-    //~| ERROR lifetime bounds cannot be used in this context
+    //~| ERROR bounds cannot be used in this context
 
     let _: for<'any> extern "C" fn<'u>();
     //~^ ERROR function pointer types may not have generic parameters

@@ -1,19 +1,20 @@
-//! This module defines the `DepNode` type which the compiler uses to represent
-//! nodes in the dependency graph. A `DepNode` consists of a `DepKind` (which
-//! specifies the kind of thing it represents, like a piece of HIR, MIR, etc)
-//! and a `Fingerprint`, a 128 bit hash value the exact meaning of which
+//! This module defines the [`DepNode`] type which the compiler uses to represent
+//! nodes in the [dependency graph]. A `DepNode` consists of a [`DepKind`] (which
+//! specifies the kind of thing it represents, like a piece of HIR, MIR, etc.)
+//! and a [`Fingerprint`], a 128-bit hash value, the exact meaning of which
 //! depends on the node's `DepKind`. Together, the kind and the fingerprint
 //! fully identify a dependency node, even across multiple compilation sessions.
 //! In other words, the value of the fingerprint does not depend on anything
 //! that is specific to a given compilation session, like an unpredictable
-//! interning key (e.g., NodeId, DefId, Symbol) or the numeric value of a
+//! interning key (e.g., `NodeId`, `DefId`, `Symbol`) or the numeric value of a
 //! pointer. The concept behind this could be compared to how git commit hashes
-//! uniquely identify a given commit and has a few advantages:
+//! uniquely identify a given commit. The fingerprinting approach has
+//! a few advantages:
 //!
 //! * A `DepNode` can simply be serialized to disk and loaded in another session
-//!   without the need to do any "rebasing (like we have to do for Spans and
-//!   NodeIds) or "retracing" like we had to do for `DefId` in earlier
-//!   implementations of the dependency graph.
+//!   without the need to do any "rebasing" (like we have to do for Spans and
+//!   NodeIds) or "retracing" (like we had to do for `DefId` in earlier
+//!   implementations of the dependency graph).
 //! * A `Fingerprint` is just a bunch of bits, which allows `DepNode` to
 //!   implement `Copy`, `Sync`, `Send`, `Freeze`, etc.
 //! * Since we just have a bit pattern, `DepNode` can be mapped from disk into
@@ -26,10 +27,12 @@
 //!   could not be instantiated because the current compilation session
 //!   contained no `DefId` for thing that had been removed.
 //!
-//! `DepNode` definition happens in `rustc_middle` with the `define_dep_nodes!()` macro.
-//! This macro defines the `DepKind` enum and a corresponding `DepConstructor` enum. The
-//! `DepConstructor` enum links a `DepKind` to the parameters that are needed at runtime in order
-//! to construct a valid `DepNode` fingerprint.
+//! `DepNode` definition happens in `rustc_middle` with the
+//! `define_dep_nodes!()` macro. This macro defines the `DepKind` enum. Each
+//! `DepKind` has its own parameters that are needed at runtime in order to
+//! construct a valid `DepNode` fingerprint. However, only `CompileCodegenUnit`
+//! and `CompileMonoItem` are constructed explicitly (with
+//! `make_compile_codegen_unit` and `make_compile_mono_item`).
 //!
 //! Because the macro sees what parameters a given `DepKind` requires, it can
 //! "infer" some properties for each kind of `DepNode`:
@@ -41,16 +44,28 @@
 //!   in which case it is possible to map the node's fingerprint back to the
 //!   `DefId` it was computed from. In other cases, too much information gets
 //!   lost during fingerprint computation.
+//!
+//! `make_compile_codegen_unit` and `make_compile_mono_items`, together with
+//! `DepNode::new()`, ensure that only valid `DepNode` instances can be
+//! constructed. For example, the API does not allow for constructing
+//! parameterless `DepNode`s with anything other than a zeroed out fingerprint.
+//! More generally speaking, it relieves the user of the `DepNode` API of
+//! having to know how to compute the expected fingerprint for a given set of
+//! node parameters.
+//!
+//! [dependency graph]: https://rustc-dev-guide.rust-lang.org/query.html
+
+use std::fmt;
+use std::hash::Hash;
+
+use rustc_data_structures::AtomicRef;
+use rustc_data_structures::fingerprint::{Fingerprint, PackedFingerprint};
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd, ToStableHashKey};
+use rustc_hir::definitions::DefPathHash;
+use rustc_macros::{Decodable, Encodable};
 
 use super::{DepContext, FingerprintStyle};
 use crate::ich::StableHashingContext;
-
-use rustc_data_structures::fingerprint::{Fingerprint, PackedFingerprint};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd, ToStableHashKey};
-use rustc_data_structures::AtomicRef;
-use rustc_hir::definitions::DefPathHash;
-use std::fmt;
-use std::hash::Hash;
 
 /// This serves as an index into arrays built by `make_dep_kind_array`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -75,8 +90,6 @@ impl DepKind {
     }
 }
 
-static_assert_size!(DepKind, 2);
-
 pub fn default_dep_kind_debug(kind: DepKind, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("DepKind").field("variant", &kind.variant).finish()
 }
@@ -95,15 +108,6 @@ pub struct DepNode {
     pub kind: DepKind,
     pub hash: PackedFingerprint,
 }
-
-// We keep a lot of `DepNode`s in memory during compilation. It's not
-// required that their size stay the same, but we don't want to change
-// it inadvertently. This assert just ensures we're aware of any change.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-static_assert_size!(DepNode, 18);
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-static_assert_size!(DepNode, 24);
 
 impl DepNode {
     /// Creates a new, parameterless DepNode. This method will assert
@@ -285,8 +289,7 @@ pub struct DepKindStruct<Tcx: DepContext> {
 /// some independent path or string that persists between runs without
 /// the need to be mapped or unmapped. (This ensures we can serialize
 /// them even in the absence of a tcx.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Encodable, Decodable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encodable, Decodable)]
 pub struct WorkProductId {
     hash: Fingerprint,
 }
@@ -312,7 +315,25 @@ impl<HCX> ToStableHashKey<HCX> for WorkProductId {
         self.hash
     }
 }
-unsafe impl StableOrd for WorkProductId {
+impl StableOrd for WorkProductId {
     // Fingerprint can use unstable (just a tuple of `u64`s), so WorkProductId can as well
     const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    // `WorkProductId` sort order is not affected by (de)serialization.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
+}
+
+// Some types are used a lot. Make sure they don't unintentionally get bigger.
+#[cfg(target_pointer_width = "64")]
+mod size_asserts {
+    use rustc_data_structures::static_assert_size;
+
+    use super::*;
+    // tidy-alphabetical-start
+    static_assert_size!(DepKind, 2);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    static_assert_size!(DepNode, 18);
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    static_assert_size!(DepNode, 24);
+    // tidy-alphabetical-end
 }

@@ -1,6 +1,6 @@
 // MIR for `variant_b::{closure#0}` after PreCodegen
 
-fn variant_b::{closure#0}(_1: &mut {closure@$DIR/slice_filter.rs:12:25: 12:41}, _2: &&(usize, usize, usize, usize)) -> bool {
+fn variant_b::{closure#0}(_1: &mut {closure@$DIR/slice_filter.rs:11:25: 11:41}, _2: &&(usize, usize, usize, usize)) -> bool {
     let mut _0: bool;
     let mut _3: &(usize, usize, usize, usize);
     let _4: usize;
@@ -21,28 +21,28 @@ fn variant_b::{closure#0}(_1: &mut {closure@$DIR/slice_filter.rs:12:25: 12:41}, 
     }
 
     bb0: {
-        _3 = deref_copy (*_2);
-        _4 = ((*_3).0: usize);
-        _5 = deref_copy (*_2);
-        _6 = ((*_5).1: usize);
-        _7 = deref_copy (*_2);
-        _8 = ((*_7).2: usize);
-        _9 = deref_copy (*_2);
-        _10 = ((*_9).3: usize);
+        _3 = copy (*_2);
+        _4 = copy ((*_3).0: usize);
+        _5 = copy (*_2);
+        _6 = copy ((*_5).1: usize);
+        _7 = copy (*_2);
+        _8 = copy ((*_7).2: usize);
+        _9 = copy (*_2);
+        _10 = copy ((*_9).3: usize);
         StorageLive(_11);
-        _11 = Le(_4, _8);
+        _11 = Le(copy _4, copy _8);
         switchInt(move _11) -> [0: bb2, otherwise: bb1];
     }
 
     bb1: {
         StorageLive(_12);
-        _12 = Le(_10, _6);
+        _12 = Le(copy _10, copy _6);
         switchInt(move _12) -> [0: bb2, otherwise: bb6];
     }
 
     bb2: {
         StorageLive(_13);
-        _13 = Le(_8, _4);
+        _13 = Le(copy _8, copy _4);
         switchInt(move _13) -> [0: bb3, otherwise: bb4];
     }
 
@@ -52,7 +52,7 @@ fn variant_b::{closure#0}(_1: &mut {closure@$DIR/slice_filter.rs:12:25: 12:41}, 
     }
 
     bb4: {
-        _0 = Le(_6, _10);
+        _0 = Le(copy _6, copy _10);
         goto -> bb5;
     }
 

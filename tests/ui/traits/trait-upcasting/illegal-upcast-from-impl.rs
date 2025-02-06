@@ -1,5 +1,8 @@
-// revisions: current next
-//[next] compile-flags: -Ztrait-solver=next
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
+
+#![feature(trait_upcasting)]
 
 trait Super {
     type Assoc;

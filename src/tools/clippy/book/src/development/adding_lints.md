@@ -18,7 +18,6 @@ because that's clearly a non-descriptive name.
     - [Cargo lints](#cargo-lints)
   - [Rustfix tests](#rustfix-tests)
   - [Testing manually](#testing-manually)
-  - [Running directly](#running-directly)
   - [Lint declaration](#lint-declaration)
   - [Lint registration](#lint-registration)
   - [Lint passes](#lint-passes)
@@ -176,23 +175,26 @@ the tests.
 
 Manually testing against an example file can be useful if you have added some
 `println!`s and the test suite output becomes unreadable. To try Clippy with
-your local modifications, run
+your local modifications, run the following from the Clippy directory:
 
-```
+```bash
 cargo dev lint input.rs
 ```
 
-from the working copy root. With tests in place, let's have a look at
-implementing our lint now.
+To run Clippy on an existing project rather than a single file you can use
 
-## Running directly
+```bash
+cargo dev lint /path/to/project
+```
 
-While it's easier to just use `cargo dev lint`, it might be desirable to get
-`target/release/cargo-clippy` and `target/release/clippy-driver` to work as well in some cases.
-By default, they don't work because clippy dynamically links rustc. To help them find rustc,
-add the path printed by`rustc --print target-libdir` (ran inside this workspace so that the rustc version matches)
-to your library search path.
-On linux, this can be done by setting the `LD_LIBRARY_PATH` environment variable to that path.
+Or set up a rustup toolchain that points to the local Clippy binaries
+
+```bash
+cargo dev setup toolchain
+
+# Then in `/path/to/project` you can run
+cargo +clippy clippy
+```
 
 ## Lint declaration
 
@@ -297,10 +299,11 @@ This is good, because it makes writing this particular lint less complicated.
 We have to make this decision with every new Clippy lint. It boils down to using
 either [`EarlyLintPass`][early_lint_pass] or [`LateLintPass`][late_lint_pass].
 
-In short, the `LateLintPass` has access to type information while the
-`EarlyLintPass` doesn't. If you don't need access to type information, use the
-`EarlyLintPass`. The `EarlyLintPass` is also faster. However, linting speed
-hasn't really been a concern with Clippy so far.
+`EarlyLintPass` runs before type checking and
+[HIR](https://rustc-dev-guide.rust-lang.org/hir.html) lowering, while `LateLintPass`
+runs after these stages, providing access to type information. The `cargo dev new_lint` command
+defaults to the recommended `LateLintPass`, but you can specify `--pass=early` if your lint
+only needs AST level analysis.
 
 Since we don't need type information for checking the function name, we used
 `--pass=early` when running the new lint automation and all the imports were
@@ -436,7 +439,7 @@ need to ensure that the MSRV configured for the project is >= the MSRV of the
 required Rust feature. If multiple features are required, just use the one with
 a lower MSRV.
 
-First, add an MSRV alias for the required feature in [`clippy_config::msrvs`].
+First, add an MSRV alias for the required feature in [`clippy_utils::msrvs`].
 This can be accessed later as `msrvs::STR_STRIP_PREFIX`, for example.
 
 ```rust
@@ -456,9 +459,8 @@ pub struct ManualStrip {
 }
 
 impl ManualStrip {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self { msrv: conf.msrv.clone() }
     }
 }
 ```
@@ -516,7 +518,7 @@ define_Conf! {
 }
 ```
 
-[`clippy_config::msrvs`]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_config/msrvs/index.html
+[`clippy_utils::msrvs`]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_config/msrvs/index.html
 
 Afterwards update the documentation for the book as described in [Adding configuration to a lint](#adding-configuration-to-a-lint).
 
@@ -536,7 +538,7 @@ via `Tools -> Clippy` and you should see the generated code in the output below.
 If the command was executed successfully, you can copy the code over to where
 you are implementing your lint.
 
-[author_example]: https://play.rust-lang.org/?version=nightly&mode=debug&edition=2018&gist=9a12cb60e5c6ad4e3003ac6d5e63cf55
+[author_example]: https://play.rust-lang.org/?version=nightly&mode=debug&edition=2024&gist=9a12cb60e5c6ad4e3003ac6d5e63cf55
 
 ## Print HIR lint
 
@@ -551,7 +553,7 @@ attribute to expressions you often need to enable
 _Clippy_.
 
 [_High-Level Intermediate Representation (HIR)_]: https://rustc-dev-guide.rust-lang.org/hir.html
-[print_hir_example]: https://play.rust-lang.org/?version=nightly&mode=debug&edition=2021&gist=daf14db3a7f39ca467cd1b86c34b9afb
+[print_hir_example]: https://play.rust-lang.org/?version=nightly&mode=debug&edition=2024&gist=daf14db3a7f39ca467cd1b86c34b9afb
 
 ## Documentation
 
@@ -584,6 +586,11 @@ declare_clippy_lint! {
     "function named `foo`, which is not a descriptive name"
 }
 ```
+
+If the lint is in the `restriction` group because it lints things that are not
+necessarily “bad” but are more of a style choice, then replace the
+“Why is this bad?” section heading with “Why restrict this?”, to avoid writing
+“Why is this bad? It isn't, but ...”.
 
 Once your lint is merged, this documentation will show up in the [lint
 list][lint_list].
@@ -682,7 +689,6 @@ for some users. Adding a configuration is done in the following steps:
        ]);
 
        // New manual definition struct
-       #[derive(Copy, Clone)]
        pub struct StructName {}
 
        impl_lint_pass!(StructName => [
@@ -693,7 +699,6 @@ for some users. Adding a configuration is done in the following steps:
     2. Next add the configuration value and a corresponding creation method like
        this:
        ```rust
-       #[derive(Copy, Clone)]
        pub struct StructName {
            configuration_ident: Type,
        }
@@ -701,9 +706,9 @@ for some users. Adding a configuration is done in the following steps:
        // ...
 
        impl StructName {
-           pub fn new(configuration_ident: Type) -> Self {
+           pub fn new(conf: &'static Conf) -> Self {
                Self {
-                   configuration_ident,
+                   configuration_ident: conf.configuration_ident,
                }
            }
        }
@@ -719,8 +724,7 @@ for some users. Adding a configuration is done in the following steps:
    store.register_*_pass(|| box module::StructName);
 
    // New registration with configuration value
-   let configuration_ident = conf.configuration_ident.clone();
-   store.register_*_pass(move || box module::StructName::new(configuration_ident));
+   store.register_*_pass(move || box module::StructName::new(conf));
    ```
 
    Congratulations the work is almost done. The configuration value can now be
@@ -736,7 +740,7 @@ for some users. Adding a configuration is done in the following steps:
 
 5. Update [Lint Configuration](../lint_configuration.md)
 
-   Run `cargo collect-metadata` to generate documentation changes for the book.
+   Run `cargo bless --test config-metadata` to generate documentation changes for the book.
 
 [`clippy_config::conf`]: https://github.com/rust-lang/rust-clippy/blob/master/clippy_config/src/conf.rs
 [`clippy_lints` lib file]: https://github.com/rust-lang/rust-clippy/blob/master/clippy_lints/src/lib.rs
@@ -784,7 +788,7 @@ don't hesitate to ask on [Zulip] or in the issue/PR.
 [`snippet`]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_utils/source/fn.snippet.html
 [let-chains]: https://github.com/rust-lang/rust/pull/94927
 [from_expansion]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_span/struct.Span.html#method.from_expansion
-[in_external_macro]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/lint/fn.in_external_macro.html
+[in_external_macro]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_span/struct.Span.html#method.in_external_macro
 [span]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_span/struct.Span.html
 [applicability]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_errors/enum.Applicability.html
 [rustc-dev-guide]: https://rustc-dev-guide.rust-lang.org/

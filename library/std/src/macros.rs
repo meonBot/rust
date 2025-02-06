@@ -230,7 +230,7 @@ macro_rules! eprintln {
 /// ```rust
 /// let a = 2;
 /// let b = dbg!(a * 2) + 1;
-/// //      ^-- prints: [src/main.rs:2] a * 2 = 4
+/// //      ^-- prints: [src/main.rs:2:9] a * 2 = 4
 /// assert_eq!(b, 5);
 /// ```
 ///
@@ -281,7 +281,7 @@ macro_rules! eprintln {
 /// This prints to [stderr]:
 ///
 /// ```text,ignore
-/// [src/main.rs:4] n.checked_sub(4) = None
+/// [src/main.rs:2:22] n.checked_sub(4) = None
 /// ```
 ///
 /// Naive factorial implementation:
@@ -301,15 +301,15 @@ macro_rules! eprintln {
 /// This prints to [stderr]:
 ///
 /// ```text,ignore
-/// [src/main.rs:3] n <= 1 = false
-/// [src/main.rs:3] n <= 1 = false
-/// [src/main.rs:3] n <= 1 = false
-/// [src/main.rs:3] n <= 1 = true
-/// [src/main.rs:4] 1 = 1
-/// [src/main.rs:5] n * factorial(n - 1) = 2
-/// [src/main.rs:5] n * factorial(n - 1) = 6
-/// [src/main.rs:5] n * factorial(n - 1) = 24
-/// [src/main.rs:11] factorial(4) = 24
+/// [src/main.rs:2:8] n <= 1 = false
+/// [src/main.rs:2:8] n <= 1 = false
+/// [src/main.rs:2:8] n <= 1 = false
+/// [src/main.rs:2:8] n <= 1 = true
+/// [src/main.rs:3:9] 1 = 1
+/// [src/main.rs:7:9] n * factorial(n - 1) = 2
+/// [src/main.rs:7:9] n * factorial(n - 1) = 6
+/// [src/main.rs:7:9] n * factorial(n - 1) = 24
+/// [src/main.rs:9:1] factorial(4) = 24
 /// ```
 ///
 /// The `dbg!(..)` macro moves the input:
@@ -355,15 +355,15 @@ macro_rules! dbg {
     // `$val` expression could be a block (`{ .. }`), in which case the `eprintln!`
     // will be malformed.
     () => {
-        $crate::eprintln!("[{}:{}]", $crate::file!(), $crate::line!())
+        $crate::eprintln!("[{}:{}:{}]", $crate::file!(), $crate::line!(), $crate::column!())
     };
     ($val:expr $(,)?) => {
         // Use of `match` here is intentional because it affects the lifetimes
         // of temporaries - https://stackoverflow.com/a/48732525/1063961
         match $val {
             tmp => {
-                $crate::eprintln!("[{}:{}] {} = {:#?}",
-                    $crate::file!(), $crate::line!(), $crate::stringify!($val), &tmp);
+                $crate::eprintln!("[{}:{}:{}] {} = {:#?}",
+                    $crate::file!(), $crate::line!(), $crate::column!(), $crate::stringify!($val), &tmp);
                 tmp
             }
         }
@@ -371,12 +371,4 @@ macro_rules! dbg {
     ($($val:expr),+ $(,)?) => {
         ($($crate::dbg!($val)),+,)
     };
-}
-
-#[cfg(test)]
-macro_rules! assert_approx_eq {
-    ($a:expr, $b:expr) => {{
-        let (a, b) = (&$a, &$b);
-        assert!((*a - *b).abs() < 1.0e-6, "{} is not approximately equal to {}", *a, *b);
-    }};
 }

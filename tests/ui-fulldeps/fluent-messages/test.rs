@@ -1,19 +1,19 @@
-// normalize-stderr-test "could not open Fluent resource:.*" -> "could not open Fluent resource: os-specific message"
+//@ normalize-stderr: "could not open Fluent resource:.*" -> "could not open Fluent resource: os-specific message"
 
 #![feature(rustc_private)]
 #![crate_type = "lib"]
 extern crate rustc_errors;
 extern crate rustc_fluent_macro;
 
-/// Copy of the relevant `DiagnosticMessage` variant constructed by `fluent_messages` as it
-/// expects `crate::DiagnosticMessage` to exist.
-pub enum DiagnosticMessage {
+/// Copy of the relevant `DiagMessage` variant constructed by `fluent_messages` as it
+/// expects `crate::DiagMessage` to exist.
+pub enum DiagMessage {
     FluentIdentifier(std::borrow::Cow<'static, str>, Option<std::borrow::Cow<'static, str>>),
 }
 
-/// Copy of the relevant `SubdiagnosticMessage` variant constructed by `fluent_messages` as it
-/// expects `crate::SubdiagnosticMessage` to exist.
-pub enum SubdiagnosticMessage {
+/// Copy of the relevant `SubdiagMessage` variant constructed by `fluent_messages` as it
+/// expects `crate::SubdiagMessage` to exist.
+pub enum SubdiagMessage {
     FluentAttr(std::borrow::Cow<'static, str>),
 }
 
@@ -79,4 +79,9 @@ mod bad_escape {
     //~^ ERROR invalid escape `\n`
     //~| ERROR invalid escape `\"`
     //~| ERROR invalid escape `\'`
+}
+
+mod many_lines {
+    rustc_fluent_macro::fluent_messages! { "./many-lines.ftl" }
+    //~^ ERROR could not parse Fluent resource
 }

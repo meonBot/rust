@@ -2,9 +2,9 @@ use super::REDUNDANT_PATTERN_MATCHING;
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::{is_lint_allowed, is_wild, span_contains_comment};
-use rustc_ast::{Attribute, LitKind};
+use rustc_ast::LitKind;
 use rustc_errors::Applicability;
-use rustc_hir::{Arm, BorrowKind, Expr, ExprKind, Guard, Pat, PatKind, QPath};
+use rustc_hir::{Arm, Attribute, BorrowKind, Expr, ExprKind, Pat, PatKind, QPath};
 use rustc_lint::{LateContext, LintContext};
 use rustc_middle::ty;
 use rustc_span::source_map::Spanned;
@@ -41,14 +41,8 @@ pub(super) fn check_match<'tcx>(
     find_matches_sugg(
         cx,
         scrutinee,
-        arms.iter().map(|arm| {
-            (
-                cx.tcx.hir().attrs(arm.hir_id),
-                Some(arm.pat),
-                arm.body,
-                arm.guard.as_ref(),
-            )
-        }),
+        arms.iter()
+            .map(|arm| (cx.tcx.hir().attrs(arm.hir_id), Some(arm.pat), arm.body, arm.guard)),
         e,
         false,
     )
@@ -67,14 +61,7 @@ where
     I: Clone
         + DoubleEndedIterator
         + ExactSizeIterator
-        + Iterator<
-            Item = (
-                &'a [Attribute],
-                Option<&'a Pat<'b>>,
-                &'a Expr<'b>,
-                Option<&'a Guard<'b>>,
-            ),
-        >,
+        + Iterator<Item = (&'a [Attribute], Option<&'a Pat<'b>>, &'a Expr<'b>, Option<&'a Expr<'b>>)>,
 {
     if !span_contains_comment(cx.sess().source_map(), expr.span)
         && iter.len() >= 2
@@ -87,7 +74,7 @@ where
         && b0 != b1
         && (first_guard.is_none() || iter.len() == 0)
         && first_attrs.is_empty()
-        && iter.all(|arm| find_bool_lit(&arm.2.kind).map_or(false, |b| b == b0) && arm.3.is_none() && arm.0.is_empty())
+        && iter.all(|arm| find_bool_lit(&arm.2.kind).is_some_and(|b| b == b0) && arm.3.is_none() && arm.0.is_empty())
     {
         if let Some(last_pat) = last_pat_opt {
             if !is_wild(last_pat) {
@@ -115,7 +102,7 @@ where
                 })
                 .join(" | ")
         };
-        let pat_and_guard = if let Some(Guard::If(g)) = first_guard {
+        let pat_and_guard = if let Some(g) = first_guard {
             format!(
                 "{pat} if {}",
                 snippet_with_applicability(cx, g.span, "..", &mut applicability)
@@ -130,12 +117,12 @@ where
             if let ty::Ref(..) = cx.typeck_results().expr_ty(ex_inner).kind() {
                 ex_new = ex_inner;
             }
-        };
+        }
         span_lint_and_sugg(
             cx,
             MATCH_LIKE_MATCHES_MACRO,
             expr.span,
-            &format!(
+            format!(
                 "{} expression looks like `matches!` macro",
                 if is_if_let { "if let .. else" } else { "match" }
             ),
@@ -161,7 +148,7 @@ fn find_bool_lit(ex: &ExprKind<'_>) -> Option<bool> {
         }) => Some(*b),
         ExprKind::Block(
             rustc_hir::Block {
-                stmts: &[],
+                stmts: [],
                 expr: Some(exp),
                 ..
             },

@@ -7,10 +7,10 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
-use crate::utils::helpers::{output, t};
+use super::helpers;
 use crate::Build;
+use crate::utils::helpers::{start_process, t};
 
 #[derive(Clone, Default)]
 pub enum GitInfo {
@@ -44,7 +44,7 @@ impl GitInfo {
         }
 
         // Make sure git commands work
-        match Command::new("git").arg("rev-parse").current_dir(dir).output() {
+        match helpers::git(Some(dir)).arg("rev-parse").as_command_mut().output() {
             Ok(ref out) if out.status.success() => {}
             _ => return GitInfo::Absent,
         }
@@ -56,22 +56,23 @@ impl GitInfo {
         }
 
         // Ok, let's scrape some info
-        let ver_date = output(
-            Command::new("git")
-                .current_dir(dir)
+        let ver_date = start_process(
+            helpers::git(Some(dir))
                 .arg("log")
                 .arg("-1")
                 .arg("--date=short")
-                .arg("--pretty=format:%cd"),
+                .arg("--pretty=format:%cd")
+                .as_command_mut(),
         );
-        let ver_hash = output(Command::new("git").current_dir(dir).arg("rev-parse").arg("HEAD"));
-        let short_ver_hash = output(
-            Command::new("git").current_dir(dir).arg("rev-parse").arg("--short=9").arg("HEAD"),
+        let ver_hash =
+            start_process(helpers::git(Some(dir)).arg("rev-parse").arg("HEAD").as_command_mut());
+        let short_ver_hash = start_process(
+            helpers::git(Some(dir)).arg("rev-parse").arg("--short=9").arg("HEAD").as_command_mut(),
         );
         GitInfo::Present(Some(Info {
-            commit_date: ver_date.trim().to_string(),
-            sha: ver_hash.trim().to_string(),
-            short_sha: short_ver_hash.trim().to_string(),
+            commit_date: ver_date().trim().to_string(),
+            sha: ver_hash().trim().to_string(),
+            short_sha: short_ver_hash().trim().to_string(),
         }))
     }
 
@@ -97,7 +98,7 @@ impl GitInfo {
 
     pub fn version(&self, build: &Build, num: &str) -> String {
         let mut version = build.release(num);
-        if let Some(ref inner) = self.info() {
+        if let Some(inner) = self.info() {
             version.push_str(" (");
             version.push_str(&inner.short_sha);
             version.push(' ');
@@ -150,7 +151,7 @@ pub fn read_commit_info_file(root: &Path) -> Option<Info> {
 /// root.
 pub fn write_commit_info_file(root: &Path, info: &Info) {
     let commit_info = format!("{}\n{}\n{}\n", info.sha, info.short_sha, info.commit_date);
-    t!(fs::write(root.join("git-commit-info"), &commit_info));
+    t!(fs::write(root.join("git-commit-info"), commit_info));
 }
 
 /// Write the commit hash to the `git-commit-hash` file given the project root.

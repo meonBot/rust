@@ -2,16 +2,15 @@
 
 **Tier: 3**
 
-ARM64e iOS (12.0+)
+ARM64e iOS (14.0+)
 
 ## Target maintainers
 
-- Artyom Tetyukhin ([@arttet](https://github.com/https://github.com/arttet))
+- Artyom Tetyukhin ([@arttet](https://github.com/arttet))
 
 ## Requirements
 
-These targets only support cross-compilation.
-The targets do support `std`.
+See the docs on [`*-apple-ios`](apple-ios.md) for general iOS requirements.
 
 ## Building the target
 
@@ -19,7 +18,7 @@ You can build Rust with support for the targets by adding it to the `target` lis
 
 ```toml
 [build]
-target = [ "arm64e-apple-ios" ]
+target = ["arm64e-apple-ios"]
 ```
 
 ## Building Rust programs

@@ -23,20 +23,21 @@
 //! allows for doing a more fine-grained check to see if pre- or post-lto data
 //! was re-used.
 
-use crate::errors;
-use rustc_ast as ast;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::unord::UnordSet;
-use rustc_errors::{DiagnosticArgValue, IntoDiagnosticArg};
+use std::borrow::Cow;
+use std::fmt;
+
+use rustc_data_structures::unord::{UnordMap, UnordSet};
+use rustc_errors::{DiagArgValue, IntoDiagArg};
+use rustc_hir as hir;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::CodegenUnitNameBuilder;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
-use rustc_span::symbol::sym;
-use rustc_span::{Span, Symbol};
-use std::borrow::Cow;
-use std::fmt;
+use rustc_span::{Span, Symbol, sym};
 use thin_vec::ThinVec;
+use tracing::debug;
+
+use crate::errors;
 
 #[allow(missing_docs)]
 pub fn assert_module_sources(tcx: TyCtxt<'_>, set_reuse: &dyn Fn(&mut CguReuseTracker)) {
@@ -45,8 +46,12 @@ pub fn assert_module_sources(tcx: TyCtxt<'_>, set_reuse: &dyn Fn(&mut CguReuseTr
             return;
         }
 
-        let available_cgus =
-            tcx.collect_and_partition_mono_items(()).1.iter().map(|cgu| cgu.name()).collect();
+        let available_cgus = tcx
+            .collect_and_partition_mono_items(())
+            .codegen_units
+            .iter()
+            .map(|cgu| cgu.name())
+            .collect();
 
         let mut ams = AssertModuleSource {
             tcx,
@@ -75,7 +80,7 @@ struct AssertModuleSource<'tcx> {
 }
 
 impl<'tcx> AssertModuleSource<'tcx> {
-    fn check_attr(&mut self, attr: &ast::Attribute) {
+    fn check_attr(&mut self, attr: &hir::Attribute) {
         let (expected_reuse, comp_kind) = if attr.has_name(sym::rustc_partition_reused) {
             (CguReuse::PreLto, ComparisonKind::AtLeast)
         } else if attr.has_name(sym::rustc_partition_codegened) {
@@ -88,7 +93,7 @@ impl<'tcx> AssertModuleSource<'tcx> {
                 sym::any => (CguReuse::PreLto, ComparisonKind::AtLeast),
                 other => {
                     self.tcx
-                        .sess
+                        .dcx()
                         .emit_fatal(errors::UnknownReuseKind { span: attr.span, kind: other });
                 }
             }
@@ -97,7 +102,7 @@ impl<'tcx> AssertModuleSource<'tcx> {
         };
 
         if !self.tcx.sess.opts.unstable_opts.query_dep_graph {
-            self.tcx.sess.emit_fatal(errors::MissingQueryDepGraph { span: attr.span });
+            self.tcx.dcx().emit_fatal(errors::MissingQueryDepGraph { span: attr.span });
         }
 
         if !self.check_config(attr) {
@@ -109,7 +114,7 @@ impl<'tcx> AssertModuleSource<'tcx> {
         let crate_name = self.tcx.crate_name(LOCAL_CRATE).to_string();
 
         if !user_path.starts_with(&crate_name) {
-            self.tcx.sess.emit_fatal(errors::MalformedCguName {
+            self.tcx.dcx().emit_fatal(errors::MalformedCguName {
                 span: attr.span,
                 user_path,
                 crate_name,
@@ -139,7 +144,7 @@ impl<'tcx> AssertModuleSource<'tcx> {
         if !self.available_cgus.contains(&cgu_name) {
             let cgu_names: Vec<&str> =
                 self.available_cgus.items().map(|cgu| cgu.as_str()).into_sorted_stable_ord();
-            self.tcx.sess.emit_err(errors::NoModuleNamed {
+            self.tcx.dcx().emit_err(errors::NoModuleNamed {
                 span: attr.span,
                 user_path,
                 cgu_name,
@@ -156,13 +161,13 @@ impl<'tcx> AssertModuleSource<'tcx> {
         );
     }
 
-    fn field(&self, attr: &ast::Attribute, name: Symbol) -> Symbol {
+    fn field(&self, attr: &hir::Attribute, name: Symbol) -> Symbol {
         for item in attr.meta_item_list().unwrap_or_else(ThinVec::new) {
             if item.has_name(name) {
                 if let Some(value) = item.value_str() {
                     return value;
                 } else {
-                    self.tcx.sess.emit_fatal(errors::FieldAssociatedValueExpected {
+                    self.tcx.dcx().emit_fatal(errors::FieldAssociatedValueExpected {
                         span: item.span(),
                         name,
                     });
@@ -170,13 +175,13 @@ impl<'tcx> AssertModuleSource<'tcx> {
             }
         }
 
-        self.tcx.sess.emit_fatal(errors::NoField { span: attr.span, name });
+        self.tcx.dcx().emit_fatal(errors::NoField { span: attr.span, name });
     }
 
     /// Scan for a `cfg="foo"` attribute and check whether we have a
     /// cfg flag called `foo`.
-    fn check_config(&self, attr: &ast::Attribute) -> bool {
-        let config = &self.tcx.sess.parse_sess.config;
+    fn check_config(&self, attr: &hir::Attribute) -> bool {
+        let config = &self.tcx.sess.psess.config;
         let value = self.field(attr, sym::cfg);
         debug!("check_config(config={:?}, value={:?})", config, value);
         if config.iter().any(|&(name, _)| name == value) {
@@ -199,15 +204,15 @@ impl fmt::Display for CguReuse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             CguReuse::No => write!(f, "No"),
-            CguReuse::PreLto => write!(f, "PreLto "),
-            CguReuse::PostLto => write!(f, "PostLto "),
+            CguReuse::PreLto => write!(f, "PreLto"),
+            CguReuse::PostLto => write!(f, "PostLto"),
         }
     }
 }
 
-impl IntoDiagnosticArg for CguReuse {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
-        DiagnosticArgValue::Str(Cow::Owned(self.to_string()))
+impl IntoDiagArg for CguReuse {
+    fn into_diag_arg(self) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Owned(self.to_string()))
     }
 }
 
@@ -218,8 +223,8 @@ pub enum ComparisonKind {
 }
 
 struct TrackerData {
-    actual_reuse: FxHashMap<String, CguReuse>,
-    expected_reuse: FxHashMap<String, (String, Span, CguReuse, ComparisonKind)>,
+    actual_reuse: UnordMap<String, CguReuse>,
+    expected_reuse: UnordMap<String, (String, Span, CguReuse, ComparisonKind)>,
 }
 
 pub struct CguReuseTracker {
@@ -267,9 +272,11 @@ impl CguReuseTracker {
 
     fn check_expected_reuse(&self, sess: &Session) {
         if let Some(ref data) = self.data {
-            for (cgu_name, &(ref cgu_user_name, ref error_span, expected_reuse, comparison_kind)) in
-                &data.expected_reuse
-            {
+            let keys = data.expected_reuse.keys().into_sorted_stable_ord();
+            for cgu_name in keys {
+                let &(ref cgu_user_name, ref error_span, expected_reuse, comparison_kind) =
+                    data.expected_reuse.get(cgu_name).unwrap();
+
                 if let Some(&actual_reuse) = data.actual_reuse.get(cgu_name) {
                     let (error, at_least) = match comparison_kind {
                         ComparisonKind::Exact => (expected_reuse != actual_reuse, false),
@@ -278,16 +285,16 @@ impl CguReuseTracker {
 
                     if error {
                         let at_least = if at_least { 1 } else { 0 };
-                        errors::IncorrectCguReuseType {
+                        sess.dcx().emit_err(errors::IncorrectCguReuseType {
                             span: *error_span,
                             cgu_user_name,
                             actual_reuse,
                             expected_reuse,
                             at_least,
-                        };
+                        });
                     }
                 } else {
-                    sess.emit_fatal(errors::CguNotRecorded { cgu_user_name, cgu_name });
+                    sess.dcx().emit_fatal(errors::CguNotRecorded { cgu_user_name, cgu_name });
                 }
             }
         }

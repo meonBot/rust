@@ -1,30 +1,31 @@
-use crate::util;
-
-use rustc_ast::token;
-use rustc_ast::{LitKind, MetaItemKind};
-use rustc_codegen_ssa::traits::CodegenBackend;
-use rustc_data_structures::defer;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::stable_hasher::StableHasher;
-use rustc_data_structures::sync::Lrc;
-use rustc_errors::registry::Registry;
-use rustc_errors::{ErrorGuaranteed, Handler};
-use rustc_lint::LintStore;
-use rustc_middle::util::Providers;
-use rustc_middle::{bug, ty};
-use rustc_parse::maybe_new_parser_from_source_str;
-use rustc_query_impl::QueryCtxt;
-use rustc_query_system::query::print_query_stack;
-use rustc_session::config::{self, Cfg, CheckCfg, ExpectedValues, Input, OutFileName};
-use rustc_session::filesearch::sysroot_candidates;
-use rustc_session::parse::ParseSess;
-use rustc_session::{lint, CompilerIO, EarlyErrorHandler, Session};
-use rustc_span::source_map::FileLoader;
-use rustc_span::symbol::sym;
-use rustc_span::FileName;
 use std::path::PathBuf;
 use std::result;
 use std::sync::Arc;
+
+use rustc_ast::{LitKind, MetaItemKind, token};
+use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::jobserver;
+use rustc_data_structures::stable_hasher::StableHasher;
+use rustc_errors::registry::Registry;
+use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
+use rustc_lint::LintStore;
+use rustc_middle::ty;
+use rustc_middle::ty::CurrentGcx;
+use rustc_middle::util::Providers;
+use rustc_parse::new_parser_from_source_str;
+use rustc_parse::parser::attr::AllowLeadingUnsafe;
+use rustc_query_impl::QueryCtxt;
+use rustc_query_system::query::print_query_stack;
+use rustc_session::config::{self, Cfg, CheckCfg, ExpectedValues, Input, OutFileName};
+use rustc_session::filesearch::{self, sysroot_candidates};
+use rustc_session::parse::ParseSess;
+use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, lint};
+use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMapInputs};
+use rustc_span::{FileName, sym};
+use tracing::trace;
+
+use crate::util;
 
 pub type Result<T> = result::Result<T, ErrorGuaranteed>;
 
@@ -39,28 +40,33 @@ pub struct Compiler {
     pub sess: Session,
     pub codegen_backend: Box<dyn CodegenBackend>,
     pub(crate) override_queries: Option<fn(&Session, &mut Providers)>,
+    pub(crate) current_gcx: CurrentGcx,
 }
 
 /// Converts strings provided as `--cfg [cfgspec]` into a `Cfg`.
-pub(crate) fn parse_cfg(handler: &EarlyErrorHandler, cfgs: Vec<String>) -> Cfg {
+pub(crate) fn parse_cfg(dcx: DiagCtxtHandle<'_>, cfgs: Vec<String>) -> Cfg {
     cfgs.into_iter()
         .map(|s| {
-            let sess = ParseSess::with_silent_emitter(Some(format!(
-                "this error occurred on the command line: `--cfg={s}`"
-            )));
+            let psess = ParseSess::with_silent_emitter(
+                vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE],
+                format!("this error occurred on the command line: `--cfg={s}`"),
+                true,
+            );
             let filename = FileName::cfg_spec_source_code(&s);
 
             macro_rules! error {
                 ($reason: expr) => {
-                    handler.early_error(format!(
+                    #[allow(rustc::untranslatable_diagnostic)]
+                    #[allow(rustc::diagnostic_outside_of_impl)]
+                    dcx.fatal(format!(
                         concat!("invalid `--cfg` argument: `{}` (", $reason, ")"),
                         s
                     ));
                 };
             }
 
-            match maybe_new_parser_from_source_str(&sess, filename, s.to_string()) {
-                Ok(mut parser) => match parser.parse_meta_item() {
+            match new_parser_from_source_str(&psess, filename, s.to_string()) {
+                Ok(mut parser) => match parser.parse_meta_item(AllowLeadingUnsafe::No) {
                     Ok(meta_item) if parser.token == token::Eof => {
                         if meta_item.path.segments.len() != 1 {
                             error!("argument key must be an identifier");
@@ -79,7 +85,7 @@ pub(crate) fn parse_cfg(handler: &EarlyErrorHandler, cfgs: Vec<String>) -> Cfg {
                     Ok(..) => {}
                     Err(err) => err.cancel(),
                 },
-                Err(errs) => drop(errs),
+                Err(errs) => errs.into_iter().for_each(|err| err.cancel()),
             }
 
             // If the user tried to use a key="value" flag, but is missing the quotes, provide
@@ -97,26 +103,60 @@ pub(crate) fn parse_cfg(handler: &EarlyErrorHandler, cfgs: Vec<String>) -> Cfg {
 }
 
 /// Converts strings provided as `--check-cfg [specs]` into a `CheckCfg`.
-pub(crate) fn parse_check_cfg(handler: &EarlyErrorHandler, specs: Vec<String>) -> CheckCfg {
+pub(crate) fn parse_check_cfg(dcx: DiagCtxtHandle<'_>, specs: Vec<String>) -> CheckCfg {
     // If any --check-cfg is passed then exhaustive_values and exhaustive_names
     // are enabled by default.
     let exhaustive_names = !specs.is_empty();
     let exhaustive_values = !specs.is_empty();
     let mut check_cfg = CheckCfg { exhaustive_names, exhaustive_values, ..CheckCfg::default() };
 
-    let mut old_syntax = None;
     for s in specs {
-        let sess = ParseSess::with_silent_emitter(Some(format!(
-            "this error occurred on the command line: `--check-cfg={s}`"
-        )));
+        let psess = ParseSess::with_silent_emitter(
+            vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE],
+            format!("this error occurred on the command line: `--check-cfg={s}`"),
+            true,
+        );
         let filename = FileName::cfg_spec_source_code(&s);
+
+        const VISIT: &str =
+            "visit <https://doc.rust-lang.org/nightly/rustc/check-cfg.html> for more details";
 
         macro_rules! error {
             ($reason:expr) => {
-                handler.early_error(format!(
-                    concat!("invalid `--check-cfg` argument: `{}` (", $reason, ")"),
-                    s
-                ))
+                #[allow(rustc::untranslatable_diagnostic)]
+                #[allow(rustc::diagnostic_outside_of_impl)]
+                {
+                    let mut diag =
+                        dcx.struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
+                    diag.note($reason);
+                    diag.note(VISIT);
+                    diag.emit()
+                }
+            };
+            (in $arg:expr, $reason:expr) => {
+                #[allow(rustc::untranslatable_diagnostic)]
+                #[allow(rustc::diagnostic_outside_of_impl)]
+                {
+                    let mut diag =
+                        dcx.struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
+
+                    let pparg = rustc_ast_pretty::pprust::meta_list_item_to_string($arg);
+                    if let Some(lit) = $arg.lit() {
+                        let (lit_kind_article, lit_kind_descr) = {
+                            let lit_kind = lit.as_token_lit().kind;
+                            (lit_kind.article(), lit_kind.descr())
+                        };
+                        diag.note(format!(
+                            "`{pparg}` is {lit_kind_article} {lit_kind_descr} literal"
+                        ));
+                    } else {
+                        diag.note(format!("`{pparg}` is invalid"));
+                    }
+
+                    diag.note($reason);
+                    diag.note(VISIT);
+                    diag.emit()
+                }
             };
         }
 
@@ -124,12 +164,15 @@ pub(crate) fn parse_check_cfg(handler: &EarlyErrorHandler, specs: Vec<String>) -
             error!("expected `cfg(name, values(\"value1\", \"value2\", ... \"valueN\"))`")
         };
 
-        let Ok(mut parser) = maybe_new_parser_from_source_str(&sess, filename, s.to_string())
-        else {
-            expected_error();
+        let mut parser = match new_parser_from_source_str(&psess, filename, s.to_string()) {
+            Ok(parser) => parser,
+            Err(errs) => {
+                errs.into_iter().for_each(|err| err.cancel());
+                expected_error();
+            }
         };
 
-        let meta_item = match parser.parse_meta_item() {
+        let meta_item = match parser.parse_meta_item(AllowLeadingUnsafe::No) {
             Ok(meta_item) if parser.token == token::Eof => meta_item,
             Ok(..) => expected_error(),
             Err(err) => {
@@ -142,174 +185,110 @@ pub(crate) fn parse_check_cfg(handler: &EarlyErrorHandler, specs: Vec<String>) -
             expected_error();
         };
 
-        let mut set_old_syntax = || {
-            // defaults are flipped for the old syntax
-            if old_syntax == None {
+        if !meta_item.has_name(sym::cfg) {
+            expected_error();
+        }
+
+        let mut names = Vec::new();
+        let mut values: FxHashSet<_> = Default::default();
+
+        let mut any_specified = false;
+        let mut values_specified = false;
+        let mut values_any_specified = false;
+
+        for arg in args {
+            if arg.is_word()
+                && let Some(ident) = arg.ident()
+            {
+                if values_specified {
+                    error!("`cfg()` names cannot be after values");
+                }
+                names.push(ident);
+            } else if arg.has_name(sym::any)
+                && let Some(args) = arg.meta_item_list()
+            {
+                if any_specified {
+                    error!("`any()` cannot be specified multiple times");
+                }
+                any_specified = true;
+                if !args.is_empty() {
+                    error!(in arg, "`any()` takes no argument");
+                }
+            } else if arg.has_name(sym::values)
+                && let Some(args) = arg.meta_item_list()
+            {
+                if names.is_empty() {
+                    error!("`values()` cannot be specified before the names");
+                } else if values_specified {
+                    error!("`values()` cannot be specified multiple times");
+                }
+                values_specified = true;
+
+                for arg in args {
+                    if let Some(LitKind::Str(s, _)) = arg.lit().map(|lit| &lit.kind) {
+                        values.insert(Some(*s));
+                    } else if arg.has_name(sym::any)
+                        && let Some(args) = arg.meta_item_list()
+                    {
+                        if values_any_specified {
+                            error!(in arg, "`any()` in `values()` cannot be specified multiple times");
+                        }
+                        values_any_specified = true;
+                        if !args.is_empty() {
+                            error!(in arg, "`any()` in `values()` takes no argument");
+                        }
+                    } else if arg.has_name(sym::none)
+                        && let Some(args) = arg.meta_item_list()
+                    {
+                        values.insert(None);
+                        if !args.is_empty() {
+                            error!(in arg, "`none()` in `values()` takes no argument");
+                        }
+                    } else {
+                        error!(in arg, "`values()` arguments must be string literals, `none()` or `any()`");
+                    }
+                }
+            } else {
+                error!(in arg, "`cfg()` arguments must be simple identifiers, `any()` or `values(...)`");
+            }
+        }
+
+        if !values_specified && !any_specified {
+            // `cfg(name)` is equivalent to `cfg(name, values(none()))` so add
+            // an implicit `none()`
+            values.insert(None);
+        } else if !values.is_empty() && values_any_specified {
+            error!(
+                "`values()` arguments cannot specify string literals and `any()` at the same time"
+            );
+        }
+
+        if any_specified {
+            if names.is_empty() && values.is_empty() && !values_specified && !values_any_specified {
                 check_cfg.exhaustive_names = false;
-                check_cfg.exhaustive_values = false;
-            }
-            old_syntax = Some(true);
-        };
-
-        if meta_item.has_name(sym::names) {
-            set_old_syntax();
-
-            check_cfg.exhaustive_names = true;
-            for arg in args {
-                if arg.is_word()
-                    && let Some(ident) = arg.ident()
-                {
-                    check_cfg.expecteds.entry(ident.name).or_insert(ExpectedValues::Any);
-                } else {
-                    error!("`names()` arguments must be simple identifiers");
-                }
-            }
-        } else if meta_item.has_name(sym::values) {
-            set_old_syntax();
-
-            if let Some((name, values)) = args.split_first() {
-                if name.is_word()
-                    && let Some(ident) = name.ident()
-                {
-                    let expected_values = check_cfg
-                        .expecteds
-                        .entry(ident.name)
-                        .and_modify(|expected_values| match expected_values {
-                            ExpectedValues::Some(_) => {}
-                            ExpectedValues::Any => {
-                                // handle the case where names(...) was done
-                                // before values by changing to a list
-                                *expected_values = ExpectedValues::Some(FxHashSet::default());
-                            }
-                        })
-                        .or_insert_with(|| ExpectedValues::Some(FxHashSet::default()));
-
-                    let ExpectedValues::Some(expected_values) = expected_values else {
-                        bug!("`expected_values` should be a list a values")
-                    };
-
-                    for val in values {
-                        if let Some(LitKind::Str(s, _)) = val.lit().map(|lit| &lit.kind) {
-                            expected_values.insert(Some(*s));
-                        } else {
-                            error!("`values()` arguments must be string literals");
-                        }
-                    }
-
-                    if values.is_empty() {
-                        expected_values.insert(None);
-                    }
-                } else {
-                    error!("`values()` first argument must be a simple identifier");
-                }
-            } else if args.is_empty() {
-                check_cfg.exhaustive_values = true;
             } else {
-                expected_error();
-            }
-        } else if meta_item.has_name(sym::cfg) {
-            old_syntax = Some(false);
-
-            let mut names = Vec::new();
-            let mut values: FxHashSet<_> = Default::default();
-
-            let mut any_specified = false;
-            let mut values_specified = false;
-            let mut values_any_specified = false;
-
-            for arg in args {
-                if arg.is_word()
-                    && let Some(ident) = arg.ident()
-                {
-                    if values_specified {
-                        error!("`cfg()` names cannot be after values");
-                    }
-                    names.push(ident);
-                } else if arg.has_name(sym::any)
-                    && let Some(args) = arg.meta_item_list()
-                {
-                    if any_specified {
-                        error!("`any()` cannot be specified multiple times");
-                    }
-                    any_specified = true;
-                    if !args.is_empty() {
-                        error!("`any()` must be empty");
-                    }
-                } else if arg.has_name(sym::values)
-                    && let Some(args) = arg.meta_item_list()
-                {
-                    if names.is_empty() {
-                        error!("`values()` cannot be specified before the names");
-                    } else if values_specified {
-                        error!("`values()` cannot be specified multiple times");
-                    }
-                    values_specified = true;
-
-                    for arg in args {
-                        if let Some(LitKind::Str(s, _)) = arg.lit().map(|lit| &lit.kind) {
-                            values.insert(Some(*s));
-                        } else if arg.has_name(sym::any)
-                            && let Some(args) = arg.meta_item_list()
-                        {
-                            if values_any_specified {
-                                error!("`any()` in `values()` cannot be specified multiple times");
-                            }
-                            values_any_specified = true;
-                            if !args.is_empty() {
-                                error!("`any()` must be empty");
-                            }
-                        } else {
-                            error!("`values()` arguments must be string literals or `any()`");
-                        }
-                    }
-                } else {
-                    error!(
-                        "`cfg()` arguments must be simple identifiers, `any()` or `values(...)`"
-                    );
-                }
-            }
-
-            if values.is_empty() && !values_any_specified && !any_specified {
-                values.insert(None);
-            } else if !values.is_empty() && values_any_specified {
-                error!(
-                    "`values()` arguments cannot specify string literals and `any()` at the same time"
-                );
-            }
-
-            if any_specified {
-                if names.is_empty()
-                    && values.is_empty()
-                    && !values_specified
-                    && !values_any_specified
-                {
-                    check_cfg.exhaustive_names = false;
-                } else {
-                    error!("`cfg(any())` can only be provided in isolation");
-                }
-            } else {
-                for name in names {
-                    check_cfg
-                        .expecteds
-                        .entry(name.name)
-                        .and_modify(|v| match v {
-                            ExpectedValues::Some(v) if !values_any_specified => {
-                                v.extend(values.clone())
-                            }
-                            ExpectedValues::Some(_) => *v = ExpectedValues::Any,
-                            ExpectedValues::Any => {}
-                        })
-                        .or_insert_with(|| {
-                            if values_any_specified {
-                                ExpectedValues::Any
-                            } else {
-                                ExpectedValues::Some(values.clone())
-                            }
-                        });
-                }
+                error!("`cfg(any())` can only be provided in isolation");
             }
         } else {
-            expected_error();
+            for name in names {
+                check_cfg
+                    .expecteds
+                    .entry(name.name)
+                    .and_modify(|v| match v {
+                        ExpectedValues::Some(v) if !values_any_specified => {
+                            v.extend(values.clone())
+                        }
+                        ExpectedValues::Some(_) => *v = ExpectedValues::Any,
+                        ExpectedValues::Any => {}
+                    })
+                    .or_insert_with(|| {
+                        if values_any_specified {
+                            ExpectedValues::Any
+                        } else {
+                            ExpectedValues::Some(values.clone())
+                        }
+                    });
+            }
         }
     }
 
@@ -329,13 +308,20 @@ pub struct Config {
     pub output_dir: Option<PathBuf>,
     pub output_file: Option<OutFileName>,
     pub ice_file: Option<PathBuf>,
+    /// Load files from sources other than the file system.
+    ///
+    /// Has no uses within this repository, but may be used in the future by
+    /// bjorn3 for "hooking rust-analyzer's VFS into rustc at some point for
+    /// running rustc without having to save". (See #102759.)
     pub file_loader: Option<Box<dyn FileLoader + Send + Sync>>,
-    pub locale_resources: &'static [&'static str],
+    /// The list of fluent resources, used for lints declared with
+    /// [`Diagnostic`](rustc_errors::Diagnostic) and [`LintDiagnostic`](rustc_errors::LintDiagnostic).
+    pub locale_resources: Vec<&'static str>,
 
     pub lint_caps: FxHashMap<lint::LintId, lint::Level>,
 
     /// This is a callback from the driver that is called when [`ParseSess`] is created.
-    pub parse_sess_created: Option<Box<dyn FnOnce(&mut ParseSess) + Send>>,
+    pub psess_created: Option<Box<dyn FnOnce(&mut ParseSess) + Send>>,
 
     /// This is a callback to hash otherwise untracked state used by the caller, if the
     /// hash changes between runs the incremental cache will be cleared.
@@ -355,6 +341,11 @@ pub struct Config {
     pub override_queries: Option<fn(&Session, &mut Providers)>,
 
     /// This is a callback from the driver that is called to create a codegen backend.
+    ///
+    /// Has no uses within this repository, but is used by bjorn3 for "the
+    /// hotswapping branch of cg_clif" for "setting the codegen backend from a
+    /// custom driver where the custom codegen backend has arbitrary data."
+    /// (See #102759.)
     pub make_codegen_backend:
         Option<Box<dyn FnOnce(&config::Options) -> Box<dyn CodegenBackend> + Send>>,
 
@@ -364,14 +355,25 @@ pub struct Config {
     /// The inner atomic value is set to true when a feature marked as `internal` is
     /// enabled. Makes it so that "please report a bug" is hidden, as ICEs with
     /// internal features are wontfix, and they are usually the cause of the ICEs.
-    /// None signifies that this is not tracked.
-    pub using_internal_features: Arc<std::sync::atomic::AtomicBool>,
+    pub using_internal_features: &'static std::sync::atomic::AtomicBool,
 
     /// All commandline args used to invoke the compiler, with @file args fully expanded.
     /// This will only be used within debug info, e.g. in the pdb file on windows
     /// This is mainly useful for other tools that reads that debuginfo to figure out
     /// how to call the compiler with the same arguments.
     pub expanded_args: Vec<String>,
+}
+
+/// Initialize jobserver before getting `jobserver::client` and `build_session`.
+pub(crate) fn initialize_checked_jobserver(early_dcx: &EarlyDiagCtxt) {
+    jobserver::initialize_checked(|err| {
+        #[allow(rustc::untranslatable_diagnostic)]
+        #[allow(rustc::diagnostic_outside_of_impl)]
+        early_dcx
+            .early_struct_warn(err)
+            .with_note("the build environment is likely misconfigured")
+            .emit()
+    });
 }
 
 // JUSTIFICATION: before session exists, only config
@@ -382,22 +384,41 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
     // Set parallel mode before thread pool creation, which will create `Lock`s.
     rustc_data_structures::sync::set_dyn_thread_safe_mode(config.opts.unstable_opts.threads > 1);
 
+    // Check jobserver before run_in_thread_pool_with_globals, which call jobserver::acquire_thread
+    let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
+    initialize_checked_jobserver(&early_dcx);
+
+    crate::callbacks::setup_callbacks();
+
+    let sysroot = filesearch::materialize_sysroot(config.opts.maybe_sysroot.clone());
+    let target = config::build_target_config(&early_dcx, &config.opts.target_triple, &sysroot);
+    let file_loader = config.file_loader.unwrap_or_else(|| Box::new(RealFileLoader));
+    let path_mapping = config.opts.file_path_mapping();
+    let hash_kind = config.opts.unstable_opts.src_hash_algorithm(&target);
+    let checksum_hash_kind = config.opts.unstable_opts.checksum_hash_algorithm();
+
     util::run_in_thread_pool_with_globals(
+        &early_dcx,
         config.opts.edition,
         config.opts.unstable_opts.threads,
-        || {
-            crate::callbacks::setup_callbacks();
+        SourceMapInputs { file_loader, path_mapping, hash_kind, checksum_hash_kind },
+        |current_gcx| {
+            // The previous `early_dcx` can't be reused here because it doesn't
+            // impl `Send`. Creating a new one is fine.
+            let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
 
-            let handler = EarlyErrorHandler::new(config.opts.error_format);
-
-            let codegen_backend = if let Some(make_codegen_backend) = config.make_codegen_backend {
-                make_codegen_backend(&config.opts)
-            } else {
-                util::get_codegen_backend(
-                    &handler,
-                    &config.opts.maybe_sysroot,
+            let codegen_backend = match config.make_codegen_backend {
+                None => util::get_codegen_backend(
+                    &early_dcx,
+                    &sysroot,
                     config.opts.unstable_opts.codegen_backend.as_deref(),
-                )
+                    &target,
+                ),
+                Some(make_codegen_backend) => {
+                    // N.B. `make_codegen_backend` takes precedence over
+                    // `target.default_codegen_backend`, which is ignored in this case.
+                    make_codegen_backend(&config.opts)
+                }
             };
 
             let temps_dir = config.opts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
@@ -411,18 +432,17 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
             ) {
                 Ok(bundle) => bundle,
                 Err(e) => {
-                    handler.early_error(format!("failed to load fluent bundle: {e}"));
+                    // We can't translate anything if we failed to load translations
+                    #[allow(rustc::untranslatable_diagnostic)]
+                    early_dcx.early_fatal(format!("failed to load fluent bundle: {e}"))
                 }
             };
 
-            let mut locale_resources = Vec::from(config.locale_resources);
+            let mut locale_resources = config.locale_resources;
             locale_resources.push(codegen_backend.locale_resource());
 
-            // target_override is documented to be called before init(), so this is okay
-            let target_override = codegen_backend.target_override(&config.opts);
-
             let mut sess = rustc_session::build_session(
-                &handler,
+                early_dcx,
                 config.opts,
                 CompilerIO {
                     input: config.input,
@@ -431,11 +451,11 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
                     temps_dir,
                 },
                 bundle,
-                config.registry.clone(),
+                config.registry,
                 locale_resources,
                 config.lint_caps,
-                config.file_loader,
-                target_override,
+                target,
+                sysroot,
                 util::rustc_version_str().unwrap_or("unknown"),
                 config.ice_file,
                 config.using_internal_features,
@@ -444,17 +464,17 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
 
             codegen_backend.init(&sess);
 
-            let cfg = parse_cfg(&handler, config.crate_cfg);
+            let cfg = parse_cfg(sess.dcx(), config.crate_cfg);
             let mut cfg = config::build_configuration(&sess, cfg);
             util::add_configuration(&mut cfg, &mut sess, &*codegen_backend);
-            sess.parse_sess.config = cfg;
+            sess.psess.config = cfg;
 
-            let mut check_cfg = parse_check_cfg(&handler, config.crate_check_cfg);
+            let mut check_cfg = parse_check_cfg(sess.dcx(), config.crate_check_cfg);
             check_cfg.fill_well_known(&sess.target);
-            sess.parse_sess.check_config = check_cfg;
+            sess.psess.check_config = check_cfg;
 
-            if let Some(parse_sess_created) = config.parse_sess_created {
-                parse_sess_created(&mut sess.parse_sess);
+            if let Some(psess_created) = config.psess_created {
+                psess_created(&mut sess.psess);
             }
 
             if let Some(hash_untracked_state) = config.hash_untracked_state {
@@ -469,48 +489,75 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
             let mut lint_store = rustc_lint::new_lint_store(sess.enable_internal_lints());
             if let Some(register_lints) = config.register_lints.as_deref() {
                 register_lints(&sess, &mut lint_store);
-                sess.registered_lints = true;
             }
-            sess.lint_store = Some(Lrc::new(lint_store));
+            sess.lint_store = Some(Arc::new(lint_store));
 
-            let compiler =
-                Compiler { sess, codegen_backend, override_queries: config.override_queries };
+            util::check_abi_required_features(&sess);
 
-            rustc_span::set_source_map(compiler.sess.parse_sess.clone_source_map(), move || {
-                let r = {
-                    let _sess_abort_error = defer(|| {
-                        compiler.sess.finish_diagnostics(&config.registry);
-                    });
+            let compiler = Compiler {
+                sess,
+                codegen_backend,
+                override_queries: config.override_queries,
+                current_gcx,
+            };
 
-                    f(&compiler)
-                };
+            // There are two paths out of `f`.
+            // - Normal exit.
+            // - Panic, e.g. triggered by `abort_if_errors` or a fatal error.
+            //
+            // We must run `finish_diagnostics` in both cases.
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&compiler)));
 
-                let prof = compiler.sess.prof.clone();
+            compiler.sess.finish_diagnostics();
 
-                prof.generic_activity("drop_compiler").run(move || drop(compiler));
-                r
-            })
+            // If error diagnostics have been emitted, we can't return an
+            // error directly, because the return type of this function
+            // is `R`, not `Result<R, E>`. But we need to communicate the
+            // errors' existence to the caller, otherwise the caller might
+            // mistakenly think that no errors occurred and return a zero
+            // exit code. So we abort (panic) instead, similar to if `f`
+            // had panicked.
+            if res.is_ok() {
+                compiler.sess.dcx().abort_if_errors();
+            }
+
+            // Also make sure to flush delayed bugs as if we panicked, the
+            // bugs would be flushed by the Drop impl of DiagCtxt while
+            // unwinding, which would result in an abort with
+            // "panic in a destructor during cleanup".
+            compiler.sess.dcx().flush_delayed();
+
+            let res = match res {
+                Ok(res) => res,
+                // Resume unwinding if a panic happened.
+                Err(err) => std::panic::resume_unwind(err),
+            };
+
+            let prof = compiler.sess.prof.clone();
+            prof.generic_activity("drop_compiler").run(move || drop(compiler));
+
+            res
         },
     )
 }
 
 pub fn try_print_query_stack(
-    handler: &Handler,
-    num_frames: Option<usize>,
+    dcx: DiagCtxtHandle<'_>,
+    limit_frames: Option<usize>,
     file: Option<std::fs::File>,
 ) {
     eprintln!("query stack during panic:");
 
     // Be careful relying on global state here: this code is called from
-    // a panic hook, which means that the global `Handler` may be in a weird
+    // a panic hook, which means that the global `DiagCtxt` may be in a weird
     // state if it was responsible for triggering the panic.
-    let i = ty::tls::with_context_opt(|icx| {
+    let all_frames = ty::tls::with_context_opt(|icx| {
         if let Some(icx) = icx {
             ty::print::with_no_queries!(print_query_stack(
                 QueryCtxt::new(icx.tcx),
                 icx.query,
-                handler,
-                num_frames,
+                dcx,
+                limit_frames,
                 file,
             ))
         } else {
@@ -518,9 +565,14 @@ pub fn try_print_query_stack(
         }
     });
 
-    if num_frames == None || num_frames >= Some(i) {
-        eprintln!("end of query stack");
+    if let Some(limit_frames) = limit_frames
+        && all_frames > limit_frames
+    {
+        eprintln!(
+            "... and {} other queries... use `env RUST_BACKTRACE=1` to see the full query stack",
+            all_frames - limit_frames
+        );
     } else {
-        eprintln!("we're just showing a limited slice of the query stack");
+        eprintln!("end of query stack");
     }
 }

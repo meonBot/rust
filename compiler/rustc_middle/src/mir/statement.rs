@@ -1,5 +1,7 @@
-/// Functionality for statements, operands, places, and things that appear in them.
-use super::{interpret::GlobalAlloc, *};
+//! Functionality for statements, operands, places, and things that appear in them.
+
+use super::interpret::GlobalAlloc;
+use super::*;
 
 ///////////////////////////////////////////////////////////////////////////
 // Statements
@@ -60,7 +62,8 @@ impl<V, T> ProjectionElem<V, T> {
             | Self::Subtype(_)
             | Self::ConstantIndex { .. }
             | Self::Subslice { .. }
-            | Self::Downcast(_, _) => false,
+            | Self::Downcast(_, _)
+            | Self::UnwrapUnsafeBinder(..) => false,
         }
     }
 
@@ -74,7 +77,8 @@ impl<V, T> ProjectionElem<V, T> {
             | Self::Subtype(_)
             | Self::ConstantIndex { .. }
             | Self::Subslice { .. }
-            | Self::Downcast(_, _) => true,
+            | Self::Downcast(_, _)
+            | Self::UnwrapUnsafeBinder(..) => true,
         }
     }
 
@@ -100,6 +104,9 @@ impl<V, T> ProjectionElem<V, T> {
             | Self::Subtype(_)
             | Self::OpaqueCast(_)
             | Self::Subslice { .. } => false,
+
+            // FIXME(unsafe_binders): Figure this out.
+            Self::UnwrapUnsafeBinder(..) => false,
         }
     }
 }
@@ -237,6 +244,11 @@ impl<'tcx> PlaceRef<'tcx> {
     }
 
     #[inline]
+    pub fn to_place(&self, tcx: TyCtxt<'tcx>) -> Place<'tcx> {
+        Place { local: self.local, projection: tcx.mk_place_elems(self.projection) }
+    }
+
+    #[inline]
     pub fn last_projection(&self) -> Option<(PlaceRef<'tcx>, PlaceElem<'tcx>)> {
         if let &[ref proj_base @ .., elem] = self.projection {
             Some((PlaceRef { local: self.local, projection: proj_base }, elem))
@@ -325,9 +337,9 @@ impl<'tcx> Operand<'tcx> {
         span: Span,
     ) -> Operand<'tcx> {
         debug_assert!({
-            let param_env_and_ty = ty::ParamEnv::empty().and(ty);
+            let typing_env = ty::TypingEnv::fully_monomorphized();
             let type_size = tcx
-                .layout_of(param_env_and_ty)
+                .layout_of(typing_env.as_query_input(ty))
                 .unwrap_or_else(|e| panic!("could not compute layout for {ty:?}: {e:?}"))
                 .size;
             let scalar_size = match val {
@@ -381,7 +393,7 @@ impl<'tcx> Operand<'tcx> {
 impl<'tcx> ConstOperand<'tcx> {
     pub fn check_static_ptr(&self, tcx: TyCtxt<'_>) -> Option<DefId> {
         match self.const_.try_to_scalar() {
-            Some(Scalar::Ptr(ptr, _size)) => match tcx.global_alloc(ptr.provenance) {
+            Some(Scalar::Ptr(ptr, _size)) => match tcx.global_alloc(ptr.provenance.alloc_id()) {
                 GlobalAlloc::Static(def_id) => {
                     assert!(!tcx.is_thread_local_static(def_id));
                     Some(def_id)
@@ -409,14 +421,14 @@ impl<'tcx> Rvalue<'tcx> {
             // Pointer to int casts may be side-effects due to exposing the provenance.
             // While the model is undecided, we should be conservative. See
             // <https://www.ralfj.de/blog/2022/04/11/provenance-exposed.html>
-            Rvalue::Cast(CastKind::PointerExposeAddress, _, _) => false,
+            Rvalue::Cast(CastKind::PointerExposeProvenance, _, _) => false,
 
             Rvalue::Use(_)
             | Rvalue::CopyForDeref(_)
             | Rvalue::Repeat(_, _)
             | Rvalue::Ref(_, _, _)
             | Rvalue::ThreadLocalRef(_)
-            | Rvalue::AddressOf(_, _)
+            | Rvalue::RawPtr(_, _)
             | Rvalue::Len(_)
             | Rvalue::Cast(
                 CastKind::IntToInt
@@ -425,20 +437,19 @@ impl<'tcx> Rvalue<'tcx> {
                 | CastKind::IntToFloat
                 | CastKind::FnPtrToPtr
                 | CastKind::PtrToPtr
-                | CastKind::PointerCoercion(_)
-                | CastKind::PointerFromExposedAddress
-                | CastKind::DynStar
+                | CastKind::PointerCoercion(_, _)
+                | CastKind::PointerWithExposedProvenance
                 | CastKind::Transmute,
                 _,
                 _,
             )
             | Rvalue::BinaryOp(_, _)
-            | Rvalue::CheckedBinaryOp(_, _)
             | Rvalue::NullaryOp(_, _)
             | Rvalue::UnaryOp(_, _)
             | Rvalue::Discriminant(_)
             | Rvalue::Aggregate(_, _)
-            | Rvalue::ShallowInitBox(_, _) => true,
+            | Rvalue::ShallowInitBox(_, _)
+            | Rvalue::WrapUnsafeBinder(_, _) => true,
         }
     }
 }
@@ -446,15 +457,17 @@ impl<'tcx> Rvalue<'tcx> {
 impl BorrowKind {
     pub fn mutability(&self) -> Mutability {
         match *self {
-            BorrowKind::Shared | BorrowKind::Fake => Mutability::Not,
+            BorrowKind::Shared | BorrowKind::Fake(_) => Mutability::Not,
             BorrowKind::Mut { .. } => Mutability::Mut,
         }
     }
 
+    /// Returns whether borrows represented by this kind are allowed to be split into separate
+    /// Reservation and Activation phases.
     pub fn allows_two_phase_borrow(&self) -> bool {
         match *self {
             BorrowKind::Shared
-            | BorrowKind::Fake
+            | BorrowKind::Fake(_)
             | BorrowKind::Mut { kind: MutBorrowKind::Default | MutBorrowKind::ClosureCapture } => {
                 false
             }

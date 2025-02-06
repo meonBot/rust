@@ -1,12 +1,12 @@
 // Should not rely on the aliasing model for its failure.
 //@compile-flags: -Zmiri-disable-stacked-borrows
 // Needs atomic accesses larger than the pointer size
-//@ignore-64bit
+//@ignore-bitwidth: 64
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
 #[repr(align(8))]
-struct AlignedI64(i64);
+struct AlignedI64(#[allow(dead_code)] i64);
 
 fn main() {
     static X: AlignedI64 = AlignedI64(0);

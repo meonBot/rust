@@ -1,6 +1,6 @@
-use crate::spec::{cvs, FramePointer, RelroLevel, TargetOptions};
+use crate::spec::{FramePointer, RelroLevel, TargetOptions, TlsModel, cvs};
 
-pub fn opts() -> TargetOptions {
+pub(crate) fn opts() -> TargetOptions {
     TargetOptions {
         os: "openbsd".into(),
         dynamic_linking: true,
@@ -11,6 +11,7 @@ pub fn opts() -> TargetOptions {
         frame_pointer: FramePointer::Always, // FIXME 43575: should be MayOmit...
         relro_level: RelroLevel::Full,
         default_dwarf_version: 2,
+        tls_model: TlsModel::Emulated,
         ..Default::default()
     }
 }

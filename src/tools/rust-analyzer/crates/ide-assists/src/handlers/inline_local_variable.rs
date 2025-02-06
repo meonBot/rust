@@ -1,9 +1,8 @@
 use hir::{PathResolution, Semantics};
 use ide_db::{
-    base_db::FileId,
     defs::Definition,
-    search::{FileReference, UsageSearchResult},
-    RootDatabase,
+    search::{FileReference, FileReferenceNode, UsageSearchResult},
+    EditionedFileId, RootDatabase,
 };
 use syntax::{
     ast::{self, AstNode, AstToken, HasName},
@@ -63,7 +62,7 @@ pub(crate) fn inline_local_variable(acc: &mut Assists, ctx: &AssistContext<'_>) 
     let wrap_in_parens = references
         .into_iter()
         .filter_map(|FileReference { range, name, .. }| match name {
-            ast::NameLike::NameRef(name) => Some((range, name)),
+            FileReferenceNode::NameRef(name) => Some((range, name)),
             _ => None,
         })
         .map(|(range, name_ref)| {
@@ -150,7 +149,7 @@ fn inline_let(
     sema: &Semantics<'_, RootDatabase>,
     let_stmt: ast::LetStmt,
     range: TextRange,
-    file_id: FileId,
+    file_id: EditionedFileId,
 ) -> Option<InlineData> {
     let bind_pat = match let_stmt.pat()? {
         ast::Pat::IdentPat(pat) => pat,
@@ -185,7 +184,7 @@ fn inline_usage(
     sema: &Semantics<'_, RootDatabase>,
     path_expr: ast::PathExpr,
     range: TextRange,
-    file_id: FileId,
+    file_id: EditionedFileId,
 ) -> Option<InlineData> {
     let path = path_expr.path()?;
     let name = path.as_single_name_ref()?;
@@ -334,7 +333,8 @@ fn foo() {
         check_assist(
             inline_local_variable,
             r"
-fn bar(a: usize): usize { a }
+//- minicore: sized
+fn bar(a: usize) -> usize { a }
 fn foo() {
     let a$0 = bar(1) as u64;
     a + 1;
@@ -348,7 +348,7 @@ fn foo() {
     bar(a);
 }",
             r"
-fn bar(a: usize): usize { a }
+fn bar(a: usize) -> usize { a }
 fn foo() {
     (bar(1) as u64) + 1;
     if (bar(1) as u64) > 10 {

@@ -1,7 +1,7 @@
 // skip-filecheck
 // Check that CopyProp does propagate return values of call terminators.
-// unit-test: CopyProp
-// needs-unwind
+//@ test-mir-pass: CopyProp
+//@ needs-unwind
 
 #![feature(custom_mir, core_intrinsics)]
 use std::intrinsics::mir::*;
@@ -26,7 +26,7 @@ fn multiple_edges(t: bool) -> u8 {
             match t { true => bbt, _ => ret }
         }
         bbt = {
-            Call(x = dummy(13), ret, UnwindContinue())
+            Call(x = dummy(13), ReturnTo(ret), UnwindContinue())
         }
         ret = {
             // `x` is not assigned on the `bb0 -> ret` edge,

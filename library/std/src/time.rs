@@ -31,20 +31,16 @@
 
 #![stable(feature = "time", since = "1.3.0")]
 
-#[cfg(test)]
-mod tests;
+#[stable(feature = "time", since = "1.3.0")]
+pub use core::time::Duration;
+#[stable(feature = "duration_checked_float", since = "1.66.0")]
+pub use core::time::TryFromFloatSecsError;
 
 use crate::error::Error;
 use crate::fmt;
 use crate::ops::{Add, AddAssign, Sub, SubAssign};
 use crate::sys::time;
 use crate::sys_common::{FromInner, IntoInner};
-
-#[stable(feature = "time", since = "1.3.0")]
-pub use core::time::Duration;
-
-#[stable(feature = "duration_checked_float", since = "1.66.0")]
-pub use core::time::TryFromFloatSecsError;
 
 /// A measurement of a monotonically nondecreasing clock.
 /// Opaque and useful only with [`Duration`].
@@ -59,7 +55,7 @@ pub use core::time::TryFromFloatSecsError;
 /// experience time dilation (slow down or speed up), but it will never go
 /// backwards.
 /// As part of this non-guarantee it is also not specified whether system suspends count as
-/// elapsed time or not. The behavior varies across platforms and rust versions.
+/// elapsed time or not. The behavior varies across platforms and Rust versions.
 ///
 /// Instants are opaque types that can only be compared to one another. There is
 /// no method to get "the number of seconds" from an instant. Instead, it only
@@ -142,7 +138,7 @@ pub use core::time::TryFromFloatSecsError;
 /// where monotonicity is violated, or `Instant`s are subtracted in the wrong order.
 ///
 /// This workaround obscures programming errors where earlier and later instants are accidentally
-/// swapped. For this reason future rust versions may reintroduce panics.
+/// swapped. For this reason future Rust versions may reintroduce panics.
 ///
 /// [tier 1]: https://doc.rust-lang.org/rustc/platform-support.html
 /// [`duration_since`]: Instant::duration_since
@@ -179,9 +175,9 @@ pub struct Instant(time::Instant);
 /// system.
 ///
 /// A `SystemTime` does not count leap seconds.
-/// `SystemTime::now()`'s behaviour around a leap second
+/// `SystemTime::now()`'s behavior around a leap second
 /// is the same as the operating system's wall clock.
-/// The precise behaviour near a leap second
+/// The precise behavior near a leap second
 /// (e.g. whether the clock appears to run slow or fast, or stop, or jump)
 /// depends on platform and configuration,
 /// so should not be relied on.
@@ -281,6 +277,7 @@ impl Instant {
     /// ```
     #[must_use]
     #[stable(feature = "time2", since = "1.8.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "instant_now")]
     pub fn now() -> Instant {
         Instant(time::Instant::now())
     }
@@ -290,7 +287,7 @@ impl Instant {
     ///
     /// # Panics
     ///
-    /// Previous rust versions panicked when `earlier` was later than `self`. Currently this
+    /// Previous Rust versions panicked when `earlier` was later than `self`. Currently this
     /// method saturates. Future versions may reintroduce the panic in some circumstances.
     /// See [Monotonicity].
     ///
@@ -365,7 +362,7 @@ impl Instant {
     ///
     /// # Panics
     ///
-    /// Previous rust versions panicked when the current time was earlier than self. Currently this
+    /// Previous Rust versions panicked when the current time was earlier than self. Currently this
     /// method returns a Duration of zero in that case. Future versions may reintroduce the panic.
     /// See [Monotonicity].
     ///
@@ -450,7 +447,7 @@ impl Sub<Instant> for Instant {
     ///
     /// # Panics
     ///
-    /// Previous rust versions panicked when `other` was later than `self`. Currently this
+    /// Previous Rust versions panicked when `other` was later than `self`. Currently this
     /// method saturates. Future versions may reintroduce the panic in some circumstances.
     /// See [Monotonicity].
     ///

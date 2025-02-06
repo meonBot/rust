@@ -1,7 +1,5 @@
-// run-pass
-// compile-flags: -C debug-assertions
-
-#![feature(strict_provenance, pointer_is_aligned)]
+//@ run-pass
+//@ compile-flags: -C debug-assertions
 
 #[repr(packed)]
 struct Misaligner {

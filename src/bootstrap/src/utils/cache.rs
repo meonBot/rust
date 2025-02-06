@@ -3,16 +3,12 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::mem;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::Mutex;
-
-// FIXME: replace with std::lazy after it gets stabilized and reaches beta
-use once_cell::sync::Lazy;
+use std::sync::{LazyLock, Mutex};
+use std::{fmt, mem};
 
 use crate::core::builder::Step;
 
@@ -43,17 +39,17 @@ impl PartialEq<str> for Interned<String> {
         *self == other
     }
 }
-impl<'a> PartialEq<&'a str> for Interned<String> {
+impl PartialEq<&str> for Interned<String> {
     fn eq(&self, other: &&str) -> bool {
         **self == **other
     }
 }
-impl<'a, T> PartialEq<&'a Interned<T>> for Interned<T> {
+impl<T> PartialEq<&Interned<T>> for Interned<T> {
     fn eq(&self, other: &&Self) -> bool {
         self.0 == other.0
     }
 }
-impl<'a, T> PartialEq<Interned<T>> for &'a Interned<T> {
+impl<T> PartialEq<Interned<T>> for &Interned<T> {
     fn eq(&self, other: &Interned<T>) -> bool {
         self.0 == other.0
     }
@@ -64,7 +60,7 @@ unsafe impl<T> Sync for Interned<T> {}
 
 impl fmt::Display for Interned<String> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s: &str = &*self;
+        let s: &str = self;
         f.write_str(s)
     }
 }
@@ -74,7 +70,7 @@ where
     Self: Deref<Target = U>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s: &U = &*self;
+        let s: &U = self;
         f.write_fmt(format_args!("{s:?}"))
     }
 }
@@ -132,7 +128,7 @@ impl<T: Hash + Clone + Eq> TyIntern<T> {
         B: Eq + Hash + ToOwned<Owned = T> + ?Sized,
         T: Borrow<B>,
     {
-        if let Some(i) = self.set.get(&item) {
+        if let Some(i) = self.set.get(item) {
             return *i;
         }
         let item = item.to_owned();
@@ -194,20 +190,9 @@ impl Interner {
     pub fn intern_str(&self, s: &str) -> Interned<String> {
         self.strs.lock().unwrap().intern_borrow(s)
     }
-    pub fn intern_string(&self, s: String) -> Interned<String> {
-        self.strs.lock().unwrap().intern(s)
-    }
-
-    pub fn intern_path(&self, s: PathBuf) -> Interned<PathBuf> {
-        self.paths.lock().unwrap().intern(s)
-    }
-
-    pub fn intern_list(&self, v: Vec<String>) -> Interned<Vec<String>> {
-        self.lists.lock().unwrap().intern(v)
-    }
 }
 
-pub static INTERNER: Lazy<Interner> = Lazy::new(Interner::default);
+pub static INTERNER: LazyLock<Interner> = LazyLock::new(Interner::default);
 
 /// This is essentially a `HashMap` which allows storing any type in its input and
 /// any type in its output. It is a write-once cache; values are never evicted,
@@ -233,7 +218,7 @@ impl Cache {
         let type_id = TypeId::of::<S>();
         let stepcache = cache
             .entry(type_id)
-            .or_insert_with(|| Box::new(HashMap::<S, S::Output>::new()))
+            .or_insert_with(|| Box::<HashMap<S, S::Output>>::default())
             .downcast_mut::<HashMap<S, S::Output>>()
             .expect("invalid type mapped");
         assert!(!stepcache.contains_key(&step), "processing {step:?} a second time");
@@ -245,7 +230,7 @@ impl Cache {
         let type_id = TypeId::of::<S>();
         let stepcache = cache
             .entry(type_id)
-            .or_insert_with(|| Box::new(HashMap::<S, S::Output>::new()))
+            .or_insert_with(|| Box::<HashMap<S, S::Output>>::default())
             .downcast_mut::<HashMap<S, S::Output>>()
             .expect("invalid type mapped");
         stepcache.get(step).cloned()

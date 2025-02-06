@@ -1,12 +1,11 @@
+use std::fmt::Write;
+
 use rustc_data_structures::intern::Interned;
 use rustc_hir::def_id::CrateNum;
 use rustc_hir::definitions::DisambiguatedDefPathData;
-use rustc_middle::ty::{
-    self,
-    print::{PrettyPrinter, Print, PrintError, Printer},
-    GenericArg, GenericArgKind, Ty, TyCtxt,
-};
-use std::fmt::Write;
+use rustc_middle::bug;
+use rustc_middle::ty::print::{PrettyPrinter, Print, PrintError, Printer};
+use rustc_middle::ty::{self, GenericArg, GenericArgKind, Ty, TyCtxt};
 
 struct AbsolutePathPrinter<'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -31,14 +30,16 @@ impl<'tcx> Printer<'tcx> for AbsolutePathPrinter<'tcx> {
             | ty::Uint(_)
             | ty::Float(_)
             | ty::Str
+            | ty::Pat(_, _)
             | ty::Array(_, _)
             | ty::Slice(_)
-            | ty::RawPtr(_)
+            | ty::RawPtr(_, _)
             | ty::Ref(_, _, _)
-            | ty::FnPtr(_)
+            | ty::FnPtr(..)
             | ty::Never
             | ty::Tuple(_)
-            | ty::Dynamic(_, _, _) => self.pretty_print_type(ty),
+            | ty::Dynamic(_, _, _)
+            | ty::UnsafeBinder(_) => self.pretty_print_type(ty),
 
             // Placeholders (all printed as `_` to uniformize them).
             ty::Param(_) | ty::Bound(..) | ty::Placeholder(_) | ty::Infer(_) | ty::Error(_) => {
@@ -51,7 +52,8 @@ impl<'tcx> Printer<'tcx> for AbsolutePathPrinter<'tcx> {
             | ty::FnDef(def_id, args)
             | ty::Alias(ty::Projection | ty::Opaque, ty::AliasTy { def_id, args, .. })
             | ty::Closure(def_id, args)
-            | ty::Coroutine(def_id, args, _) => self.print_def_path(def_id, args),
+            | ty::CoroutineClosure(def_id, args)
+            | ty::Coroutine(def_id, args) => self.print_def_path(def_id, args),
             ty::Foreign(def_id) => self.print_def_path(def_id, &[]),
 
             ty::Alias(ty::Weak, _) => bug!("type_name: unexpected weak projection"),

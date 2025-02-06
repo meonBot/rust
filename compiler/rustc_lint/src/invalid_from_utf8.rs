@@ -2,6 +2,7 @@ use std::str::Utf8Error;
 
 use rustc_ast::LitKind;
 use rustc_hir::{Expr, ExprKind};
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::source_map::Spanned;
 use rustc_span::sym;
 
@@ -78,7 +79,7 @@ impl<'tcx> LateLintPass<'tcx> for InvalidFromUtf8 {
                 let valid_up_to = utf8_error.valid_up_to();
                 let is_unchecked_variant = diag_item.as_str().contains("unchecked");
 
-                cx.emit_spanned_lint(
+                cx.emit_span_lint(
                     if is_unchecked_variant {
                         INVALID_FROM_UTF8_UNCHECKED
                     } else {
@@ -111,7 +112,7 @@ impl<'tcx> LateLintPass<'tcx> for InvalidFromUtf8 {
                         .map(|e| match &e.kind {
                             ExprKind::Lit(Spanned { node: lit, .. }) => match lit {
                                 LitKind::Byte(b) => Some(*b),
-                                LitKind::Int(b, _) => Some(*b as u8),
+                                LitKind::Int(b, _) => Some(b.get() as u8),
                                 _ => None,
                             },
                             _ => None,

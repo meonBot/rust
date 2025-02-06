@@ -53,18 +53,9 @@ fn data_moved() {
 }
 
 fn run_fut<T>(fut: impl Future<Output = T>) -> T {
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
-    struct MyWaker;
-    impl Wake for MyWaker {
-        fn wake(self: Arc<Self>) {
-            unimplemented!()
-        }
-    }
-
-    let waker = Waker::from(Arc::new(MyWaker));
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
 
     let mut pinned = Box::pin(fut);
     loop {

@@ -1,5 +1,5 @@
-use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet;
 use clippy_utils::ty::is_type_diagnostic_item;
 use clippy_utils::usage::mutated_variables;
@@ -21,7 +21,7 @@ pub(super) fn check<'tcx>(
     unwrap_arg: &'tcx hir::Expr<'_>,
     msrv: &Msrv,
 ) -> bool {
-    // lint if the caller of `map()` is an `Option`
+    // lint if the caller of `map()` is an `Option` or a `Result`.
     let is_option = is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(recv), sym::Option);
     let is_result = is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(recv), sym::Result);
 

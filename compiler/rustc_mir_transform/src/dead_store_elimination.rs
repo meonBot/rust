@@ -12,31 +12,32 @@
 //!     will still not cause any further changes.
 //!
 
-use crate::util::is_within_packed;
+use rustc_middle::bug;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
+use rustc_mir_dataflow::Analysis;
 use rustc_mir_dataflow::debuginfo::debuginfo_locals;
 use rustc_mir_dataflow::impls::{
-    borrowed_locals, LivenessTransferFunction, MaybeTransitiveLiveLocals,
+    LivenessTransferFunction, MaybeTransitiveLiveLocals, borrowed_locals,
 };
-use rustc_mir_dataflow::Analysis;
+
+use crate::util::is_within_packed;
 
 /// Performs the optimization on the body
 ///
-/// The `borrowed` set must be a `BitSet` of all the locals that are ever borrowed in this body. It
-/// can be generated via the [`borrowed_locals`] function.
-pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+/// The `borrowed` set must be a `DenseBitSet` of all the locals that are ever borrowed in this
+/// body. It can be generated via the [`borrowed_locals`] function.
+fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
     let borrowed_locals = borrowed_locals(body);
 
     // If the user requests complete debuginfo, mark the locals that appear in it as live, so
-    // we don't remove assignements to them.
+    // we don't remove assignments to them.
     let mut always_live = debuginfo_locals(body);
     always_live.union(&borrowed_locals);
 
     let mut live = MaybeTransitiveLiveLocals::new(&always_live)
-        .into_engine(tcx, body)
-        .iterate_to_fixpoint()
+        .iterate_to_fixpoint(tcx, body, None)
         .into_results_cursor(body);
 
     // For blocks with a call terminator, if an argument copy can be turned into a move,
@@ -52,7 +53,7 @@ pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
             live.seek_to_block_end(bb);
             let mut state = live.get().clone();
 
-            for (index, arg) in args.iter().enumerate().rev() {
+            for (index, arg) in args.iter().map(|a| &a.node).enumerate().rev() {
                 if let Operand::Copy(place) = *arg
                     && !place.is_indirect()
                     // Do not skip the transformation if the local is in debuginfo, as we do
@@ -98,10 +99,11 @@ pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
                 | StatementKind::Intrinsic(_)
                 | StatementKind::ConstEvalCounter
                 | StatementKind::PlaceMention(_)
-                | StatementKind::Nop => (),
+                | StatementKind::BackwardIncompatibleDropHint { .. }
+                | StatementKind::Nop => {}
 
                 StatementKind::FakeRead(_) | StatementKind::AscribeUserType(_, _) => {
-                    bug!("{:?} not found in this MIR phase!", &statement.kind)
+                    bug!("{:?} not found in this MIR phase!", statement.kind)
                 }
             }
         }
@@ -119,22 +121,34 @@ pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let TerminatorKind::Call { ref mut args, .. } = bbs[block].terminator_mut().kind else {
             bug!()
         };
-        let arg = &mut args[argument_index];
+        let arg = &mut args[argument_index].node;
         let Operand::Copy(place) = *arg else { bug!() };
         *arg = Operand::Move(place);
     }
-
-    crate::simplify::simplify_locals(body, tcx)
 }
 
-pub struct DeadStoreElimination;
+pub(super) enum DeadStoreElimination {
+    Initial,
+    Final,
+}
 
-impl<'tcx> MirPass<'tcx> for DeadStoreElimination {
+impl<'tcx> crate::MirPass<'tcx> for DeadStoreElimination {
+    fn name(&self) -> &'static str {
+        match self {
+            DeadStoreElimination::Initial => "DeadStoreElimination-initial",
+            DeadStoreElimination::Final => "DeadStoreElimination-final",
+        }
+    }
+
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
         sess.mir_opt_level() >= 2
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         eliminate(tcx, body);
+    }
+
+    fn is_required(&self) -> bool {
+        false
     }
 }

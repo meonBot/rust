@@ -21,22 +21,22 @@
 //!
 //! [c]: https://rust-lang.github.io/chalk/book/canonical_queries/canonicalization.html
 
-use rustc_macros::HashStable;
-use rustc_type_ir::Canonical as IrCanonical;
-use rustc_type_ir::CanonicalVarInfo as IrCanonicalVarInfo;
+use std::collections::hash_map::Entry;
+
+use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::sync::Lock;
+use rustc_macros::{HashStable, TypeFoldable, TypeVisitable};
+pub use rustc_type_ir as ir;
 pub use rustc_type_ir::{CanonicalTyVarKind, CanonicalVarKind};
 use smallvec::SmallVec;
-use std::ops::Index;
 
-use crate::infer::MemberConstraint;
 use crate::mir::ConstraintCategory;
-use crate::ty::GenericArg;
-use crate::ty::{self, BoundVar, List, Region, Ty, TyCtxt};
+use crate::ty::{self, GenericArg, List, Ty, TyCtxt, TypeFlags, TypeVisitableExt};
 
-pub type Canonical<'tcx, V> = IrCanonical<TyCtxt<'tcx>, V>;
-
-pub type CanonicalVarInfo<'tcx> = IrCanonicalVarInfo<TyCtxt<'tcx>>;
-
+pub type CanonicalQueryInput<'tcx, V> = ir::CanonicalQueryInput<TyCtxt<'tcx>, V>;
+pub type Canonical<'tcx, V> = ir::Canonical<TyCtxt<'tcx>, V>;
+pub type CanonicalVarInfo<'tcx> = ir::CanonicalVarInfo<TyCtxt<'tcx>>;
+pub type CanonicalVarValues<'tcx> = ir::CanonicalVarValues<TyCtxt<'tcx>>;
 pub type CanonicalVarInfos<'tcx> = &'tcx List<CanonicalVarInfo<'tcx>>;
 
 impl<'tcx> ty::TypeFoldable<TyCtxt<'tcx>> for CanonicalVarInfos<'tcx> {
@@ -45,74 +45,6 @@ impl<'tcx> ty::TypeFoldable<TyCtxt<'tcx>> for CanonicalVarInfos<'tcx> {
         folder: &mut F,
     ) -> Result<Self, F::Error> {
         ty::util::fold_list(self, folder, |tcx, v| tcx.mk_canonical_var_infos(v))
-    }
-}
-
-/// A set of values corresponding to the canonical variables from some
-/// `Canonical`. You can give these values to
-/// `canonical_value.substitute` to substitute them into the canonical
-/// value at the right places.
-///
-/// When you canonicalize a value `V`, you get back one of these
-/// vectors with the original values that were replaced by canonical
-/// variables. You will need to supply it later to instantiate the
-/// canonicalized query response.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TyDecodable, TyEncodable)]
-#[derive(HashStable, TypeFoldable, TypeVisitable)]
-pub struct CanonicalVarValues<'tcx> {
-    pub var_values: ty::GenericArgsRef<'tcx>,
-}
-
-impl CanonicalVarValues<'_> {
-    pub fn is_identity(&self) -> bool {
-        self.var_values.iter().enumerate().all(|(bv, arg)| match arg.unpack() {
-            ty::GenericArgKind::Lifetime(r) => {
-                matches!(*r, ty::ReBound(ty::INNERMOST, br) if br.var.as_usize() == bv)
-            }
-            ty::GenericArgKind::Type(ty) => {
-                matches!(*ty.kind(), ty::Bound(ty::INNERMOST, bt) if bt.var.as_usize() == bv)
-            }
-            ty::GenericArgKind::Const(ct) => {
-                matches!(ct.kind(), ty::ConstKind::Bound(ty::INNERMOST, bc) if bc.as_usize() == bv)
-            }
-        })
-    }
-
-    pub fn is_identity_modulo_regions(&self) -> bool {
-        let mut var = ty::BoundVar::from_u32(0);
-        for arg in self.var_values {
-            match arg.unpack() {
-                ty::GenericArgKind::Lifetime(r) => {
-                    if let ty::ReBound(ty::INNERMOST, br) = *r
-                        && var == br.var
-                    {
-                        var = var + 1;
-                    } else {
-                        // It's ok if this region var isn't unique
-                    }
-                }
-                ty::GenericArgKind::Type(ty) => {
-                    if let ty::Bound(ty::INNERMOST, bt) = *ty.kind()
-                        && var == bt.var
-                    {
-                        var = var + 1;
-                    } else {
-                        return false;
-                    }
-                }
-                ty::GenericArgKind::Const(ct) => {
-                    if let ty::ConstKind::Bound(ty::INNERMOST, bc) = ct.kind()
-                        && var == bc
-                    {
-                        var = var + 1;
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
     }
 }
 
@@ -150,11 +82,6 @@ pub struct QueryResponse<'tcx, R> {
     pub var_values: CanonicalVarValues<'tcx>,
     pub region_constraints: QueryRegionConstraints<'tcx>,
     pub certainty: Certainty,
-    /// List of opaque types which we tried to compare to another type.
-    /// Inside the query we don't know yet whether the opaque type actually
-    /// should get its hidden type inferred. So we bubble the opaque type
-    /// and the type it was compared against upwards and let the query caller
-    /// handle it.
     pub opaque_types: Vec<(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)>,
     pub value: R,
 }
@@ -163,14 +90,13 @@ pub struct QueryResponse<'tcx, R> {
 #[derive(HashStable, TypeFoldable, TypeVisitable)]
 pub struct QueryRegionConstraints<'tcx> {
     pub outlives: Vec<QueryOutlivesConstraint<'tcx>>,
-    pub member_constraints: Vec<MemberConstraint<'tcx>>,
 }
 
 impl QueryRegionConstraints<'_> {
     /// Represents an empty (trivially true) set of region
     /// constraints.
     pub fn is_empty(&self) -> bool {
-        self.outlives.is_empty() && self.member_constraints.is_empty()
+        self.outlives.is_empty()
     }
 }
 
@@ -214,80 +140,71 @@ impl<'tcx, R> QueryResponse<'tcx, R> {
 }
 
 pub type QueryOutlivesConstraint<'tcx> =
-    (ty::OutlivesPredicate<GenericArg<'tcx>, Region<'tcx>>, ConstraintCategory<'tcx>);
+    (ty::OutlivesPredicate<'tcx, GenericArg<'tcx>>, ConstraintCategory<'tcx>);
 
-TrivialTypeTraversalImpls! {
-    crate::infer::canonical::Certainty,
+#[derive(Default)]
+pub struct CanonicalParamEnvCache<'tcx> {
+    map: Lock<
+        FxHashMap<
+            ty::ParamEnv<'tcx>,
+            (Canonical<'tcx, ty::ParamEnv<'tcx>>, &'tcx [GenericArg<'tcx>]),
+        >,
+    >,
 }
 
-impl<'tcx> CanonicalVarValues<'tcx> {
-    // Given a list of canonical variables, construct a set of values which are
-    // the identity response.
-    pub fn make_identity(
+impl<'tcx> CanonicalParamEnvCache<'tcx> {
+    /// Gets the cached canonical form of `key` or executes
+    /// `canonicalize_op` and caches the result if not present.
+    ///
+    /// `canonicalize_op` is intentionally not allowed to be a closure to
+    /// statically prevent it from capturing `InferCtxt` and resolving
+    /// inference variables, which invalidates the cache.
+    pub fn get_or_insert(
+        &self,
         tcx: TyCtxt<'tcx>,
-        infos: CanonicalVarInfos<'tcx>,
-    ) -> CanonicalVarValues<'tcx> {
-        CanonicalVarValues {
-            var_values: tcx.mk_args_from_iter(infos.iter().enumerate().map(
-                |(i, info)| -> ty::GenericArg<'tcx> {
-                    match info.kind {
-                        CanonicalVarKind::Ty(_) | CanonicalVarKind::PlaceholderTy(_) => {
-                            Ty::new_bound(tcx, ty::INNERMOST, ty::BoundVar::from_usize(i).into())
-                                .into()
-                        }
-                        CanonicalVarKind::Region(_) | CanonicalVarKind::PlaceholderRegion(_) => {
-                            let br = ty::BoundRegion {
-                                var: ty::BoundVar::from_usize(i),
-                                kind: ty::BrAnon,
-                            };
-                            ty::Region::new_bound(tcx, ty::INNERMOST, br).into()
-                        }
-                        CanonicalVarKind::Effect => ty::Const::new_bound(
-                            tcx,
-                            ty::INNERMOST,
-                            ty::BoundVar::from_usize(i),
-                            tcx.types.bool,
-                        )
-                        .into(),
-                        CanonicalVarKind::Const(_, ty)
-                        | CanonicalVarKind::PlaceholderConst(_, ty) => ty::Const::new_bound(
-                            tcx,
-                            ty::INNERMOST,
-                            ty::BoundVar::from_usize(i),
-                            ty,
-                        )
-                        .into(),
-                    }
-                },
-            )),
+        key: ty::ParamEnv<'tcx>,
+        state: &mut OriginalQueryValues<'tcx>,
+        canonicalize_op: fn(
+            TyCtxt<'tcx>,
+            ty::ParamEnv<'tcx>,
+            &mut OriginalQueryValues<'tcx>,
+        ) -> Canonical<'tcx, ty::ParamEnv<'tcx>>,
+    ) -> Canonical<'tcx, ty::ParamEnv<'tcx>> {
+        if !key.has_type_flags(
+            TypeFlags::HAS_INFER | TypeFlags::HAS_PLACEHOLDER | TypeFlags::HAS_FREE_REGIONS,
+        ) {
+            return Canonical {
+                max_universe: ty::UniverseIndex::ROOT,
+                variables: List::empty(),
+                value: key,
+            };
         }
-    }
 
-    /// Creates dummy var values which should not be used in a
-    /// canonical response.
-    pub fn dummy() -> CanonicalVarValues<'tcx> {
-        CanonicalVarValues { var_values: ty::List::empty() }
-    }
+        assert_eq!(state.var_values.len(), 0);
+        assert_eq!(state.universe_map.len(), 1);
+        debug_assert_eq!(&*state.universe_map, &[ty::UniverseIndex::ROOT]);
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.var_values.len()
-    }
-}
-
-impl<'a, 'tcx> IntoIterator for &'a CanonicalVarValues<'tcx> {
-    type Item = GenericArg<'tcx>;
-    type IntoIter = ::std::iter::Copied<::std::slice::Iter<'a, GenericArg<'tcx>>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.var_values.iter()
-    }
-}
-
-impl<'tcx> Index<BoundVar> for CanonicalVarValues<'tcx> {
-    type Output = GenericArg<'tcx>;
-
-    fn index(&self, value: BoundVar) -> &GenericArg<'tcx> {
-        &self.var_values[value.as_usize()]
+        match self.map.borrow().entry(key) {
+            Entry::Occupied(e) => {
+                let (canonical, var_values) = e.get();
+                if cfg!(debug_assertions) {
+                    let mut state = state.clone();
+                    let rerun_canonical = canonicalize_op(tcx, key, &mut state);
+                    assert_eq!(rerun_canonical, *canonical);
+                    let OriginalQueryValues { var_values: rerun_var_values, universe_map } = state;
+                    assert_eq!(universe_map.len(), 1);
+                    assert_eq!(**var_values, *rerun_var_values);
+                }
+                state.var_values.extend_from_slice(var_values);
+                *canonical
+            }
+            Entry::Vacant(e) => {
+                let canonical = canonicalize_op(tcx, key, state);
+                let OriginalQueryValues { var_values, universe_map } = state;
+                assert_eq!(universe_map.len(), 1);
+                e.insert((canonical, tcx.arena.alloc_slice(var_values)));
+                canonical
+            }
+        }
     }
 }

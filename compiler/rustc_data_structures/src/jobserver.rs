@@ -1,8 +1,7 @@
-pub use jobserver_crate::Client;
-
-use jobserver_crate::{FromEnv, FromEnvErrorKind};
-
 use std::sync::{LazyLock, OnceLock};
+
+pub use jobserver_crate::{Acquired, Client, HelperThread};
+use jobserver_crate::{FromEnv, FromEnvErrorKind};
 
 // We can only call `from_env_ext` once per process
 
@@ -23,7 +22,10 @@ static GLOBAL_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
 
     if matches!(
         error.kind(),
-        FromEnvErrorKind::NoEnvVar | FromEnvErrorKind::NoJobserver | FromEnvErrorKind::Unsupported
+        FromEnvErrorKind::NoEnvVar
+            | FromEnvErrorKind::NoJobserver
+            | FromEnvErrorKind::NegativeFd
+            | FromEnvErrorKind::Unsupported
     ) {
         return Ok(default_client());
     }
@@ -52,7 +54,7 @@ fn default_client() -> Client {
 
 static GLOBAL_CLIENT_CHECKED: OnceLock<Client> = OnceLock::new();
 
-pub fn check(report_warning: impl FnOnce(&'static str)) {
+pub fn initialize_checked(report_warning: impl FnOnce(&'static str)) {
     let client_checked = match &*GLOBAL_CLIENT {
         Ok(client) => client.clone(),
         Err(e) => {

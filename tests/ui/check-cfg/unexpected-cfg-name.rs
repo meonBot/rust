@@ -1,14 +1,15 @@
 // Check warning for unexpected configuration name
 //
-// check-pass
-// revisions: names exhaustive
-// compile-flags: --check-cfg=cfg(names,exhaustive)
-// [names]compile-flags: --check-cfg=names() -Z unstable-options
-// [exhaustive]compile-flags: --check-cfg=cfg() -Z unstable-options
+//@ check-pass
+//@ no-auto-check-cfg
+//@ compile-flags: --check-cfg=cfg()
 
 #[cfg(widnows)]
 //~^ WARNING unexpected `cfg` condition name
 pub fn f() {}
+
+#[cfg(test)]
+//~^ WARNING unexpected `cfg` condition name
 
 #[cfg(windows)]
 pub fn g() {}

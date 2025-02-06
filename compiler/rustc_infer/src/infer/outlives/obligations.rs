@@ -59,20 +59,25 @@
 //! might later infer `?U` to something like `&'b u32`, which would
 //! imply that `'b: 'a`.
 
-use crate::infer::outlives::components::{push_outlives_components, Component};
-use crate::infer::outlives::env::RegionBoundPairs;
-use crate::infer::outlives::verify::VerifyBoundCx;
-use crate::infer::{
-    self, GenericKind, InferCtxt, RegionObligation, SubregionOrigin, UndoLog, VerifyBound,
-};
-use crate::traits::{ObligationCause, ObligationCauseCode};
 use rustc_data_structures::undo_log::UndoLogs;
+use rustc_middle::bug;
 use rustc_middle::mir::ConstraintCategory;
-use rustc_middle::ty::GenericArgKind;
-use rustc_middle::ty::{self, GenericArgsRef, Region, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::traits::query::NoSolution;
+use rustc_middle::ty::{
+    self, GenericArgKind, GenericArgsRef, PolyTypeOutlivesPredicate, Region, Ty, TyCtxt,
+    TypeFoldable as _, TypeVisitableExt,
+};
+use rustc_type_ir::outlives::{Component, push_outlives_components};
 use smallvec::smallvec;
+use tracing::{debug, instrument};
 
 use super::env::OutlivesEnvironment;
+use crate::infer::outlives::env::RegionBoundPairs;
+use crate::infer::outlives::verify::VerifyBoundCx;
+use crate::infer::resolve::OpportunisticRegionResolver;
+use crate::infer::snapshot::undo_log::UndoLog;
+use crate::infer::{self, GenericKind, InferCtxt, RegionObligation, SubregionOrigin, VerifyBound};
+use crate::traits::{ObligationCause, ObligationCauseCode};
 
 impl<'tcx> InferCtxt<'tcx> {
     /// Registers that the given region obligation must be resolved
@@ -95,15 +100,16 @@ impl<'tcx> InferCtxt<'tcx> {
     ) {
         debug!(?sup_type, ?sub_region, ?cause);
         let origin = SubregionOrigin::from_obligation_cause(cause, || {
-            infer::RelateParamBound(
-                cause.span,
-                sup_type,
-                match cause.code().peel_derives() {
-                    ObligationCauseCode::BindingObligation(_, span)
-                    | ObligationCauseCode::ExprBindingObligation(_, span, ..) => Some(*span),
-                    _ => None,
-                },
-            )
+            infer::RelateParamBound(cause.span, sup_type, match cause.code().peel_derives() {
+                ObligationCauseCode::WhereClause(_, span)
+                | ObligationCauseCode::WhereClauseInExpr(_, span, ..)
+                | ObligationCauseCode::OpaqueTypeBound(span, _)
+                    if !span.is_dummy() =>
+                {
+                    Some(*span)
+                }
+                _ => None,
+            })
         });
 
         self.register_region_obligation(RegionObligation { sup_type, sub_region, origin });
@@ -123,26 +129,59 @@ impl<'tcx> InferCtxt<'tcx> {
     /// flow of the inferencer. The key point is that it is
     /// invoked after all type-inference variables have been bound --
     /// right before lexical region resolution.
-    #[instrument(level = "debug", skip(self, outlives_env))]
-    pub fn process_registered_region_obligations(&self, outlives_env: &OutlivesEnvironment<'tcx>) {
+    #[instrument(level = "debug", skip(self, outlives_env, deeply_normalize_ty))]
+    pub fn process_registered_region_obligations(
+        &self,
+        outlives_env: &OutlivesEnvironment<'tcx>,
+        mut deeply_normalize_ty: impl FnMut(
+            PolyTypeOutlivesPredicate<'tcx>,
+            SubregionOrigin<'tcx>,
+        )
+            -> Result<PolyTypeOutlivesPredicate<'tcx>, NoSolution>,
+    ) -> Result<(), (PolyTypeOutlivesPredicate<'tcx>, SubregionOrigin<'tcx>)> {
         assert!(!self.in_snapshot(), "cannot process registered region obligations in a snapshot");
 
-        let my_region_obligations = self.take_registered_region_obligations();
+        // Must loop since the process of normalizing may itself register region obligations.
+        for iteration in 0.. {
+            let my_region_obligations = self.take_registered_region_obligations();
+            if my_region_obligations.is_empty() {
+                break;
+            }
 
-        for RegionObligation { sup_type, sub_region, origin } in my_region_obligations {
-            debug!(?sup_type, ?sub_region, ?origin);
-            let sup_type = self.resolve_vars_if_possible(sup_type);
+            if !self.tcx.recursion_limit().value_within_limit(iteration) {
+                bug!(
+                    "FIXME(-Znext-solver): Overflowed when processing region obligations: {my_region_obligations:#?}"
+                );
+            }
 
-            let outlives = &mut TypeOutlives::new(
-                self,
-                self.tcx,
-                outlives_env.region_bound_pairs(),
-                None,
-                outlives_env.param_env,
-            );
-            let category = origin.to_constraint_category();
-            outlives.type_must_outlive(origin, sup_type, sub_region, category);
+            for RegionObligation { sup_type, sub_region, origin } in my_region_obligations {
+                let outlives = ty::Binder::dummy(ty::OutlivesPredicate(sup_type, sub_region));
+                let ty::OutlivesPredicate(sup_type, sub_region) =
+                    deeply_normalize_ty(outlives, origin.clone())
+                        .map_err(|NoSolution| (outlives, origin.clone()))?
+                        .no_bound_vars()
+                        .expect("started with no bound vars, should end with no bound vars");
+                // `TypeOutlives` is structural, so we should try to opportunistically resolve all
+                // region vids before processing regions, so we have a better chance to match clauses
+                // in our param-env.
+                let (sup_type, sub_region) =
+                    (sup_type, sub_region).fold_with(&mut OpportunisticRegionResolver::new(self));
+
+                debug!(?sup_type, ?sub_region, ?origin);
+
+                let outlives = &mut TypeOutlives::new(
+                    self,
+                    self.tcx,
+                    outlives_env.region_bound_pairs(),
+                    None,
+                    outlives_env.known_type_outlives(),
+                );
+                let category = origin.to_constraint_category();
+                outlives.type_must_outlive(origin, sup_type, sub_region, category);
+            }
         }
+
+        Ok(())
     }
 }
 
@@ -190,7 +229,7 @@ where
         tcx: TyCtxt<'tcx>,
         region_bound_pairs: &'cx RegionBoundPairs<'tcx>,
         implicit_region_bound: Option<ty::Region<'tcx>>,
-        param_env: ty::ParamEnv<'tcx>,
+        caller_bounds: &'cx [ty::PolyTypeOutlivesPredicate<'tcx>],
     ) -> Self {
         Self {
             delegate,
@@ -199,7 +238,7 @@ where
                 tcx,
                 region_bound_pairs,
                 implicit_region_bound,
-                param_env,
+                caller_bounds,
             ),
         }
     }
@@ -230,7 +269,7 @@ where
     fn components_must_outlive(
         &mut self,
         origin: infer::SubregionOrigin<'tcx>,
-        components: &[Component<'tcx>],
+        components: &[Component<TyCtxt<'tcx>>],
         region: ty::Region<'tcx>,
         category: ConstraintCategory<'tcx>,
     ) {
@@ -251,10 +290,10 @@ where
                     self.components_must_outlive(origin, subcomponents, region, category);
                 }
                 Component::UnresolvedInferenceVariable(v) => {
-                    // ignore this, we presume it will yield an error
-                    // later, since if a type variable is not resolved by
-                    // this point it never will be
-                    self.tcx.sess.span_delayed_bug(
+                    // Ignore this, we presume it will yield an error later,
+                    // since if a type variable is not resolved by this point
+                    // it never will be.
+                    self.tcx.dcx().span_delayed_bug(
                         origin.span(),
                         format!("unresolved inference variable in outlives: {v:?}"),
                     );
@@ -304,6 +343,13 @@ where
             return;
         }
 
+        if alias_ty.has_non_region_infer() {
+            self.tcx
+                .dcx()
+                .span_delayed_bug(origin.span(), "an alias has infers during region solving");
+            return;
+        }
+
         // This case is thorny for inference. The fundamental problem is
         // that there are many cases where we have choice, and inference
         // doesn't like choice (the current region inference in
@@ -329,24 +375,8 @@ where
         // Compute the bounds we can derive from the environment. This
         // is an "approximate" match -- in some cases, these bounds
         // may not apply.
-        let mut approx_env_bounds = self.verify_bound.approx_declared_bounds_from_env(alias_ty);
+        let approx_env_bounds = self.verify_bound.approx_declared_bounds_from_env(alias_ty);
         debug!(?approx_env_bounds);
-
-        // Remove outlives bounds that we get from the environment but
-        // which are also deducible from the trait. This arises (cc
-        // #55756) in cases where you have e.g., `<T as Foo<'a>>::Item:
-        // 'a` in the environment but `trait Foo<'b> { type Item: 'b
-        // }` in the trait definition.
-        approx_env_bounds.retain(|bound_outlives| {
-            // OK to skip binder because we only manipulate and compare against other
-            // values from the same binder. e.g. if we have (e.g.) `for<'a> <T as Trait<'a>>::Item: 'a`
-            // in `bound`, the `'a` will be a `^1` (bound, debruijn index == innermost) region.
-            // If the declaration is `trait Trait<'b> { type Item: 'b; }`, then `projection_declared_bounds_from_trait`
-            // will be invoked with `['b => ^1]` and so we will get `^1` returned.
-            let bound = bound_outlives.skip_binder();
-            let ty::Alias(_, alias_ty) = bound.0.kind() else { bug!("expected AliasTy") };
-            self.verify_bound.declared_bounds_from_definition(*alias_ty).all(|r| r != bound.1)
-        });
 
         // If declared bounds list is empty, the only applicable rule is
         // OutlivesProjectionComponent. If there are inference variables,
@@ -365,7 +395,7 @@ where
         let is_opaque = alias_ty.kind(self.tcx) == ty::Opaque;
         if approx_env_bounds.is_empty()
             && trait_bounds.is_empty()
-            && (alias_ty.has_infer() || is_opaque)
+            && (alias_ty.has_infer_regions() || is_opaque)
         {
             debug!("no declared bounds");
             let opt_variances = is_opaque.then(|| self.tcx.variances_of(alias_ty.def_id));
@@ -410,7 +440,7 @@ where
         // projection outlive; in some cases, this may add insufficient
         // edges into the inference graph, leading to inference failures
         // even though a satisfactory solution exists.
-        let verify_bound = self.verify_bound.alias_bound(alias_ty, &mut Default::default());
+        let verify_bound = self.verify_bound.alias_bound(alias_ty);
         debug!("alias_must_outlive: pushing {:?}", verify_bound);
         self.delegate.push_verify(origin, GenericKind::Alias(alias_ty), region, verify_bound);
     }

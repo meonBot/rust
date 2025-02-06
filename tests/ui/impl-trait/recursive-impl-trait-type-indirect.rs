@@ -1,6 +1,5 @@
 // Test that impl trait does not allow creating recursive types that are
 // otherwise forbidden.
-
 #![feature(coroutines)]
 #![allow(unconditional_recursion)]
 
@@ -58,6 +57,8 @@ fn coroutine_sig() -> impl Sized {
 fn coroutine_capture() -> impl Sized {
     //~^ ERROR
     let x = coroutine_capture();
+
+    #[coroutine]
     move || {
         yield;
         x;
@@ -67,15 +68,6 @@ fn coroutine_capture() -> impl Sized {
 fn substs_change<T: 'static>() -> impl Sized {
     //~^ ERROR
     (substs_change::<&T>(),)
-}
-
-fn coroutine_hold() -> impl Sized {
-    //~^ ERROR
-    move || {
-        let x = coroutine_hold();
-        yield;
-        x;
-    }
 }
 
 fn use_fn_ptr() -> impl Sized {

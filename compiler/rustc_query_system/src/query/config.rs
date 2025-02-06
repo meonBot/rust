@@ -1,16 +1,16 @@
 //! Query configuration and description traits.
 
+use std::fmt::Debug;
+use std::hash::Hash;
+
+use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_span::ErrorGuaranteed;
+
 use crate::dep_graph::{DepKind, DepNode, DepNodeParams, SerializedDepNodeIndex};
 use crate::error::HandleCycleError;
 use crate::ich::StableHashingContext;
 use crate::query::caches::QueryCache;
-use crate::query::DepNodeIndex;
-use crate::query::{QueryContext, QueryInfo, QueryState};
-
-use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_span::ErrorGuaranteed;
-use std::fmt::Debug;
-use std::hash::Hash;
+use crate::query::{CycleError, DepNodeIndex, QueryContext, QueryState};
 
 pub type HashResult<V> = Option<fn(&mut StableHashingContext<'_>, &V) -> Fingerprint>;
 
@@ -57,7 +57,7 @@ pub trait QueryConfig<Qcx: QueryContext>: Copy {
     fn value_from_cycle_error(
         self,
         tcx: Qcx::DepContext,
-        cycle: &[QueryInfo],
+        cycle_error: &CycleError,
         guar: ErrorGuaranteed,
     ) -> Self::Value;
 

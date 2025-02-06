@@ -7,35 +7,33 @@
 //!
 //! This crate implements several kinds of arena.
 
+// tidy-alphabetical-start
+#![allow(clippy::mut_from_ref)] // Arena allocators are one place where this pattern is fine.
+#![allow(internal_features)]
+#![cfg_attr(test, feature(test))]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![doc(
     html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
     test(no_crate_inject, attr(deny(warnings)))
 )]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
 #![feature(core_intrinsics)]
-#![feature(dropck_eyepatch)]
-#![feature(new_uninit)]
-#![feature(maybe_uninit_slice)]
 #![feature(decl_macro)]
+#![feature(dropck_eyepatch)]
+#![feature(maybe_uninit_slice)]
 #![feature(rustc_attrs)]
-#![cfg_attr(test, feature(test))]
-#![feature(strict_provenance)]
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-#![allow(internal_features)]
-#![allow(clippy::mut_from_ref)] // Arena allocators are one of the places where this pattern is fine.
-
-use smallvec::SmallVec;
+#![feature(rustdoc_internals)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 use std::alloc::Layout;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr::{self, NonNull};
-use std::slice;
-use std::{cmp, intrinsics};
+use std::{cmp, intrinsics, slice};
+
+use smallvec::SmallVec;
 
 /// This calls the passed function while ensuring it won't be inlined into the caller.
 #[inline(never)]
@@ -80,7 +78,7 @@ impl<T> ArenaChunk<T> {
             // been initialized.
             unsafe {
                 let slice = self.storage.as_mut();
-                ptr::drop_in_place(MaybeUninit::slice_assume_init_mut(&mut slice[..len]));
+                slice[..len].assume_init_drop();
             }
         }
     }
@@ -97,7 +95,7 @@ impl<T> ArenaChunk<T> {
         unsafe {
             if mem::size_of::<T>() == 0 {
                 // A pointer as large as possible for zero-sized elements.
-                ptr::invalid_mut(!0)
+                ptr::without_provenance_mut(!0)
             } else {
                 self.start().add(self.storage.len())
             }
@@ -484,6 +482,33 @@ impl DroplessArena {
         }
     }
 
+    /// Used by `Lift` to check whether this slice is allocated
+    /// in this arena.
+    #[inline]
+    pub fn contains_slice<T>(&self, slice: &[T]) -> bool {
+        for chunk in self.chunks.borrow_mut().iter_mut() {
+            let ptr = slice.as_ptr().cast::<u8>().cast_mut();
+            if chunk.start() <= ptr && chunk.end() >= ptr {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Allocates a string slice that is copied into the `DroplessArena`, returning a
+    /// reference to it. Will panic if passed an empty string.
+    ///
+    /// Panics:
+    ///
+    ///  - Zero-length string
+    #[inline]
+    pub fn alloc_str(&self, string: &str) -> &str {
+        let slice = self.alloc_slice(string.as_bytes());
+
+        // SAFETY: the result has a copy of the same valid UTF-8 bytes.
+        unsafe { std::str::from_utf8_unchecked(slice) }
+    }
+
     /// # Safety
     ///
     /// The caller must ensure that `mem` is valid for writes up to `size_of::<T>() * len`, and that
@@ -588,34 +613,34 @@ pub macro declare_arena([$($a:tt $name:ident: $ty:ty,)*]) {
 
     pub trait ArenaAllocatable<'tcx, C = rustc_arena::IsNotCopy>: Sized {
         #[allow(clippy::mut_from_ref)]
-        fn allocate_on<'a>(self, arena: &'a Arena<'tcx>) -> &'a mut Self;
+        fn allocate_on(self, arena: &'tcx Arena<'tcx>) -> &'tcx mut Self;
         #[allow(clippy::mut_from_ref)]
-        fn allocate_from_iter<'a>(
-            arena: &'a Arena<'tcx>,
+        fn allocate_from_iter(
+            arena: &'tcx Arena<'tcx>,
             iter: impl ::std::iter::IntoIterator<Item = Self>,
-        ) -> &'a mut [Self];
+        ) -> &'tcx mut [Self];
     }
 
     // Any type that impls `Copy` can be arena-allocated in the `DroplessArena`.
     impl<'tcx, T: Copy> ArenaAllocatable<'tcx, rustc_arena::IsCopy> for T {
         #[inline]
         #[allow(clippy::mut_from_ref)]
-        fn allocate_on<'a>(self, arena: &'a Arena<'tcx>) -> &'a mut Self {
+        fn allocate_on(self, arena: &'tcx Arena<'tcx>) -> &'tcx mut Self {
             arena.dropless.alloc(self)
         }
         #[inline]
         #[allow(clippy::mut_from_ref)]
-        fn allocate_from_iter<'a>(
-            arena: &'a Arena<'tcx>,
+        fn allocate_from_iter(
+            arena: &'tcx Arena<'tcx>,
             iter: impl ::std::iter::IntoIterator<Item = Self>,
-        ) -> &'a mut [Self] {
+        ) -> &'tcx mut [Self] {
             arena.dropless.alloc_from_iter(iter)
         }
     }
     $(
         impl<'tcx> ArenaAllocatable<'tcx, rustc_arena::IsNotCopy> for $ty {
             #[inline]
-            fn allocate_on<'a>(self, arena: &'a Arena<'tcx>) -> &'a mut Self {
+            fn allocate_on(self, arena: &'tcx Arena<'tcx>) -> &'tcx mut Self {
                 if !::std::mem::needs_drop::<Self>() {
                     arena.dropless.alloc(self)
                 } else {
@@ -625,10 +650,10 @@ pub macro declare_arena([$($a:tt $name:ident: $ty:ty,)*]) {
 
             #[inline]
             #[allow(clippy::mut_from_ref)]
-            fn allocate_from_iter<'a>(
-                arena: &'a Arena<'tcx>,
+            fn allocate_from_iter(
+                arena: &'tcx Arena<'tcx>,
                 iter: impl ::std::iter::IntoIterator<Item = Self>,
-            ) -> &'a mut [Self] {
+            ) -> &'tcx mut [Self] {
                 if !::std::mem::needs_drop::<Self>() {
                     arena.dropless.alloc_from_iter(iter)
                 } else {
@@ -641,7 +666,7 @@ pub macro declare_arena([$($a:tt $name:ident: $ty:ty,)*]) {
     impl<'tcx> Arena<'tcx> {
         #[inline]
         #[allow(clippy::mut_from_ref)]
-        pub fn alloc<T: ArenaAllocatable<'tcx, C>, C>(&self, value: T) -> &mut T {
+        pub fn alloc<T: ArenaAllocatable<'tcx, C>, C>(&'tcx self, value: T) -> &mut T {
             value.allocate_on(self)
         }
 
@@ -655,9 +680,17 @@ pub macro declare_arena([$($a:tt $name:ident: $ty:ty,)*]) {
             self.dropless.alloc_slice(value)
         }
 
+        #[inline]
+        pub fn alloc_str(&self, string: &str) -> &str {
+            if string.is_empty() {
+                return "";
+            }
+            self.dropless.alloc_str(string)
+        }
+
         #[allow(clippy::mut_from_ref)]
         pub fn alloc_from_iter<T: ArenaAllocatable<'tcx, C>, C>(
-            &self,
+            &'tcx self,
             iter: impl ::std::iter::IntoIterator<Item = T>,
         ) -> &mut [T] {
             T::allocate_from_iter(self, iter)

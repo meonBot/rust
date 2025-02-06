@@ -23,8 +23,8 @@ const EXPECTED = [
         'others': [
             { 'path': 'impl_trait', 'name': 'bbbbbbb' },
             { 'path': 'impl_trait::Ccccccc', 'name': 'ddddddd' },
-            { 'path': 'impl_trait::Ccccccc', 'name': 'fffffff' },
             { 'path': 'impl_trait::Ccccccc', 'name': 'ggggggg' },
+            { 'path': 'impl_trait::Ccccccc', 'name': 'fffffff' },
         ],
     },
     {
@@ -45,8 +45,8 @@ const EXPECTED = [
         'returned': [
             { 'path': 'impl_trait', 'name': 'bbbbbbb' },
             { 'path': 'impl_trait::Ccccccc', 'name': 'ddddddd' },
-            { 'path': 'impl_trait::Ccccccc', 'name': 'fffffff' },
             { 'path': 'impl_trait::Ccccccc', 'name': 'ggggggg' },
+            { 'path': 'impl_trait::Ccccccc', 'name': 'fffffff' },
         ],
     },
 ];

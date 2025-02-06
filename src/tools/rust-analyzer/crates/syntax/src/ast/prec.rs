@@ -1,7 +1,7 @@
 //! Precedence representation.
 
 use crate::{
-    ast::{self, BinaryOp, Expr, HasArgList},
+    ast::{self, BinaryOp, Expr, HasArgList, RangeItem},
     match_ast, AstNode, SyntaxNode,
 };
 
@@ -27,6 +27,14 @@ impl Expr {
     }
 
     fn needs_parens_in_expr(&self, parent: &Expr) -> bool {
+        // Parentheses are necessary when calling a function-like pointer that is a member of a struct or union
+        // (e.g. `(a.f)()`).
+        let is_parent_call_expr = matches!(parent, ast::Expr::CallExpr(_));
+        let is_field_expr = matches!(self, ast::Expr::FieldExpr(_));
+        if is_parent_call_expr && is_field_expr {
+            return true;
+        }
+
         // Special-case block weirdness
         if parent.child_is_followed_by_a_block() {
             use Expr::*;
@@ -130,8 +138,8 @@ impl Expr {
             //
             ContinueExpr(_) => (0, 0),
 
-            ClosureExpr(_) | ReturnExpr(_) | YieldExpr(_) | YeetExpr(_) | BreakExpr(_)
-            | OffsetOfExpr(_) | FormatArgsExpr(_) | AsmExpr(_) => (0, 1),
+            ClosureExpr(_) | ReturnExpr(_) | BecomeExpr(_) | YieldExpr(_) | YeetExpr(_)
+            | BreakExpr(_) | OffsetOfExpr(_) | FormatArgsExpr(_) | AsmExpr(_) => (0, 1),
 
             RangeExpr(_) => (5, 5),
 
@@ -288,6 +296,7 @@ impl Expr {
                 PrefixExpr(e) => e.op_token(),
                 RefExpr(e) => e.amp_token(),
                 ReturnExpr(e) => e.return_token(),
+                BecomeExpr(e) => e.become_token(),
                 TryExpr(e) => e.question_mark_token(),
                 YieldExpr(e) => e.yield_token(),
                 YeetExpr(e) => e.do_token(),
@@ -316,7 +325,8 @@ impl Expr {
 
             // For BinExpr and RangeExpr this is technically wrong -- the child can be on the left...
             BinExpr(_) | RangeExpr(_) | BreakExpr(_) | ContinueExpr(_) | PrefixExpr(_)
-            | RefExpr(_) | ReturnExpr(_) | YieldExpr(_) | YeetExpr(_) | LetExpr(_) => self
+            | RefExpr(_) | ReturnExpr(_) | BecomeExpr(_) | YieldExpr(_) | YeetExpr(_)
+            | LetExpr(_) => self
                 .syntax()
                 .parent()
                 .and_then(Expr::cast)

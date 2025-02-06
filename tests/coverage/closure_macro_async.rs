@@ -1,5 +1,8 @@
-// compile-flags: --edition=2018
 #![feature(coverage_attribute)]
+//@ edition: 2018
+
+//@ aux-build: executor.rs
+extern crate executor;
 
 macro_rules! bail {
     ($msg:literal $(,)?) => {
@@ -14,7 +17,8 @@ macro_rules! bail {
 
 macro_rules! on_error {
     ($value:expr, $error_message:expr) => {
-        $value.or_else(|e| { // FIXME(85000): no coverage in closure macros
+        $value.or_else(|e| {
+            // This closure, which is declared in a macro, should be instrumented.
             let message = format!($error_message, e);
             if message.len() > 0 {
                 println!("{}", message);
@@ -42,36 +46,4 @@ pub async fn test() -> Result<(), String> {
 #[coverage(off)]
 fn main() {
     executor::block_on(test()).unwrap();
-}
-
-mod executor {
-    use core::{
-        future::Future,
-        pin::Pin,
-        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-    };
-
-    #[coverage(off)]
-    pub fn block_on<F: Future>(mut future: F) -> F::Output {
-        let mut future = unsafe { Pin::new_unchecked(&mut future) };
-        use std::hint::unreachable_unchecked;
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(
-            #[coverage(off)]
-            |_| unsafe { unreachable_unchecked() }, // clone
-            #[coverage(off)]
-            |_| unsafe { unreachable_unchecked() }, // wake
-            #[coverage(off)]
-            |_| unsafe { unreachable_unchecked() }, // wake_by_ref
-            #[coverage(off)]
-            |_| (),
-        );
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-        let mut context = Context::from_waker(&waker);
-
-        loop {
-            if let Poll::Ready(val) = future.as_mut().poll(&mut context) {
-                break val;
-            }
-        }
-    }
 }

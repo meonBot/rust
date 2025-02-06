@@ -1,6 +1,5 @@
-// check-fail
-// known-bug: #102682
-// edition: 2021
+//@ known-bug: #130935
+//@ edition: 2021
 
 trait MyTrait<T, U> {
     async fn foo(&self) -> &(T, U);

@@ -56,7 +56,7 @@ extern "Rust" {
     ///
     /// This is internal and unstable and should not be used; we give it here
     /// just to be complete.
-    pub fn miri_start_panic(payload: *mut u8) -> !;
+    pub fn miri_start_unwind(payload: *mut u8) -> !;
 
     /// Miri-provided extern function to get the internal unique identifier for the allocation that a pointer
     /// points to. If this pointer is invalid (not pointing to an allocation), interpretation will abort.
@@ -133,8 +133,8 @@ extern "Rust" {
     /// with a null terminator.
     /// Returns 0 if the `out` buffer was large enough, and the required size otherwise.
     pub fn miri_host_to_target_path(
-        path: *const std::ffi::c_char,
-        out: *mut std::ffi::c_char,
+        path: *const core::ffi::c_char,
+        out: *mut core::ffi::c_char,
         out_size: usize,
     ) -> usize;
 

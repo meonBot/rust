@@ -2,27 +2,26 @@ mod plumbing;
 pub use self::plumbing::*;
 
 mod job;
-#[cfg(parallel_compiler)]
-pub use self::job::deadlock;
-pub use self::job::{print_query_stack, QueryInfo, QueryJob, QueryJobId, QueryJobInfo, QueryMap};
-
-mod caches;
-pub use self::caches::{
-    CacheSelector, DefaultCacheSelector, QueryCache, SingleCacheSelector, VecCacheSelector,
+pub use self::job::{
+    QueryInfo, QueryJob, QueryJobId, QueryJobInfo, QueryMap, break_query_cycles, print_query_stack,
+    report_cycle,
 };
 
-mod config;
-pub use self::config::{HashResult, QueryConfig};
+mod caches;
+pub use self::caches::{DefIdCache, DefaultCache, QueryCache, SingleCache, VecCache};
 
-use crate::dep_graph::DepKind;
-use crate::dep_graph::{DepNodeIndex, HasDepContext, SerializedDepNodeIndex};
+mod config;
 use rustc_data_structures::stable_hasher::Hash64;
 use rustc_data_structures::sync::Lock;
-use rustc_errors::Diagnostic;
+use rustc_errors::DiagInner;
 use rustc_hir::def::DefKind;
-use rustc_span::def_id::DefId;
+use rustc_macros::{Decodable, Encodable};
 use rustc_span::Span;
+use rustc_span::def_id::DefId;
 use thin_vec::ThinVec;
+
+pub use self::config::{HashResult, QueryConfig};
+use crate::dep_graph::{DepKind, DepNodeIndex, HasDepContext, SerializedDepNodeIndex};
 
 /// Description of a frame in the query stack.
 ///
@@ -33,11 +32,11 @@ pub struct QueryStackFrame {
     span: Option<Span>,
     pub def_id: Option<DefId>,
     pub def_kind: Option<DefKind>,
-    pub ty_adt_id: Option<DefId>,
+    /// A def-id that is extracted from a `Ty` in a query key
+    pub def_id_for_ty_in_cycle: Option<DefId>,
     pub dep_kind: DepKind,
     /// This hash is used to deterministically pick
     /// a query to remove cycles in the parallel compiler.
-    #[cfg(parallel_compiler)]
     hash: Hash64,
 }
 
@@ -49,19 +48,10 @@ impl QueryStackFrame {
         def_id: Option<DefId>,
         def_kind: Option<DefKind>,
         dep_kind: DepKind,
-        ty_adt_id: Option<DefId>,
-        _hash: impl FnOnce() -> Hash64,
+        def_id_for_ty_in_cycle: Option<DefId>,
+        hash: impl FnOnce() -> Hash64,
     ) -> Self {
-        Self {
-            description,
-            span,
-            def_id,
-            def_kind,
-            ty_adt_id,
-            dep_kind,
-            #[cfg(parallel_compiler)]
-            hash: _hash(),
-        }
+        Self { description, span, def_id, def_kind, def_id_for_ty_in_cycle, dep_kind, hash: hash() }
     }
 
     // FIXME(eddyb) Get more valid `Span`s on queries.
@@ -85,14 +75,17 @@ pub struct QuerySideEffects {
     /// Stores any diagnostics emitted during query execution.
     /// These diagnostics will be re-emitted if we mark
     /// the query as green.
-    pub(super) diagnostics: ThinVec<Diagnostic>,
+    pub(super) diagnostics: ThinVec<DiagInner>,
 }
 
 impl QuerySideEffects {
+    /// Returns true if there might be side effects.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub fn maybe_any(&self) -> bool {
         let QuerySideEffects { diagnostics } = self;
-        diagnostics.is_empty()
+        // Use `has_capacity` so that the destructor for `self.diagnostics` can be skipped
+        // if `maybe_any` is known to be false.
+        diagnostics.has_capacity()
     }
     pub fn append(&mut self, other: QuerySideEffects) {
         let QuerySideEffects { diagnostics } = self;
@@ -128,7 +121,7 @@ pub trait QueryContext: HasDepContext {
         self,
         token: QueryJobId,
         depth_limit: bool,
-        diagnostics: Option<&Lock<ThinVec<Diagnostic>>>,
+        diagnostics: Option<&Lock<ThinVec<DiagInner>>>,
         compute: impl FnOnce() -> R,
     ) -> R;
 

@@ -5,9 +5,9 @@
 // The cdecl ABI is used. It differs from the stdcall or fastcall ABI.
 // "i686-unknown-windows" is used to get the minimal subset of windows-specific features.
 
-use crate::spec::{base, Target};
+use crate::spec::{RustcAbi, Target, base};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     let mut base = base::uefi_msvc::opts();
     base.cpu = "pentium4".into();
     base.max_atomic_width = Some(64);
@@ -22,6 +22,7 @@ pub fn target() -> Target {
     // If you initialize FP units yourself, you can override these flags with custom linker
     // arguments, thus giving you access to full MMX/SSE acceleration.
     base.features = "-mmx,-sse,+soft-float".into();
+    base.rustc_abi = Some(RustcAbi::X86Softfloat);
 
     // Use -GNU here, because of the reason below:
     // Background and Problem:
@@ -78,9 +79,15 @@ pub fn target() -> Target {
     // remove -gnu and use the default one.
     Target {
         llvm_target: "i686-unknown-windows-gnu".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("32-bit UEFI".into()),
+            tier: Some(2),
+            host_tools: Some(false),
+            std: None, // ?
+        },
         pointer_width: 32,
         data_layout: "e-m:x-p:32:32-p270:32:32-p271:32:32-p272:64:64-\
-            i64:64-f80:32-n8:16:32-a:0:32-S32"
+            i64:64-i128:128-f80:32-n8:16:32-a:0:32-S32"
             .into(),
         arch: "x86".into(),
 

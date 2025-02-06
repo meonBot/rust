@@ -3,7 +3,7 @@
 #![allow(unused)]
 #![allow(
     clippy::assign_op_pattern,
-    clippy::blocks_in_if_conditions,
+    clippy::blocks_in_conditions,
     clippy::let_and_return,
     clippy::let_unit_value,
     clippy::nonminimal_bool,
@@ -269,4 +269,15 @@ fn issue8911() -> u32 {
     }
 
     3
+}
+
+macro_rules! issue13776_mac {
+    ($var:expr, $val:literal) => {
+        $var = $val;
+    };
+}
+
+fn issue13776() {
+    let x;
+    issue13776_mac!(x, 10); // should not lint
 }

@@ -1,6 +1,6 @@
-use proc_macro2::{self, Ident};
+use proc_macro2::Ident;
 use quote::quote;
-use syn::{self, parse_quote};
+use syn::parse_quote;
 
 struct Attributes {
     ignore: bool,
@@ -73,6 +73,8 @@ fn hash_stable_derive_with_mode(
         HashStableMode::Normal => parse_quote!('__ctx),
         HashStableMode::Generic | HashStableMode::NoContext => parse_quote!(__CTX),
     };
+
+    s.underscore_const(true);
 
     // no_context impl is able to derive by-field, which is closer to a perfect derive.
     s.add_bounds(match mode {

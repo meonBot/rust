@@ -1,6 +1,6 @@
 // Can't put mut in non-ident pattern
 
-// edition:2018
+//@ edition:2018
 
 #![feature(box_patterns)]
 #![allow(warnings)]
@@ -12,6 +12,10 @@ pub fn main() {
     let mut (x @ y) = 0; //~ ERROR `mut` must be attached to each individual binding
 
     let mut mut x = 0;
+    //~^ ERROR `mut` on a binding may not be repeated
+    //~| remove the additional `mut`s
+
+    let mut mut mut mut mut x = 0;
     //~^ ERROR `mut` on a binding may not be repeated
     //~| remove the additional `mut`s
 

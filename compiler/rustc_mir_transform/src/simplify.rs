@@ -27,69 +27,75 @@
 //! naively generate still contains the `_a = ()` write in the unreachable block "after" the
 //! return.
 
-use crate::MirPass;
-use rustc_data_structures::fx::FxIndexSet;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 use rustc_middle::mir::visit::{MutVisitor, MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
+use rustc_span::DUMMY_SP;
 use smallvec::SmallVec;
+use tracing::{debug, trace};
 
-pub enum SimplifyCfg {
+pub(super) enum SimplifyCfg {
     Initial,
     PromoteConsts,
     RemoveFalseEdges,
-    EarlyOpt,
-    ElaborateDrops,
+    /// Runs at the beginning of "analysis to runtime" lowering, *before* drop elaboration.
+    PostAnalysis,
+    /// Runs at the end of "analysis to runtime" lowering, *after* drop elaboration.
+    /// This is before the main optimization passes on runtime MIR kick in.
+    PreOptimizations,
     Final,
     MakeShim,
-    AfterUninhabitedEnumBranching,
+    AfterUnreachableEnumBranching,
 }
 
 impl SimplifyCfg {
-    pub fn name(&self) -> &'static str {
+    fn name(&self) -> &'static str {
         match self {
             SimplifyCfg::Initial => "SimplifyCfg-initial",
             SimplifyCfg::PromoteConsts => "SimplifyCfg-promote-consts",
             SimplifyCfg::RemoveFalseEdges => "SimplifyCfg-remove-false-edges",
-            SimplifyCfg::EarlyOpt => "SimplifyCfg-early-opt",
-            SimplifyCfg::ElaborateDrops => "SimplifyCfg-elaborate-drops",
+            SimplifyCfg::PostAnalysis => "SimplifyCfg-post-analysis",
+            SimplifyCfg::PreOptimizations => "SimplifyCfg-pre-optimizations",
             SimplifyCfg::Final => "SimplifyCfg-final",
             SimplifyCfg::MakeShim => "SimplifyCfg-make_shim",
-            SimplifyCfg::AfterUninhabitedEnumBranching => {
-                "SimplifyCfg-after-uninhabited-enum-branching"
+            SimplifyCfg::AfterUnreachableEnumBranching => {
+                "SimplifyCfg-after-unreachable-enum-branching"
             }
         }
     }
 }
 
-pub fn simplify_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+pub(super) fn simplify_cfg(body: &mut Body<'_>) {
     CfgSimplifier::new(body).simplify();
-    remove_duplicate_unreachable_blocks(tcx, body);
     remove_dead_blocks(body);
 
     // FIXME: Should probably be moved into some kind of pass manager
     body.basic_blocks_mut().raw.shrink_to_fit();
 }
 
-impl<'tcx> MirPass<'tcx> for SimplifyCfg {
+impl<'tcx> crate::MirPass<'tcx> for SimplifyCfg {
     fn name(&self) -> &'static str {
         self.name()
     }
 
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    fn run_pass(&self, _: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         debug!("SimplifyCfg({:?}) - simplifying {:?}", self.name(), body.source);
-        simplify_cfg(tcx, body);
+        simplify_cfg(body);
+    }
+
+    fn is_required(&self) -> bool {
+        false
     }
 }
 
-pub struct CfgSimplifier<'a, 'tcx> {
+struct CfgSimplifier<'a, 'tcx> {
     basic_blocks: &'a mut IndexSlice<BasicBlock, BasicBlockData<'tcx>>,
     pred_count: IndexVec<BasicBlock, u32>,
 }
 
 impl<'a, 'tcx> CfgSimplifier<'a, 'tcx> {
-    pub fn new(body: &'a mut Body<'tcx>) -> Self {
+    fn new(body: &'a mut Body<'tcx>) -> Self {
         let mut pred_count = IndexVec::from_elem(0u32, &body.basic_blocks);
 
         // we can't use mir.predecessors() here because that counts
@@ -109,7 +115,7 @@ impl<'a, 'tcx> CfgSimplifier<'a, 'tcx> {
         CfgSimplifier { basic_blocks, pred_count }
     }
 
-    pub fn simplify(mut self) {
+    fn simplify(mut self) {
         self.strip_nops();
 
         // Vec of the blocks that should be merged. We store the indices here, instead of the
@@ -278,7 +284,7 @@ impl<'a, 'tcx> CfgSimplifier<'a, 'tcx> {
     }
 }
 
-pub fn simplify_duplicate_switch_targets(terminator: &mut Terminator<'_>) {
+pub(super) fn simplify_duplicate_switch_targets(terminator: &mut Terminator<'_>) {
     if let TerminatorKind::SwitchInt { targets, .. } = &mut terminator.kind {
         let otherwise = targets.otherwise();
         if targets.iter().any(|t| t.1 == otherwise) {
@@ -290,55 +296,25 @@ pub fn simplify_duplicate_switch_targets(terminator: &mut Terminator<'_>) {
     }
 }
 
-pub fn remove_duplicate_unreachable_blocks<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-    struct OptApplier<'tcx> {
-        tcx: TyCtxt<'tcx>,
-        duplicates: FxIndexSet<BasicBlock>,
-    }
+pub(super) fn remove_dead_blocks(body: &mut Body<'_>) {
+    let should_deduplicate_unreachable = |bbdata: &BasicBlockData<'_>| {
+        // CfgSimplifier::simplify leaves behind some unreachable basic blocks without a
+        // terminator. Those blocks will be deleted by remove_dead_blocks, but we run just
+        // before then so we need to handle missing terminators.
+        // We also need to prevent confusing cleanup and non-cleanup blocks. In practice we
+        // don't emit empty unreachable cleanup blocks, so this simple check suffices.
+        bbdata.terminator.is_some() && bbdata.is_empty_unreachable() && !bbdata.is_cleanup
+    };
 
-    impl<'tcx> MutVisitor<'tcx> for OptApplier<'tcx> {
-        fn tcx(&self) -> TyCtxt<'tcx> {
-            self.tcx
-        }
-
-        fn visit_terminator(&mut self, terminator: &mut Terminator<'tcx>, location: Location) {
-            for target in terminator.successors_mut() {
-                // We don't have to check whether `target` is a cleanup block, because have
-                // entirely excluded cleanup blocks in building the set of duplicates.
-                if self.duplicates.contains(target) {
-                    *target = self.duplicates[0];
-                }
-            }
-
-            simplify_duplicate_switch_targets(terminator);
-
-            self.super_terminator(terminator, location);
-        }
-    }
-
-    let unreachable_blocks = body
+    let reachable = traversal::reachable_as_bitset(body);
+    let empty_unreachable_blocks = body
         .basic_blocks
         .iter_enumerated()
-        .filter(|(_, bb)| {
-            // CfgSimplifier::simplify leaves behind some unreachable basic blocks without a
-            // terminator. Those blocks will be deleted by remove_dead_blocks, but we run just
-            // before then so we need to handle missing terminators.
-            // We also need to prevent confusing cleanup and non-cleanup blocks. In practice we
-            // don't emit empty unreachable cleanup blocks, so this simple check suffices.
-            bb.terminator.is_some() && bb.is_empty_unreachable() && !bb.is_cleanup
-        })
-        .map(|(block, _)| block)
-        .collect::<FxIndexSet<_>>();
+        .filter(|(bb, bbdata)| should_deduplicate_unreachable(bbdata) && reachable.contains(*bb))
+        .count();
 
-    if unreachable_blocks.len() > 1 {
-        OptApplier { tcx, duplicates: unreachable_blocks }.visit_body(body);
-    }
-}
-
-pub fn remove_dead_blocks(body: &mut Body<'_>) {
-    let reachable = traversal::reachable_as_bitset(body);
     let num_blocks = body.basic_blocks.len();
-    if num_blocks == reachable.count() {
+    if num_blocks == reachable.count() && empty_unreachable_blocks <= 1 {
         return;
     }
 
@@ -347,15 +323,39 @@ pub fn remove_dead_blocks(body: &mut Body<'_>) {
     let mut replacements: Vec<_> = (0..num_blocks).map(BasicBlock::new).collect();
     let mut orig_index = 0;
     let mut used_index = 0;
-    basic_blocks.raw.retain(|_| {
-        let keep = reachable.contains(BasicBlock::new(orig_index));
-        if keep {
-            replacements[orig_index] = BasicBlock::new(used_index);
-            used_index += 1;
+    let mut kept_unreachable = None;
+    let mut deduplicated_unreachable = false;
+    basic_blocks.raw.retain(|bbdata| {
+        let orig_bb = BasicBlock::new(orig_index);
+        if !reachable.contains(orig_bb) {
+            orig_index += 1;
+            return false;
         }
+
+        let used_bb = BasicBlock::new(used_index);
+        if should_deduplicate_unreachable(bbdata) {
+            let kept_unreachable = *kept_unreachable.get_or_insert(used_bb);
+            if kept_unreachable != used_bb {
+                replacements[orig_index] = kept_unreachable;
+                deduplicated_unreachable = true;
+                orig_index += 1;
+                return false;
+            }
+        }
+
+        replacements[orig_index] = used_bb;
+        used_index += 1;
         orig_index += 1;
-        keep
+        true
     });
+
+    // If we deduplicated unreachable blocks we erase their source_info as we
+    // can no longer attribute their code to a particular location in the
+    // source.
+    if deduplicated_unreachable {
+        basic_blocks[kept_unreachable.unwrap()].terminator_mut().source_info =
+            SourceInfo { span: DUMMY_SP, scope: OUTERMOST_SOURCE_SCOPE };
+    }
 
     for block in basic_blocks {
         for target in block.terminator_mut().successors_mut() {
@@ -364,13 +364,13 @@ pub fn remove_dead_blocks(body: &mut Body<'_>) {
     }
 }
 
-pub enum SimplifyLocals {
+pub(super) enum SimplifyLocals {
     BeforeConstProp,
     AfterGVN,
     Final,
 }
 
-impl<'tcx> MirPass<'tcx> for SimplifyLocals {
+impl<'tcx> crate::MirPass<'tcx> for SimplifyLocals {
     fn name(&self) -> &'static str {
         match &self {
             SimplifyLocals::BeforeConstProp => "SimplifyLocals-before-const-prop",
@@ -385,11 +385,37 @@ impl<'tcx> MirPass<'tcx> for SimplifyLocals {
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         trace!("running SimplifyLocals on {:?}", body.source);
-        simplify_locals(body, tcx);
+
+        // First, we're going to get a count of *actual* uses for every `Local`.
+        let mut used_locals = UsedLocals::new(body);
+
+        // Next, we're going to remove any `Local` with zero actual uses. When we remove those
+        // `Locals`, we're also going to subtract any uses of other `Locals` from the `used_locals`
+        // count. For example, if we removed `_2 = discriminant(_1)`, then we'll subtract one from
+        // `use_counts[_1]`. That in turn might make `_1` unused, so we loop until we hit a
+        // fixedpoint where there are no more unused locals.
+        remove_unused_definitions_helper(&mut used_locals, body);
+
+        // Finally, we'll actually do the work of shrinking `body.local_decls` and remapping the
+        // `Local`s.
+        let map = make_local_map(&mut body.local_decls, &used_locals);
+
+        // Only bother running the `LocalUpdater` if we actually found locals to remove.
+        if map.iter().any(Option::is_none) {
+            // Update references to all vars and tmps now
+            let mut updater = LocalUpdater { map, tcx };
+            updater.visit_body_preserves_cfg(body);
+
+            body.local_decls.shrink_to_fit();
+        }
+    }
+
+    fn is_required(&self) -> bool {
+        false
     }
 }
 
-pub fn remove_unused_definitions<'tcx>(body: &mut Body<'tcx>) {
+pub(super) fn remove_unused_definitions<'tcx>(body: &mut Body<'tcx>) {
     // First, we're going to get a count of *actual* uses for every `Local`.
     let mut used_locals = UsedLocals::new(body);
 
@@ -399,30 +425,6 @@ pub fn remove_unused_definitions<'tcx>(body: &mut Body<'tcx>) {
     // `use_counts[_1]`. That in turn might make `_1` unused, so we loop until we hit a
     // fixedpoint where there are no more unused locals.
     remove_unused_definitions_helper(&mut used_locals, body);
-}
-
-pub fn simplify_locals<'tcx>(body: &mut Body<'tcx>, tcx: TyCtxt<'tcx>) {
-    // First, we're going to get a count of *actual* uses for every `Local`.
-    let mut used_locals = UsedLocals::new(body);
-
-    // Next, we're going to remove any `Local` with zero actual uses. When we remove those
-    // `Locals`, we're also going to subtract any uses of other `Locals` from the `used_locals`
-    // count. For example, if we removed `_2 = discriminant(_1)`, then we'll subtract one from
-    // `use_counts[_1]`. That in turn might make `_1` unused, so we loop until we hit a
-    // fixedpoint where there are no more unused locals.
-    remove_unused_definitions_helper(&mut used_locals, body);
-
-    // Finally, we'll actually do the work of shrinking `body.local_decls` and remapping the `Local`s.
-    let map = make_local_map(&mut body.local_decls, &used_locals);
-
-    // Only bother running the `LocalUpdater` if we actually found locals to remove.
-    if map.iter().any(Option::is_none) {
-        // Update references to all vars and tmps now
-        let mut updater = LocalUpdater { map, tcx };
-        updater.visit_body_preserves_cfg(body);
-
-        body.local_decls.shrink_to_fit();
-    }
 }
 
 /// Construct the mapping while swapping out unused stuff out from the `vec`.
@@ -431,7 +433,7 @@ fn make_local_map<V>(
     used_locals: &UsedLocals,
 ) -> IndexVec<Local, Option<Local>> {
     let mut map: IndexVec<Local, Option<Local>> = IndexVec::from_elem(None, local_decls);
-    let mut used = Local::new(0);
+    let mut used = Local::ZERO;
 
     for alive_index in local_decls.indices() {
         // `is_used` treats the `RETURN_PLACE` and arguments as used.
@@ -529,7 +531,8 @@ impl<'tcx> Visitor<'tcx> for UsedLocals {
             }
 
             StatementKind::SetDiscriminant { ref place, variant_index: _ }
-            | StatementKind::Deinit(ref place) => {
+            | StatementKind::Deinit(ref place)
+            | StatementKind::BackwardIncompatibleDropHint { ref place, reason: _ } => {
                 self.visit_lhs(place, location);
             }
         }
@@ -566,6 +569,7 @@ fn remove_unused_definitions_helper(used_locals: &mut UsedLocals, body: &mut Bod
                     StatementKind::Assign(box (place, _)) => used_locals.is_used(place.local),
 
                     StatementKind::SetDiscriminant { ref place, .. }
+                    | StatementKind::BackwardIncompatibleDropHint { ref place, reason: _ }
                     | StatementKind::Deinit(ref place) => used_locals.is_used(place.local),
                     StatementKind::Nop => false,
                     _ => true,
@@ -591,6 +595,20 @@ struct LocalUpdater<'tcx> {
 impl<'tcx> MutVisitor<'tcx> for LocalUpdater<'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
+    }
+
+    fn visit_statement(&mut self, statement: &mut Statement<'tcx>, location: Location) {
+        if let StatementKind::BackwardIncompatibleDropHint { place, reason: _ } =
+            &mut statement.kind
+        {
+            self.visit_local(
+                &mut place.local,
+                PlaceContext::MutatingUse(MutatingUseContext::Store),
+                location,
+            );
+        } else {
+            self.super_statement(statement, location);
+        }
     }
 
     fn visit_local(&mut self, l: &mut Local, _: PlaceContext, _: Location) {
