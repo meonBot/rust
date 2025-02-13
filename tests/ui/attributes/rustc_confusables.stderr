@@ -31,7 +31,13 @@ error[E0599]: no method named `inser` found for struct `rustc_confusables_across
   --> $DIR/rustc_confusables.rs:12:7
    |
 LL |     x.inser();
-   |       ^^^^^ help: there is a method with a similar name: `insert`
+   |       ^^^^^
+   |
+help: there is a method `insert` with a similar name
+   |
+LL -     x.inser();
+LL +     x.insert();
+   |
 
 error[E0599]: no method named `foo` found for struct `rustc_confusables_across_crate::BTreeSet` in the current scope
   --> $DIR/rustc_confusables.rs:15:7
@@ -47,8 +53,9 @@ LL |     x.push();
    |
 help: you might have meant to use `insert`
    |
-LL |     x.insert();
-   |       ~~~~~~
+LL -     x.push();
+LL +     x.insert();
+   |
 
 error[E0599]: no method named `test` found for struct `rustc_confusables_across_crate::BTreeSet` in the current scope
   --> $DIR/rustc_confusables.rs:20:7
@@ -60,7 +67,13 @@ error[E0599]: no method named `pulled` found for struct `rustc_confusables_acros
   --> $DIR/rustc_confusables.rs:22:7
    |
 LL |     x.pulled();
-   |       ^^^^^^ help: there is a method with a similar name: `pull`
+   |       ^^^^^^
+   |
+help: you might have meant to use `pull`
+   |
+LL -     x.pulled();
+LL +     x.pull();
+   |
 
 error: aborting due to 9 previous errors
 

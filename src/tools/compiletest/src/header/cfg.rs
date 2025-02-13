@@ -1,6 +1,7 @@
+use std::collections::HashSet;
+
 use crate::common::{CompareMode, Config, Debugger};
 use crate::header::IgnoreDecision;
-use std::collections::HashSet;
 
 const EXTRA_ARCHS: &[&str] = &["spirv"];
 
@@ -39,8 +40,8 @@ pub(super) fn handle_only(config: &Config, line: &str) -> IgnoreDecision {
 }
 
 /// Parses a name-value directive which contains config-specific information, e.g., `ignore-x86`
-/// or `normalize-stderr-32bit`.
-pub(super) fn parse_cfg_name_directive<'a>(
+/// or `only-windows`.
+fn parse_cfg_name_directive<'a>(
     config: &Config,
     line: &'a str,
     prefix: &str,
@@ -58,7 +59,7 @@ pub(super) fn parse_cfg_name_directive<'a>(
 
     // Some of the matchers might be "" depending on what the target information is. To avoid
     // problems we outright reject empty directives.
-    if name == "" {
+    if name.is_empty() {
         return ParsedNameDirective::not_a_directive();
     }
 
@@ -159,6 +160,18 @@ pub(super) fn parse_cfg_name_directive<'a>(
         message: "when the architecture is part of the Thumb family"
     }
 
+    condition! {
+        name: "apple",
+        condition: config.target.contains("apple"),
+        message: "when the target vendor is Apple"
+    }
+
+    condition! {
+        name: "enzyme",
+        condition: config.has_enzyme,
+        message: "when rustc is built with LLVM Enzyme"
+    }
+
     // Technically the locally built compiler uses the "dev" channel rather than the "nightly"
     // channel, even though most people don't know or won't care about it. To avoid confusion, we
     // treat the "dev" channel as the "nightly" channel when processing the directive.
@@ -179,7 +192,7 @@ pub(super) fn parse_cfg_name_directive<'a>(
         message: "on big-endian targets",
     }
     condition! {
-        name: config.stage_id.split('-').next().unwrap(),
+        name: format!("stage{}", config.stage).as_str(),
         allowed_names: &["stage0", "stage1", "stage2"],
         message: "when the bootstrapping stage is {name}",
     }
@@ -189,9 +202,14 @@ pub(super) fn parse_cfg_name_directive<'a>(
         message: "when running tests remotely",
     }
     condition! {
-        name: "debug",
-        condition: config.with_debug_assertions,
-        message: "when running tests with `ignore-debug` header",
+        name: "rustc-debug-assertions",
+        condition: config.with_rustc_debug_assertions,
+        message: "when rustc is built with debug assertions",
+    }
+    condition! {
+        name: "std-debug-assertions",
+        condition: config.with_std_debug_assertions,
+        message: "when std is built with debug assertions",
     }
     condition! {
         name: config.debugger.as_ref().map(|d| d.to_str()),
@@ -207,6 +225,20 @@ pub(super) fn parse_cfg_name_directive<'a>(
             inner: CompareMode::STR_VARIANTS,
         },
         message: "when comparing with {name}",
+    }
+    // Coverage tests run the same test file in multiple modes.
+    // If a particular test should not be run in one of the modes, ignore it
+    // with "ignore-coverage-map" or "ignore-coverage-run".
+    condition! {
+        name: config.mode.to_str(),
+        allowed_names: ["coverage-map", "coverage-run"],
+        message: "when the test mode is {name}",
+    }
+
+    condition! {
+        name: "dist",
+        condition: std::env::var("COMPILETEST_ENABLE_DIST_TESTS") == Ok("1".to_string()),
+        message: "when performing tests on dist toolchain"
     }
 
     if prefix == "ignore" && outcome == MatchOutcome::Invalid {

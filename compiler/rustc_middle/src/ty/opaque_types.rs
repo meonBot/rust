@@ -1,10 +1,13 @@
+use rustc_data_structures::fx::FxHashMap;
+use rustc_span::Span;
+use rustc_span::def_id::DefId;
+use tracing::{debug, instrument, trace};
+
 use crate::error::ConstNotUsedTraitAlias;
 use crate::ty::fold::{TypeFolder, TypeSuperFoldable};
-use crate::ty::{self, Ty, TyCtxt, TypeFoldable};
-use crate::ty::{GenericArg, GenericArgKind};
-use rustc_data_structures::fx::FxHashMap;
-use rustc_span::def_id::DefId;
-use rustc_span::Span;
+use crate::ty::{self, GenericArg, GenericArgKind, Ty, TyCtxt, TypeFoldable};
+
+pub type OpaqueTypeKey<'tcx> = rustc_type_ir::OpaqueTypeKey<TyCtxt<'tcx>>;
 
 /// Converts generic params of a TypeFoldable from one
 /// item's generics to another. Usually from a function's generics
@@ -92,7 +95,7 @@ impl<'tcx> ReverseMapper<'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -130,9 +133,9 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
             None => {
                 let e = self
                     .tcx
-                    .sess
+                    .dcx()
                     .struct_span_err(self.span, "non-defining opaque type use in defining scope")
-                    .span_label(
+                    .with_span_label(
                         self.span,
                         format!(
                             "lifetime `{r}` is part of concrete type but not used in \
@@ -141,7 +144,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
                     )
                     .emit();
 
-                ty::Region::new_error(self.interner(), e)
+                ty::Region::new_error(self.cx(), e)
             }
         }
     }
@@ -153,9 +156,9 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
                 Ty::new_closure(self.tcx, def_id, args)
             }
 
-            ty::Coroutine(def_id, args, movability) => {
+            ty::Coroutine(def_id, args) => {
                 let args = self.fold_closure_args(def_id, args);
-                Ty::new_coroutine(self.tcx, def_id, args, movability)
+                Ty::new_coroutine(self.tcx, def_id, args)
             }
 
             ty::CoroutineWitness(def_id, args) => {
@@ -164,9 +167,9 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
             }
 
             ty::Param(param) => {
-                // Look it up in the substitution list.
+                // Look it up in the generic parameters list.
                 match self.map.get(&ty.into()).map(|k| k.unpack()) {
-                    // Found it in the substitution list; replace with the parameter from the
+                    // Found it in the generic parameters list; replace with the parameter from the
                     // opaque type.
                     Some(GenericArgKind::Type(t1)) => t1,
                     Some(u) => panic!("type mapped to unexpected kind: {u:?}"),
@@ -174,7 +177,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
                         debug!(?param, ?self.map);
                         if !self.ignore_errors {
                             self.tcx
-                                .sess
+                                .dcx()
                                 .struct_span_err(
                                     self.span,
                                     format!(
@@ -199,23 +202,23 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
         // Find a const parameter
         match ct.kind() {
             ty::ConstKind::Param(..) => {
-                // Look it up in the substitution list.
+                // Look it up in the generic parameters list.
                 match self.map.get(&ct.into()).map(|k| k.unpack()) {
-                    // Found it in the substitution list, replace with the parameter from the
+                    // Found it in the generic parameters list, replace with the parameter from the
                     // opaque type.
                     Some(GenericArgKind::Const(c1)) => c1,
                     Some(u) => panic!("const mapped to unexpected kind: {u:?}"),
                     None => {
                         let guar = self
                             .tcx
-                            .sess
+                            .dcx()
                             .create_err(ConstNotUsedTraitAlias {
                                 ct: ct.to_string(),
                                 span: self.span,
                             })
                             .emit_unless(self.ignore_errors);
 
-                        ty::Const::new_error(self.tcx, guar, ct.ty())
+                        ty::Const::new_error(self.tcx, guar)
                     }
                 }
             }

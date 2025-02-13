@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 
 trait Foo: PartialEq<i32> + std::fmt::Debug + Send + Sync {
     fn a(&self) -> i32 {

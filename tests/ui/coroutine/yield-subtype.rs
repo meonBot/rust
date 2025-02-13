@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 #![allow(dead_code)]
 #![allow(dead_code)]
 
@@ -8,7 +8,7 @@ fn bar<'a>() {
     let a: &'static str = "hi";
     let b: &'a str = a;
 
-    || { //~ WARN unused coroutine that must be used
+    #[coroutine] || { //~ WARN unused coroutine that must be used
         yield a;
         yield b;
     };

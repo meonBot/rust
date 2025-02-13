@@ -1,30 +1,26 @@
-use crate::spec::base::apple::{ios_llvm_target, opts, Arch};
+use crate::spec::base::apple::{Arch, TargetAbi, base};
 use crate::spec::{FramePointer, SanitizerSet, Target, TargetOptions};
 
-pub fn target() -> Target {
-    let arch = Arch::Arm64e;
-    let mut base = opts("ios", arch);
-    base.supported_sanitizers = SanitizerSet::ADDRESS | SanitizerSet::THREAD;
-
+pub(crate) fn target() -> Target {
+    let (opts, llvm_target, arch) = base("ios", Arch::Arm64e, TargetAbi::Normal);
     Target {
-        llvm_target: ios_llvm_target(arch).into(),
+        llvm_target,
+        metadata: crate::spec::TargetMetadata {
+            description: Some("ARM64e Apple iOS".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(true),
+        },
         pointer_width: 64,
-        data_layout: "e-m:o-i64:64-i128:128-n32:64-S128".into(),
-        arch: arch.target_arch(),
+        data_layout: "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
+            .into(),
+        arch,
         options: TargetOptions {
-            features: "+neon,+fp-armv8,+apple-a12,+v8.3a,+paca,+pacg".into(),
+            features: "+neon,+fp-armv8,+apple-a12,+v8.3a,+pauth".into(),
             max_atomic_width: Some(128),
-            forces_embed_bitcode: true,
             frame_pointer: FramePointer::NonLeaf,
-            bitcode_llvm_cmdline: "-triple\0\
-                arm64e-apple-ios14.1.0\0\
-                -emit-obj\0\
-                -disable-llvm-passes\0\
-                -target-abi\0\
-                darwinpcs\0\
-                -Os\0"
-                .into(),
-            ..base
+            supported_sanitizers: SanitizerSet::ADDRESS | SanitizerSet::THREAD,
+            ..opts
         },
     }
 }

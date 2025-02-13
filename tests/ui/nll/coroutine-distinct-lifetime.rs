@@ -6,9 +6,10 @@
 // over a yield -- because the data that is borrowed (`*x`) is not
 // stored on the stack.
 
-// check-pass
+//@ check-pass
 
 fn foo(x: &mut u32) {
+    #[coroutine]
     move || {
         let s = &mut *x;
         yield;

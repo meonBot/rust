@@ -1,25 +1,18 @@
+use rustc_ast::MetaItem;
+use rustc_hir::def_id::DefId;
+use rustc_middle::mir::{self, Body, Local, Location};
+use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_span::{Span, Symbol, sym};
+use tracing::{debug, info};
+
 use crate::errors::{
     PeekArgumentNotALocal, PeekArgumentUntracked, PeekBitNotSet, PeekMustBeNotTemporary,
     PeekMustBePlaceOrRefPlace, StopAfterDataFlowEndedCompilation,
 };
 use crate::framework::BitSetExt;
-use crate::impls::{
-    DefinitelyInitializedPlaces, MaybeInitializedPlaces, MaybeLiveLocals, MaybeUninitializedPlaces,
-};
-use crate::move_paths::{HasMoveData, MoveData};
-use crate::move_paths::{LookupResult, MovePathIndex};
-use crate::MoveDataParamEnv;
+use crate::impls::{MaybeInitializedPlaces, MaybeLiveLocals, MaybeUninitializedPlaces};
+use crate::move_paths::{HasMoveData, LookupResult, MoveData, MovePathIndex};
 use crate::{Analysis, JoinSemiLattice, ResultsCursor};
-use rustc_ast::MetaItem;
-use rustc_hir::def_id::DefId;
-use rustc_index::bit_set::ChunkedBitSet;
-use rustc_middle::mir::MirPass;
-use rustc_middle::mir::{self, Body, Local, Location};
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::symbol::{sym, Symbol};
-use rustc_span::Span;
-
-pub struct SanityCheck;
 
 fn has_rustc_mir_with(tcx: TyCtxt<'_>, def_id: DefId, name: Symbol) -> Option<MetaItem> {
     for attr in tcx.get_attrs(def_id, sym::rustc_mir) {
@@ -34,54 +27,39 @@ fn has_rustc_mir_with(tcx: TyCtxt<'_>, def_id: DefId, name: Symbol) -> Option<Me
     None
 }
 
-// FIXME: This should be a `MirLint`, but it needs to be moved back to `rustc_mir_transform` first.
-impl<'tcx> MirPass<'tcx> for SanityCheck {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        let def_id = body.source.def_id();
-        if !tcx.has_attr(def_id, sym::rustc_mir) {
-            debug!("skipping rustc_peek::SanityCheck on {}", tcx.def_path_str(def_id));
-            return;
-        } else {
-            debug!("running rustc_peek::SanityCheck on {}", tcx.def_path_str(def_id));
-        }
+pub fn sanity_check<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
+    let def_id = body.source.def_id();
+    if !tcx.has_attr(def_id, sym::rustc_mir) {
+        debug!("skipping rustc_peek::SanityCheck on {}", tcx.def_path_str(def_id));
+        return;
+    } else {
+        debug!("running rustc_peek::SanityCheck on {}", tcx.def_path_str(def_id));
+    }
 
-        let param_env = tcx.param_env(def_id);
-        let move_data = MoveData::gather_moves(body, tcx, param_env, |_| true);
-        let mdpe = MoveDataParamEnv { move_data, param_env };
+    let move_data = MoveData::gather_moves(body, tcx, |_| true);
 
-        if has_rustc_mir_with(tcx, def_id, sym::rustc_peek_maybe_init).is_some() {
-            let flow_inits = MaybeInitializedPlaces::new(tcx, body, &mdpe)
-                .into_engine(tcx, body)
-                .iterate_to_fixpoint();
+    if has_rustc_mir_with(tcx, def_id, sym::rustc_peek_maybe_init).is_some() {
+        let flow_inits =
+            MaybeInitializedPlaces::new(tcx, body, &move_data).iterate_to_fixpoint(tcx, body, None);
 
-            sanity_check_via_rustc_peek(tcx, flow_inits.into_results_cursor(body));
-        }
+        sanity_check_via_rustc_peek(tcx, flow_inits.into_results_cursor(body));
+    }
 
-        if has_rustc_mir_with(tcx, def_id, sym::rustc_peek_maybe_uninit).is_some() {
-            let flow_uninits = MaybeUninitializedPlaces::new(tcx, body, &mdpe)
-                .into_engine(tcx, body)
-                .iterate_to_fixpoint();
+    if has_rustc_mir_with(tcx, def_id, sym::rustc_peek_maybe_uninit).is_some() {
+        let flow_uninits = MaybeUninitializedPlaces::new(tcx, body, &move_data)
+            .iterate_to_fixpoint(tcx, body, None);
 
-            sanity_check_via_rustc_peek(tcx, flow_uninits.into_results_cursor(body));
-        }
+        sanity_check_via_rustc_peek(tcx, flow_uninits.into_results_cursor(body));
+    }
 
-        if has_rustc_mir_with(tcx, def_id, sym::rustc_peek_definite_init).is_some() {
-            let flow_def_inits = DefinitelyInitializedPlaces::new(body, &mdpe)
-                .into_engine(tcx, body)
-                .iterate_to_fixpoint();
+    if has_rustc_mir_with(tcx, def_id, sym::rustc_peek_liveness).is_some() {
+        let flow_liveness = MaybeLiveLocals.iterate_to_fixpoint(tcx, body, None);
 
-            sanity_check_via_rustc_peek(tcx, flow_def_inits.into_results_cursor(body));
-        }
+        sanity_check_via_rustc_peek(tcx, flow_liveness.into_results_cursor(body));
+    }
 
-        if has_rustc_mir_with(tcx, def_id, sym::rustc_peek_liveness).is_some() {
-            let flow_liveness = MaybeLiveLocals.into_engine(tcx, body).iterate_to_fixpoint();
-
-            sanity_check_via_rustc_peek(tcx, flow_liveness.into_results_cursor(body));
-        }
-
-        if has_rustc_mir_with(tcx, def_id, sym::stop_after_dataflow).is_some() {
-            tcx.sess.emit_fatal(StopAfterDataFlowEndedCompilation);
-        }
+    if has_rustc_mir_with(tcx, def_id, sym::stop_after_dataflow).is_some() {
+        tcx.dcx().emit_fatal(StopAfterDataFlowEndedCompilation);
     }
 }
 
@@ -145,7 +123,7 @@ where
             }
 
             _ => {
-                tcx.sess.emit_err(PeekMustBePlaceOrRefPlace { span: call.span });
+                tcx.dcx().emit_err(PeekMustBePlaceOrRefPlace { span: call.span });
             }
         }
     }
@@ -202,24 +180,23 @@ impl PeekCall {
             &terminator.kind
         {
             if let ty::FnDef(def_id, fn_args) = *func.const_.ty().kind() {
-                let name = tcx.item_name(def_id);
-                if !tcx.is_intrinsic(def_id) || name != sym::rustc_peek {
+                if tcx.intrinsic(def_id)?.name != sym::rustc_peek {
                     return None;
                 }
 
                 assert_eq!(fn_args.len(), 1);
                 let kind = PeekCallKind::from_arg_ty(fn_args.type_at(0));
-                let arg = match &args[0] {
+                let arg = match &args[0].node {
                     Operand::Copy(place) | Operand::Move(place) => {
                         if let Some(local) = place.as_local() {
                             local
                         } else {
-                            tcx.sess.emit_err(PeekMustBeNotTemporary { span });
+                            tcx.dcx().emit_err(PeekMustBeNotTemporary { span });
                             return None;
                         }
                     }
                     _ => {
-                        tcx.sess.emit_err(PeekMustBeNotTemporary { span });
+                        tcx.dcx().emit_err(PeekMustBeNotTemporary { span });
                         return None;
                     }
                 };
@@ -237,7 +214,7 @@ trait RustcPeekAt<'tcx>: Analysis<'tcx> {
         &self,
         tcx: TyCtxt<'tcx>,
         place: mir::Place<'tcx>,
-        flow_state: &Self::Domain,
+        state: &Self::Domain,
         call: PeekCall,
     );
 }
@@ -251,20 +228,20 @@ where
         &self,
         tcx: TyCtxt<'tcx>,
         place: mir::Place<'tcx>,
-        flow_state: &Self::Domain,
+        state: &Self::Domain,
         call: PeekCall,
     ) {
         match self.move_data().rev_lookup.find(place.as_ref()) {
             LookupResult::Exact(peek_mpi) => {
-                let bit_state = flow_state.contains(peek_mpi);
+                let bit_state = state.contains(peek_mpi);
                 debug!("rustc_peek({:?} = &{:?}) bit_state: {}", call.arg, place, bit_state);
                 if !bit_state {
-                    tcx.sess.emit_err(PeekBitNotSet { span: call.span });
+                    tcx.dcx().emit_err(PeekBitNotSet { span: call.span });
                 }
             }
 
             LookupResult::Parent(..) => {
-                tcx.sess.emit_err(PeekArgumentUntracked { span: call.span });
+                tcx.dcx().emit_err(PeekArgumentUntracked { span: call.span });
             }
         }
     }
@@ -275,17 +252,17 @@ impl<'tcx> RustcPeekAt<'tcx> for MaybeLiveLocals {
         &self,
         tcx: TyCtxt<'tcx>,
         place: mir::Place<'tcx>,
-        flow_state: &ChunkedBitSet<Local>,
+        state: &Self::Domain,
         call: PeekCall,
     ) {
         info!(?place, "peek_at");
         let Some(local) = place.as_local() else {
-            tcx.sess.emit_err(PeekArgumentNotALocal { span: call.span });
+            tcx.dcx().emit_err(PeekArgumentNotALocal { span: call.span });
             return;
         };
 
-        if !flow_state.contains(local) {
-            tcx.sess.emit_err(PeekBitNotSet { span: call.span });
+        if !state.contains(local) {
+            tcx.dcx().emit_err(PeekBitNotSet { span: call.span });
         }
     }
 }

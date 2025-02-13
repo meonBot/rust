@@ -18,11 +18,7 @@ pub(super) fn check<'tcx>(
     recv: &'tcx hir::Expr<'_>,
     arg: &'tcx hir::Expr<'_>,
     simplify_using: &str,
-) {
-    if is_from_proc_macro(cx, expr) {
-        return;
-    }
-
+) -> bool {
     let is_option = is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(recv), sym::Option);
     let is_result = is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(recv), sym::Result);
     let is_bool = cx.typeck_results().expr_ty(recv).is_bool();
@@ -32,8 +28,8 @@ pub(super) fn check<'tcx>(
             let body = cx.tcx.hir().body(body);
             let body_expr = &body.value;
 
-            if usage::BindingUsageFinder::are_params_used(cx, body) {
-                return;
+            if usage::BindingUsageFinder::are_params_used(cx, body) || is_from_proc_macro(cx, expr) {
+                return false;
             }
 
             if eager_or_lazy::switch_to_eager_eval(cx, body_expr) {
@@ -53,7 +49,7 @@ pub(super) fn check<'tcx>(
                         fn_decl.output,
                         FnRetTy::DefaultReturn(_)
                             | FnRetTy::Return(hir::Ty {
-                                kind: hir::TyKind::Infer,
+                                kind: hir::TyKind::Infer(()),
                                 ..
                             })
                     ) {
@@ -68,15 +64,17 @@ pub(super) fn check<'tcx>(
                 // but prefer to avoid changing the signature of the function itself.
                 if let hir::ExprKind::MethodCall(.., span) = expr.kind {
                     span_lint_and_then(cx, UNNECESSARY_LAZY_EVALUATIONS, expr.span, msg, |diag| {
-                        diag.span_suggestion(
+                        diag.span_suggestion_verbose(
                             span,
-                            format!("use `{simplify_using}(..)` instead"),
+                            format!("use `{simplify_using}` instead"),
                             format!("{simplify_using}({})", snippet(cx, body_expr.span, "..")),
                             applicability,
                         );
                     });
+                    return true;
                 }
             }
         }
     }
+    false
 }

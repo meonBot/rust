@@ -1,11 +1,14 @@
+use std::iter;
+
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
+use rustc_middle::bug;
 use rustc_middle::query::Providers;
+use rustc_middle::ty::fold::fold_regions;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::Span;
-use std::iter;
 
 pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers {
@@ -69,25 +72,23 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
                     // case, since it has been liberated), map it back to the early-bound lifetime of
                     // the GAT. Since RPITITs also have all of the fn's generics, we slice only
                     // the end of the list corresponding to the opaque's generics.
-                    for param in &generics.params[tcx.generics_of(fn_def_id).params.len()..] {
+                    for param in &generics.own_params[tcx.generics_of(fn_def_id).own_params.len()..]
+                    {
                         let orig_lt =
-                            tcx.map_rpit_lifetime_to_fn_lifetime(param.def_id.expect_local());
+                            tcx.map_opaque_lifetime_to_parent_lifetime(param.def_id.expect_local());
                         if matches!(*orig_lt, ty::ReLateParam(..)) {
                             mapping.insert(
                                 orig_lt,
                                 ty::Region::new_early_param(
                                     tcx,
-                                    ty::EarlyParamRegion {
-                                        def_id: param.def_id,
-                                        index: param.index,
-                                        name: param.name,
-                                    },
+                                    ty::EarlyParamRegion { index: param.index, name: param.name },
                                 ),
                             );
                         }
                     }
                     // FIXME: This could use a real folder, I guess.
-                    let remapped_wf_tys = tcx.fold_regions(
+                    let remapped_wf_tys = fold_regions(
+                        tcx,
                         tcx.assumed_wf_types(fn_def_id.expect_local()).to_vec(),
                         |region, _| {
                             // If `region` is a `ReLateParam` that is captured by the
@@ -121,18 +122,7 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
             }
         }
         DefKind::AssocConst | DefKind::AssocTy => tcx.assumed_wf_types(tcx.local_parent(def_id)),
-        DefKind::OpaqueTy => match tcx.def_kind(tcx.local_parent(def_id)) {
-            DefKind::TyAlias => ty::List::empty(),
-            DefKind::AssocTy => tcx.assumed_wf_types(tcx.local_parent(def_id)),
-            // Nested opaque types only occur in associated types:
-            // ` type Opaque<T> = impl Trait<&'static T, AssocTy = impl Nested>; `
-            // assumed_wf_types should include those of `Opaque<T>`, `Opaque<T>` itself
-            // and `&'static T`.
-            DefKind::OpaqueTy => bug!("unimplemented implied bounds for nested opaque types"),
-            def_kind => {
-                bug!("unimplemented implied bounds for opaque types with parent {def_kind:?}")
-            }
-        },
+        DefKind::OpaqueTy => bug!("implied bounds are not defined for opaques"),
         DefKind::Mod
         | DefKind::Struct
         | DefKind::Union
@@ -145,7 +135,7 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
         | DefKind::TyParam
         | DefKind::Const
         | DefKind::ConstParam
-        | DefKind::Static(_)
+        | DefKind::Static { .. }
         | DefKind::Ctor(_, _)
         | DefKind::Macro(_)
         | DefKind::ExternCrate
@@ -156,12 +146,13 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
         | DefKind::Field
         | DefKind::LifetimeParam
         | DefKind::GlobalAsm
-        | DefKind::Closure => ty::List::empty(),
+        | DefKind::Closure
+        | DefKind::SyntheticCoroutineBody => ty::List::empty(),
     }
 }
 
 fn fn_sig_spans(tcx: TyCtxt<'_>, def_id: LocalDefId) -> impl Iterator<Item = Span> + '_ {
-    let node = tcx.hir().get(tcx.local_def_id_to_hir_id(def_id));
+    let node = tcx.hir_node_by_def_id(def_id);
     if let Some(decl) = node.fn_decl() {
         decl.inputs.iter().map(|ty| ty.span).chain(iter::once(decl.output.span()))
     } else {

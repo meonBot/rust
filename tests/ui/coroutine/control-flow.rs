@@ -1,11 +1,10 @@
-// run-pass
+//@ run-pass
 
-// revisions: default nomiropt
-//[nomiropt]compile-flags: -Z mir-opt-level=0
+//@ revisions: default nomiropt
+//@[nomiropt]compile-flags: -Z mir-opt-level=0
 
-#![feature(coroutines, coroutine_trait)]
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
 
-use std::marker::Unpin;
 use std::ops::{CoroutineState, Coroutine};
 use std::pin::Pin;
 
@@ -25,25 +24,25 @@ fn finish<T>(mut amt: usize, mut t: T) -> T::Return
 }
 
 fn main() {
-    finish(1, || yield);
-    finish(8, || {
+    finish(1, #[coroutine] || yield);
+    finish(8, #[coroutine] || {
         for _ in 0..8 {
             yield;
         }
     });
-    finish(1, || {
+    finish(1, #[coroutine] || {
         if true {
             yield;
         } else {
         }
     });
-    finish(1, || {
+    finish(1, #[coroutine] || {
         if false {
         } else {
             yield;
         }
     });
-    finish(2, || {
+    finish(2, #[coroutine] || {
         if { yield; false } {
             yield;
             panic!()

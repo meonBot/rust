@@ -1,19 +1,17 @@
 // This test checks links colors.
+include: "utils.goml"
 go-to: "file://" + |DOC_PATH| + "/test_docs/index.html"
 
 // This is needed so that the text color is computed.
 show-text: true
 
+// First we check the links of the different items.
 define-function: (
     "check-colors",
-    (theme, mod, macro, struct, enum, trait, fn, type, union, keyword,
-     sidebar, sidebar_current, sidebar_current_background),
+    [theme, mod, macro, struct, enum, trait, fn, type, union, keyword,
+     sidebar, sidebar_current, sidebar_current_background],
     block {
-        set-local-storage: {
-            "rustdoc-theme": |theme|,
-            "rustdoc-use-system-theme": "false",
-        }
-        reload:
+        call-function: ("switch-theme", {"theme": |theme|})
         // Checking results colors.
         assert-css: (".item-table .mod", {"color": |mod|}, ALL)
         assert-css: (".item-table .macro", {"color": |macro|}, ALL)
@@ -26,18 +24,23 @@ define-function: (
         assert-css: (".item-table .keyword", {"color": |keyword|}, ALL)
         // Checking sidebar elements.
         assert-css: (
-            ".sidebar-elems a:not(.current)",
+            ".sidebar-elems li:not(.current) a",
             {"color": |sidebar|, "background-color": "rgba(0, 0, 0, 0)", "font-weight": "400"},
             ALL,
         )
         assert-css: (
-            ".sidebar-elems a.current",
+            ".sidebar-elems li.current a",
             {
                 "color": |sidebar_current|,
                 "background-color": |sidebar_current_background|,
                 "font-weight": "500",
             },
             ALL,
+        )
+        move-cursor-to: "dd a[href='long_code_block_link/index.html']"
+        assert-css: (
+            "dd a[href='long_code_block_link/index.html']",
+            {"text-decoration": "underline solid " + |mod|},
         )
     },
 )

@@ -1,6 +1,6 @@
 use super::sealed::Sealed;
 use crate::simd::{
-    cmp::SimdPartialOrd, intrinsics, num::SimdUint, LaneCount, Mask, Simd, SimdCast, SimdElement,
+    cmp::SimdOrd, cmp::SimdPartialOrd, num::SimdUint, LaneCount, Mask, Simd, SimdCast, SimdElement,
     SupportedLaneCount,
 };
 
@@ -70,10 +70,26 @@ pub trait SimdInt: Copy + Sealed {
     /// # #[cfg(not(feature = "as_crate"))] use core::simd;
     /// # use simd::prelude::*;
     /// use core::i32::{MIN, MAX};
-    /// let xs = Simd::from_array([MIN, MIN +1, -5, 0]);
+    /// let xs = Simd::from_array([MIN, MIN + 1, -5, 0]);
     /// assert_eq!(xs.abs(), Simd::from_array([MIN, MAX, 5, 0]));
     /// ```
     fn abs(self) -> Self;
+
+    /// Lanewise absolute difference.
+    /// Every element becomes the absolute difference of `self` and `second`.
+    ///
+    /// # Examples
+    /// ```
+    /// # #![feature(portable_simd)]
+    /// # #[cfg(feature = "as_crate")] use core_simd::simd;
+    /// # #[cfg(not(feature = "as_crate"))] use core::simd;
+    /// # use simd::prelude::*;
+    /// use core::i32::{MIN, MAX};
+    /// let a = Simd::from_array([MIN, MAX, 100, -100]);
+    /// let b = Simd::from_array([MAX, MIN, -80, -120]);
+    /// assert_eq!(a.abs_diff(b), Simd::from_array([u32::MAX, u32::MAX, 180, 20]));
+    /// ```
+    fn abs_diff(self, second: Self) -> Self::Unsigned;
 
     /// Lanewise saturating absolute value, implemented in Rust.
     /// As abs(), except the MIN value becomes MAX instead of itself.
@@ -203,6 +219,12 @@ pub trait SimdInt: Copy + Sealed {
     /// The least significant bit becomes the most significant bit, second least-significant bit becomes second most-significant bit, etc.
     fn reverse_bits(self) -> Self;
 
+    /// Returns the number of ones in the binary representation of each element.
+    fn count_ones(self) -> Self::Unsigned;
+
+    /// Returns the number of zeros in the binary representation of each element.
+    fn count_zeros(self) -> Self::Unsigned;
+
     /// Returns the number of leading zeros in the binary representation of each element.
     fn leading_zeros(self) -> Self::Unsigned;
 
@@ -237,19 +259,19 @@ macro_rules! impl_trait {
             #[inline]
             fn cast<T: SimdCast>(self) -> Self::Cast<T> {
                 // Safety: supported types are guaranteed by SimdCast
-                unsafe { intrinsics::simd_as(self) }
+                unsafe { core::intrinsics::simd::simd_as(self) }
             }
 
             #[inline]
             fn saturating_add(self, second: Self) -> Self {
                 // Safety: `self` is a vector
-                unsafe { intrinsics::simd_saturating_add(self, second) }
+                unsafe { core::intrinsics::simd::simd_saturating_add(self, second) }
             }
 
             #[inline]
             fn saturating_sub(self, second: Self) -> Self {
                 // Safety: `self` is a vector
-                unsafe { intrinsics::simd_saturating_sub(self, second) }
+                unsafe { core::intrinsics::simd::simd_saturating_sub(self, second) }
             }
 
             #[inline]
@@ -257,6 +279,13 @@ macro_rules! impl_trait {
                 const SHR: $ty = <$ty>::BITS as $ty - 1;
                 let m = self >> Simd::splat(SHR);
                 (self^m) - m
+            }
+
+            #[inline]
+            fn abs_diff(self, second: Self) -> Self::Unsigned {
+                let max = self.simd_max(second);
+                let min = self.simd_min(second);
+                (max - min).cast()
             }
 
             #[inline]
@@ -293,55 +322,65 @@ macro_rules! impl_trait {
             #[inline]
             fn reduce_sum(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_add_ordered(self, 0) }
+                unsafe { core::intrinsics::simd::simd_reduce_add_ordered(self, 0) }
             }
 
             #[inline]
             fn reduce_product(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_mul_ordered(self, 1) }
+                unsafe { core::intrinsics::simd::simd_reduce_mul_ordered(self, 1) }
             }
 
             #[inline]
             fn reduce_max(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_max(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_max(self) }
             }
 
             #[inline]
             fn reduce_min(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_min(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_min(self) }
             }
 
             #[inline]
             fn reduce_and(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_and(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_and(self) }
             }
 
             #[inline]
             fn reduce_or(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_or(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_or(self) }
             }
 
             #[inline]
             fn reduce_xor(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_xor(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_xor(self) }
             }
 
             #[inline]
             fn swap_bytes(self) -> Self {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_bswap(self) }
+                unsafe { core::intrinsics::simd::simd_bswap(self) }
             }
 
             #[inline]
             fn reverse_bits(self) -> Self {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_bitreverse(self) }
+                unsafe { core::intrinsics::simd::simd_bitreverse(self) }
+            }
+
+            #[inline]
+            fn count_ones(self) -> Self::Unsigned {
+                self.cast::<$unsigned>().count_ones()
+            }
+
+            #[inline]
+            fn count_zeros(self) -> Self::Unsigned {
+                self.cast::<$unsigned>().count_zeros()
             }
 
             #[inline]

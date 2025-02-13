@@ -2,10 +2,9 @@
 
 use std::fmt;
 
-use serde::{Serialize, Serializer};
-
-use rustc_hir::def::DefKind;
+use rustc_hir::def::{CtorOf, DefKind};
 use rustc_span::hygiene::MacroKind;
+use serde::{Serialize, Serializer};
 
 use crate::clean;
 
@@ -52,7 +51,7 @@ pub(crate) enum ItemType {
     AssocConst = 19,
     Union = 20,
     ForeignType = 21,
-    OpaqueTy = 22,
+    // OpaqueTy used to be here, but it was removed in #127276
     ProcAttribute = 23,
     ProcDerive = 24,
     TraitAlias = 25,
@@ -71,7 +70,7 @@ impl Serialize for ItemType {
 
 impl<'a> From<&'a clean::Item> for ItemType {
     fn from(item: &'a clean::Item) -> ItemType {
-        let kind = match *item.kind {
+        let kind = match item.kind {
             clean::StrippedItem(box ref item) => item,
             ref kind => kind,
         };
@@ -85,12 +84,11 @@ impl<'a> From<&'a clean::Item> for ItemType {
             clean::EnumItem(..) => ItemType::Enum,
             clean::FunctionItem(..) => ItemType::Function,
             clean::TypeAliasItem(..) => ItemType::TypeAlias,
-            clean::OpaqueTyItem(..) => ItemType::OpaqueTy,
             clean::StaticItem(..) => ItemType::Static,
             clean::ConstantItem(..) => ItemType::Constant,
             clean::TraitItem(..) => ItemType::Trait,
             clean::ImplItem(..) => ItemType::Impl,
-            clean::TyMethodItem(..) => ItemType::TyMethod,
+            clean::RequiredMethodItem(..) => ItemType::TyMethod,
             clean::MethodItem(..) => ItemType::Method,
             clean::StructFieldItem(..) => ItemType::StructField,
             clean::VariantItem(..) => ItemType::Variant,
@@ -98,8 +96,10 @@ impl<'a> From<&'a clean::Item> for ItemType {
             clean::ForeignStaticItem(..) => ItemType::Static,     // no ForeignStatic
             clean::MacroItem(..) => ItemType::Macro,
             clean::PrimitiveItem(..) => ItemType::Primitive,
-            clean::TyAssocConstItem(..) | clean::AssocConstItem(..) => ItemType::AssocConst,
-            clean::TyAssocTypeItem(..) | clean::AssocTypeItem(..) => ItemType::AssocType,
+            clean::RequiredAssocConstItem(..)
+            | clean::ProvidedAssocConstItem(..)
+            | clean::ImplAssocConstItem(..) => ItemType::AssocConst,
+            clean::RequiredAssocTypeItem(..) | clean::AssocTypeItem(..) => ItemType::AssocType,
             clean::ForeignTypeItem => ItemType::ForeignType,
             clean::KeywordItem => ItemType::Keyword,
             clean::TraitAliasItem(..) => ItemType::TraitAlias,
@@ -115,12 +115,20 @@ impl<'a> From<&'a clean::Item> for ItemType {
 
 impl From<DefKind> for ItemType {
     fn from(other: DefKind) -> Self {
-        match other {
+        Self::from_def_kind(other, None)
+    }
+}
+
+impl ItemType {
+    /// Depending on the parent kind, some variants have a different translation (like a `Method`
+    /// becoming a `TyMethod`).
+    pub(crate) fn from_def_kind(kind: DefKind, parent_kind: Option<DefKind>) -> Self {
+        match kind {
             DefKind::Enum => Self::Enum,
             DefKind::Fn => Self::Function,
             DefKind::Mod => Self::Module,
             DefKind::Const => Self::Constant,
-            DefKind::Static(_) => Self::Static,
+            DefKind::Static { .. } => Self::Static,
             DefKind::Struct => Self::Struct,
             DefKind::Union => Self::Union,
             DefKind::Trait => Self::Trait,
@@ -131,30 +139,36 @@ impl From<DefKind> for ItemType {
                 MacroKind::Attr => ItemType::ProcAttribute,
                 MacroKind::Derive => ItemType::ProcDerive,
             },
-            DefKind::ForeignTy
-            | DefKind::Variant
-            | DefKind::AssocTy
-            | DefKind::TyParam
+            DefKind::ForeignTy => Self::ForeignType,
+            DefKind::Variant => Self::Variant,
+            DefKind::Field => Self::StructField,
+            DefKind::AssocTy => Self::AssocType,
+            DefKind::AssocFn => {
+                if let Some(DefKind::Trait) = parent_kind {
+                    Self::TyMethod
+                } else {
+                    Self::Method
+                }
+            }
+            DefKind::Ctor(CtorOf::Struct, _) => Self::Struct,
+            DefKind::Ctor(CtorOf::Variant, _) => Self::Variant,
+            DefKind::AssocConst => Self::AssocConst,
+            DefKind::TyParam
             | DefKind::ConstParam
-            | DefKind::Ctor(..)
-            | DefKind::AssocFn
-            | DefKind::AssocConst
             | DefKind::ExternCrate
             | DefKind::Use
             | DefKind::ForeignMod
             | DefKind::AnonConst
             | DefKind::InlineConst
             | DefKind::OpaqueTy
-            | DefKind::Field
             | DefKind::LifetimeParam
             | DefKind::GlobalAsm
             | DefKind::Impl { .. }
-            | DefKind::Closure => Self::ForeignType,
+            | DefKind::Closure
+            | DefKind::SyntheticCoroutineBody => Self::ForeignType,
         }
     }
-}
 
-impl ItemType {
     pub(crate) fn as_str(&self) -> &'static str {
         match *self {
             ItemType::Module => "mod",
@@ -179,7 +193,6 @@ impl ItemType {
             ItemType::AssocConst => "associatedconstant",
             ItemType::ForeignType => "foreigntype",
             ItemType::Keyword => "keyword",
-            ItemType::OpaqueTy => "opaque",
             ItemType::ProcAttribute => "attr",
             ItemType::ProcDerive => "derive",
             ItemType::TraitAlias => "traitalias",

@@ -1,6 +1,5 @@
 #![allow(unused_imports)]
 use super::MaskElement;
-use crate::simd::intrinsics;
 use crate::simd::{LaneCount, Simd, SupportedLaneCount};
 use core::marker::PhantomData;
 
@@ -109,31 +108,18 @@ where
     #[must_use = "method returns a new vector and does not mutate the original value"]
     pub fn to_int(self) -> Simd<T, N> {
         unsafe {
-            intrinsics::simd_select_bitmask(self.0, Simd::splat(T::TRUE), Simd::splat(T::FALSE))
+            core::intrinsics::simd::simd_select_bitmask(
+                self.0,
+                Simd::splat(T::TRUE),
+                Simd::splat(T::FALSE),
+            )
         }
     }
 
     #[inline]
     #[must_use = "method returns a new mask and does not mutate the original value"]
     pub unsafe fn from_int_unchecked(value: Simd<T, N>) -> Self {
-        unsafe { Self(intrinsics::simd_bitmask(value), PhantomData) }
-    }
-
-    #[inline]
-    #[must_use = "method returns a new vector and does not mutate the original value"]
-    pub fn to_bitmask_vector(self) -> Simd<u8, N> {
-        let mut bitmask = Simd::splat(0);
-        bitmask.as_mut_array()[..self.0.as_ref().len()].copy_from_slice(self.0.as_ref());
-        bitmask
-    }
-
-    #[inline]
-    #[must_use = "method returns a new mask and does not mutate the original value"]
-    pub fn from_bitmask_vector(bitmask: Simd<u8, N>) -> Self {
-        let mut bytes = <LaneCount<N> as SupportedLaneCount>::BitMask::default();
-        let len = bytes.as_ref().len();
-        bytes.as_mut().copy_from_slice(&bitmask.as_array()[..len]);
-        Self(bytes, PhantomData)
+        unsafe { Self(core::intrinsics::simd::simd_bitmask(value), PhantomData) }
     }
 
     #[inline]

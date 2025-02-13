@@ -1,5 +1,5 @@
-// check-pass
-// compile-flags: -Ztrait-solver=next
+//@ check-pass
+//@ compile-flags: -Znext-solver
 
 fn foo<'a: 'a>(x: &'a Vec<i32>) -> impl Sized {
     ()

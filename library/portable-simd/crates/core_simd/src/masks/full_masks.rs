@@ -1,6 +1,5 @@
 //! Masks that take up full SIMD vector registers.
 
-use crate::simd::intrinsics;
 use crate::simd::{LaneCount, MaskElement, Simd, SupportedLaneCount};
 
 #[repr(transparent)]
@@ -138,57 +137,7 @@ where
         U: MaskElement,
     {
         // Safety: masks are simply integer vectors of 0 and -1, and we can cast the element type.
-        unsafe { Mask(intrinsics::simd_cast(self.0)) }
-    }
-
-    #[inline]
-    #[must_use = "method returns a new vector and does not mutate the original value"]
-    pub fn to_bitmask_vector(self) -> Simd<u8, N> {
-        let mut bitmask = Simd::splat(0);
-
-        // Safety: Bytes is the right size array
-        unsafe {
-            // Compute the bitmask
-            let mut bytes: <LaneCount<N> as SupportedLaneCount>::BitMask =
-                intrinsics::simd_bitmask(self.0);
-
-            // LLVM assumes bit order should match endianness
-            if cfg!(target_endian = "big") {
-                for x in bytes.as_mut() {
-                    *x = x.reverse_bits()
-                }
-            }
-
-            bitmask.as_mut_array()[..bytes.as_ref().len()].copy_from_slice(bytes.as_ref());
-        }
-
-        bitmask
-    }
-
-    #[inline]
-    #[must_use = "method returns a new mask and does not mutate the original value"]
-    pub fn from_bitmask_vector(bitmask: Simd<u8, N>) -> Self {
-        let mut bytes = <LaneCount<N> as SupportedLaneCount>::BitMask::default();
-
-        // Safety: Bytes is the right size array
-        unsafe {
-            let len = bytes.as_ref().len();
-            bytes.as_mut().copy_from_slice(&bitmask.as_array()[..len]);
-
-            // LLVM assumes bit order should match endianness
-            if cfg!(target_endian = "big") {
-                for x in bytes.as_mut() {
-                    *x = x.reverse_bits();
-                }
-            }
-
-            // Compute the regular mask
-            Self::from_int_unchecked(intrinsics::simd_select_bitmask(
-                bytes,
-                Self::splat(true).to_int(),
-                Self::splat(false).to_int(),
-            ))
-        }
+        unsafe { Mask(core::intrinsics::simd::simd_cast(self.0)) }
     }
 
     #[inline]
@@ -199,7 +148,7 @@ where
         let resized = self.to_int().resize::<M>(T::FALSE);
 
         // Safety: `resized` is an integer vector with length M, which must match T
-        let bitmask: U = unsafe { intrinsics::simd_bitmask(resized) };
+        let bitmask: U = unsafe { core::intrinsics::simd::simd_bitmask(resized) };
 
         // LLVM assumes bit order should match endianness
         if cfg!(target_endian = "big") {
@@ -223,7 +172,7 @@ where
 
         // SAFETY: `mask` is the correct bitmask type for a u64 bitmask
         let mask: Simd<T, M> = unsafe {
-            intrinsics::simd_select_bitmask(
+            core::intrinsics::simd::simd_select_bitmask(
                 bitmask,
                 Simd::<T, M>::splat(T::TRUE),
                 Simd::<T, M>::splat(T::FALSE),
@@ -274,14 +223,14 @@ where
     #[must_use = "method returns a new bool and does not mutate the original value"]
     pub fn any(self) -> bool {
         // Safety: use `self` as an integer vector
-        unsafe { intrinsics::simd_reduce_any(self.to_int()) }
+        unsafe { core::intrinsics::simd::simd_reduce_any(self.to_int()) }
     }
 
     #[inline]
-    #[must_use = "method returns a new vector and does not mutate the original value"]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     pub fn all(self) -> bool {
         // Safety: use `self` as an integer vector
-        unsafe { intrinsics::simd_reduce_all(self.to_int()) }
+        unsafe { core::intrinsics::simd::simd_reduce_all(self.to_int()) }
     }
 }
 
@@ -306,7 +255,7 @@ where
     #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitand(self, rhs: Self) -> Self {
         // Safety: `self` is an integer vector
-        unsafe { Self(intrinsics::simd_and(self.0, rhs.0)) }
+        unsafe { Self(core::intrinsics::simd::simd_and(self.0, rhs.0)) }
     }
 }
 
@@ -320,7 +269,7 @@ where
     #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitor(self, rhs: Self) -> Self {
         // Safety: `self` is an integer vector
-        unsafe { Self(intrinsics::simd_or(self.0, rhs.0)) }
+        unsafe { Self(core::intrinsics::simd::simd_or(self.0, rhs.0)) }
     }
 }
 
@@ -334,7 +283,7 @@ where
     #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitxor(self, rhs: Self) -> Self {
         // Safety: `self` is an integer vector
-        unsafe { Self(intrinsics::simd_xor(self.0, rhs.0)) }
+        unsafe { Self(core::intrinsics::simd::simd_xor(self.0, rhs.0)) }
     }
 }
 

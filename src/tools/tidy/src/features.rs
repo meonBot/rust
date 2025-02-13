@@ -9,15 +9,13 @@
 //! * All unstable lang features have tests to ensure they are actually unstable.
 //! * Language features in a group are sorted by feature name.
 
-use crate::walk::{filter_dirs, filter_not_rust, walk, walk_many};
 use std::collections::hash_map::{Entry, HashMap};
 use std::ffi::OsStr;
-use std::fmt;
-use std::fs;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::{fmt, fs};
 
-use regex::Regex;
+use crate::walk::{filter_dirs, filter_not_rust, walk, walk_many};
 
 #[cfg(test)]
 mod tests;
@@ -29,6 +27,7 @@ const FEATURE_GROUP_START_PREFIX: &str = "// feature-group-start";
 const FEATURE_GROUP_END_PREFIX: &str = "// feature-group-end";
 
 #[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "build-metrics", derive(serde::Serialize))]
 pub enum Status {
     Accepted,
     Removed,
@@ -47,11 +46,14 @@ impl fmt::Display for Status {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "build-metrics", derive(serde::Serialize))]
 pub struct Feature {
     pub level: Status,
     pub since: Option<Version>,
     pub has_gate_test: bool,
     pub tracking_issue: Option<NonZeroU32>,
+    pub file: PathBuf,
+    pub line: usize,
 }
 impl Feature {
     fn tracking_issue_display(&self) -> impl fmt::Display {
@@ -112,7 +114,7 @@ pub fn check(
             let file = entry.path();
             let filename = file.file_name().unwrap().to_string_lossy();
             let filen_underscore = filename.replace('-', "_").replace(".rs", "");
-            let filename_is_gate_test = test_filen_gate(&filen_underscore, &mut features);
+            let filename_gate = test_filen_gate(&filen_underscore, &mut features);
 
             for (i, line) in contents.lines().enumerate() {
                 let mut err = |msg: &str| {
@@ -128,7 +130,7 @@ pub fn check(
                 };
                 match features.get_mut(feature_name) {
                     Some(f) => {
-                        if filename_is_gate_test {
+                        if filename_gate == Some(feature_name) {
                             err(&format!(
                                 "The file is already marked as gate test \
                                       through its name, no need for a \
@@ -184,23 +186,25 @@ pub fn check(
         .chain(lib_features.iter().map(|feat| (feat, "lib")));
     for ((feature_name, feature), kind) in all_features_iter {
         let since = if let Some(since) = feature.since { since } else { continue };
+        let file = feature.file.display();
+        let line = feature.line;
         if since > version && since != Version::CurrentPlaceholder {
             tidy_error!(
                 bad,
-                "The stabilization version {since} of {kind} feature `{feature_name}` is newer than the current {version}"
+                "{file}:{line}: The stabilization version {since} of {kind} feature `{feature_name}` is newer than the current {version}"
             );
         }
         if channel == "nightly" && since == version {
             tidy_error!(
                 bad,
-                "The stabilization version {since} of {kind} feature `{feature_name}` is written out but should be {}",
+                "{file}:{line}: The stabilization version {since} of {kind} feature `{feature_name}` is written out but should be {}",
                 version::VERSION_PLACEHOLDER
             );
         }
         if channel != "nightly" && since == Version::CurrentPlaceholder {
             tidy_error!(
                 bad,
-                "The placeholder use of {kind} feature `{feature_name}` is not allowed on the {channel} channel",
+                "{file}:{line}: The placeholder use of {kind} feature `{feature_name}` is not allowed on the {channel} channel",
             );
         }
     }
@@ -247,34 +251,28 @@ fn format_features<'a>(
 }
 
 fn find_attr_val<'a>(line: &'a str, attr: &str) -> Option<&'a str> {
-    lazy_static::lazy_static! {
-        static ref ISSUE: Regex = Regex::new(r#"issue\s*=\s*"([^"]*)""#).unwrap();
-        static ref FEATURE: Regex = Regex::new(r#"feature\s*=\s*"([^"]*)""#).unwrap();
-        static ref SINCE: Regex = Regex::new(r#"since\s*=\s*"([^"]*)""#).unwrap();
-    }
-
     let r = match attr {
-        "issue" => &*ISSUE,
-        "feature" => &*FEATURE,
-        "since" => &*SINCE,
+        "issue" => static_regex!(r#"issue\s*=\s*"([^"]*)""#),
+        "feature" => static_regex!(r#"feature\s*=\s*"([^"]*)""#),
+        "since" => static_regex!(r#"since\s*=\s*"([^"]*)""#),
         _ => unimplemented!("{attr} not handled"),
     };
 
     r.captures(line).and_then(|c| c.get(1)).map(|m| m.as_str())
 }
 
-fn test_filen_gate(filen_underscore: &str, features: &mut Features) -> bool {
+fn test_filen_gate<'f>(filen_underscore: &'f str, features: &mut Features) -> Option<&'f str> {
     let prefix = "feature_gate_";
-    if filen_underscore.starts_with(prefix) {
+    if let Some(suffix) = filen_underscore.strip_prefix(prefix) {
         for (n, f) in features.iter_mut() {
             // Equivalent to filen_underscore == format!("feature_gate_{n}")
-            if &filen_underscore[prefix.len()..] == n {
+            if suffix == n {
                 f.has_gate_test = true;
-                return true;
+                return Some(suffix);
             }
         }
     }
-    false
+    None
 }
 
 pub fn collect_lang_features(base_compiler_path: &Path, bad: &mut bool) -> Features {
@@ -433,7 +431,14 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
                 );
             }
             Entry::Vacant(e) => {
-                e.insert(Feature { level, since, has_gate_test: false, tracking_issue });
+                e.insert(Feature {
+                    level,
+                    since,
+                    has_gate_test: false,
+                    tracking_issue,
+                    file: path.to_path_buf(),
+                    line: line_number,
+                });
             }
         }
     }
@@ -452,9 +457,10 @@ fn get_and_check_lib_features(
                     if f.tracking_issue != s.tracking_issue && f.level != Status::Accepted {
                         tidy_error!(
                             bad,
-                            "{}:{}: `issue` \"{}\" mismatches the {} `issue` of \"{}\"",
+                            "{}:{}: feature gate {} has inconsistent `issue`: \"{}\" mismatches the {} `issue` of \"{}\"",
                             file.display(),
                             line,
+                            name,
                             f.tracking_issue_display(),
                             display,
                             s.tracking_issue_display(),
@@ -517,11 +523,8 @@ fn map_lib_features(
                     }};
                 }
 
-                lazy_static::lazy_static! {
-                    static ref COMMENT_LINE: Regex = Regex::new(r"^\s*//").unwrap();
-                }
                 // exclude commented out lines
-                if COMMENT_LINE.is_match(line) {
+                if static_regex!(r"^\s*//").is_match(line) {
                     continue;
                 }
 
@@ -559,6 +562,8 @@ fn map_lib_features(
                         since: None,
                         has_gate_test: false,
                         tracking_issue: find_attr_val(line, "issue").and_then(handle_issue_none),
+                        file: file.to_path_buf(),
+                        line: i + 1,
                     };
                     mf(Ok((feature_name, feature)), file, i + 1);
                     continue;
@@ -588,7 +593,14 @@ fn map_lib_features(
                 };
                 let tracking_issue = find_attr_val(line, "issue").and_then(handle_issue_none);
 
-                let feature = Feature { level, since, has_gate_test: false, tracking_issue };
+                let feature = Feature {
+                    level,
+                    since,
+                    has_gate_test: false,
+                    tracking_issue,
+                    file: file.to_path_buf(),
+                    line: i + 1,
+                };
                 if line.contains(']') {
                     mf(Ok((feature_name, feature)), file, i + 1);
                 } else {

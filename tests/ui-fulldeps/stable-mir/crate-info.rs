@@ -1,15 +1,13 @@
-// run-pass
+//@ run-pass
 // Test that users are able to use stable mir APIs to retrieve information of the current crate
 
-// ignore-stage1
-// ignore-cross-compile
-// ignore-remote
-// ignore-windows-gnu mingw has troubles with linking https://github.com/rust-lang/rust/pull/116837
-// edition: 2021
+//@ ignore-stage1
+//@ ignore-cross-compile
+//@ ignore-remote
+//@ edition: 2021
 
 #![feature(rustc_private)]
 #![feature(assert_matches)]
-#![feature(control_flow_enum)]
 
 extern crate rustc_hir;
 extern crate rustc_middle;
@@ -20,7 +18,6 @@ extern crate rustc_interface;
 extern crate stable_mir;
 
 use rustc_hir::def::DefKind;
-use rustc_middle::ty::TyCtxt;
 use rustc_smir::rustc_internal;
 use stable_mir::ItemKind;
 use stable_mir::crate_def::CrateDef;
@@ -33,7 +30,7 @@ use std::ops::ControlFlow;
 const CRATE_NAME: &str = "input";
 
 /// This function uses the Stable MIR APIs to get information about the test crate.
-fn test_stable_mir(_tcx: TyCtxt<'_>) -> ControlFlow<()> {
+fn test_stable_mir() -> ControlFlow<()> {
     // Get the local crate using stable_mir API.
     let local = stable_mir::local_crate();
     assert_eq!(&local.name, CRATE_NAME);
@@ -194,7 +191,7 @@ fn main() {
         CRATE_NAME.to_string(),
         path.to_string(),
     ];
-    run!(args, tcx, test_stable_mir(tcx)).unwrap();
+    run!(args, test_stable_mir).unwrap();
 }
 
 fn generate_input(path: &str) -> std::io::Result<()> {

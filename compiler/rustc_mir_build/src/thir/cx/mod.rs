@@ -2,28 +2,29 @@
 //! structures into the THIR. The `builder` is generally ignorant of the tcx,
 //! etc., and instead goes through the `Cx` for most of its work.
 
-use crate::thir::pattern::pat_from_hir;
-use crate::thir::util::UserAnnotatedTyHelpers;
-
 use rustc_data_structures::steal::Steal;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
+use rustc_hir::HirId;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::lang_items::LangItem;
-use rustc_hir::HirId;
-use rustc_hir::Node;
+use rustc_middle::bug;
 use rustc_middle::middle::region;
 use rustc_middle::thir::*;
-use rustc_middle::ty::{self, RvalueScopes, Ty, TyCtxt};
+use rustc_middle::ty::{self, RvalueScopes, TyCtxt};
+use tracing::instrument;
 
+use crate::thir::pattern::pat_from_hir;
+
+/// Query implementation for [`TyCtxt::thir_body`].
 pub(crate) fn thir_body(
     tcx: TyCtxt<'_>,
     owner_def: LocalDefId,
 ) -> Result<(&Steal<Thir<'_>>, ExprId), ErrorGuaranteed> {
     let hir = tcx.hir();
-    let body = hir.body(hir.body_owned_by(owner_def));
-    let mut cx = Cx::new(tcx, owner_def);
+    let body = hir.body_owned_by(owner_def);
+    let mut cx = ThirBuildCx::new(tcx, owner_def);
     if let Some(reported) = cx.typeck_results.tainted_by_errors {
         return Err(reported);
     }
@@ -32,14 +33,14 @@ pub(crate) fn thir_body(
     let owner_id = tcx.local_def_id_to_hir_id(owner_def);
     if let Some(fn_decl) = hir.fn_decl_by_hir_id(owner_id) {
         let closure_env_param = cx.closure_env_param(owner_def, owner_id);
-        let explicit_params = cx.explicit_params(owner_id, fn_decl, body);
+        let explicit_params = cx.explicit_params(owner_id, fn_decl, &body);
         cx.thir.params = closure_env_param.into_iter().chain(explicit_params).collect();
 
         // The resume argument may be missing, in that case we need to provide it here.
         // It will always be `()` in this case.
         if tcx.is_coroutine(owner_def.to_def_id()) && body.params.is_empty() {
             cx.thir.params.push(Param {
-                ty: Ty::new_unit(tcx),
+                ty: tcx.types.unit,
                 pat: None,
                 ty_span: None,
                 self_kind: None,
@@ -51,11 +52,13 @@ pub(crate) fn thir_body(
     Ok((tcx.alloc_steal_thir(cx.thir), expr))
 }
 
-struct Cx<'tcx> {
+/// Context for lowering HIR to THIR for a single function body (or other kind of body).
+struct ThirBuildCx<'tcx> {
     tcx: TyCtxt<'tcx>,
+    /// The THIR data that this context is building.
     thir: Thir<'tcx>,
 
-    param_env: ty::ParamEnv<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
 
     region_scope_tree: &'tcx region::ScopeTree,
     typeck_results: &'tcx ty::TypeckResults<'tcx>,
@@ -68,8 +71,8 @@ struct Cx<'tcx> {
     body_owner: DefId,
 }
 
-impl<'tcx> Cx<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Cx<'tcx> {
+impl<'tcx> ThirBuildCx<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Self {
         let typeck_results = tcx.typeck(def);
         let hir = tcx.hir();
         let hir_id = tcx.local_def_id_to_hir_id(def);
@@ -93,10 +96,12 @@ impl<'tcx> Cx<'tcx> {
             BodyTy::Const(typeck_results.node_type(hir_id))
         };
 
-        Cx {
+        Self {
             tcx,
             thir: Thir::new(body_type),
-            param_env: tcx.param_env(def),
+            // FIXME(#132279): We're in a body, we should use a typing
+            // mode which reveals the opaque types defined by that body.
+            typing_env: ty::TypingEnv::non_body_analysis(tcx, def),
             region_scope_tree: tcx.region_scope_tree(def),
             typeck_results,
             rvalue_scopes: &typeck_results.rvalue_scopes,
@@ -109,58 +114,50 @@ impl<'tcx> Cx<'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn pattern_from_hir(&mut self, p: &hir::Pat<'_>) -> Box<Pat<'tcx>> {
-        let p = match self.tcx.hir().get(p.hir_id) {
-            Node::Pat(p) => p,
-            node => bug!("pattern became {:?}", node),
-        };
-        pat_from_hir(self.tcx, self.param_env, self.typeck_results(), p)
+    fn pattern_from_hir(&mut self, p: &'tcx hir::Pat<'tcx>) -> Box<Pat<'tcx>> {
+        pat_from_hir(self.tcx, self.typing_env, self.typeck_results, p)
     }
 
-    fn closure_env_param(&self, owner_def: LocalDefId, owner_id: HirId) -> Option<Param<'tcx>> {
-        match self.tcx.def_kind(owner_def) {
-            DefKind::Closure if self.tcx.is_coroutine(owner_def.to_def_id()) => {
-                let coroutine_ty = self.typeck_results.node_type(owner_id);
-                let coroutine_param = Param {
-                    ty: coroutine_ty,
-                    pat: None,
-                    ty_span: None,
-                    self_kind: None,
-                    hir_id: None,
-                };
-                Some(coroutine_param)
-            }
-            DefKind::Closure => {
-                let closure_ty = self.typeck_results.node_type(owner_id);
-
-                let ty::Closure(closure_def_id, closure_args) = *closure_ty.kind() else {
-                    bug!("closure expr does not have closure type: {:?}", closure_ty);
-                };
-
-                let bound_vars =
-                    self.tcx.mk_bound_variable_kinds(&[ty::BoundVariableKind::Region(ty::BrEnv)]);
-                let br = ty::BoundRegion {
-                    var: ty::BoundVar::from_usize(bound_vars.len() - 1),
-                    kind: ty::BrEnv,
-                };
-                let env_region = ty::Region::new_bound(self.tcx, ty::INNERMOST, br);
-                let closure_env_ty =
-                    self.tcx.closure_env_ty(closure_def_id, closure_args, env_region).unwrap();
-                let liberated_closure_env_ty = self.tcx.instantiate_bound_regions_with_erased(
-                    ty::Binder::bind_with_vars(closure_env_ty, bound_vars),
-                );
-                let env_param = Param {
-                    ty: liberated_closure_env_ty,
-                    pat: None,
-                    ty_span: None,
-                    self_kind: None,
-                    hir_id: None,
-                };
-
-                Some(env_param)
-            }
-            _ => None,
+    fn closure_env_param(&self, owner_def: LocalDefId, expr_id: HirId) -> Option<Param<'tcx>> {
+        if self.tcx.def_kind(owner_def) != DefKind::Closure {
+            return None;
         }
+
+        let closure_ty = self.typeck_results.node_type(expr_id);
+        Some(match *closure_ty.kind() {
+            ty::Coroutine(..) => {
+                Param { ty: closure_ty, pat: None, ty_span: None, self_kind: None, hir_id: None }
+            }
+            ty::Closure(_, args) => {
+                let closure_env_ty = self.tcx.closure_env_ty(
+                    closure_ty,
+                    args.as_closure().kind(),
+                    self.tcx.lifetimes.re_erased,
+                );
+                Param {
+                    ty: closure_env_ty,
+                    pat: None,
+                    ty_span: None,
+                    self_kind: None,
+                    hir_id: None,
+                }
+            }
+            ty::CoroutineClosure(_, args) => {
+                let closure_env_ty = self.tcx.closure_env_ty(
+                    closure_ty,
+                    args.as_coroutine_closure().kind(),
+                    self.tcx.lifetimes.re_erased,
+                );
+                Param {
+                    ty: closure_env_ty,
+                    pat: None,
+                    ty_span: None,
+                    self_kind: None,
+                    hir_id: None,
+                }
+            }
+            _ => bug!("unexpected closure type: {closure_ty}"),
+        })
     }
 
     fn explicit_params<'a>(
@@ -200,15 +197,12 @@ impl<'tcx> Cx<'tcx> {
             Param { pat: Some(pat), ty, ty_span, self_kind, hir_id: Some(param.hir_id) }
         })
     }
-}
 
-impl<'tcx> UserAnnotatedTyHelpers<'tcx> for Cx<'tcx> {
-    fn tcx(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
-    fn typeck_results(&self) -> &ty::TypeckResults<'tcx> {
-        self.typeck_results
+    fn user_args_applied_to_ty_of_hir_id(
+        &self,
+        hir_id: HirId,
+    ) -> Option<ty::CanonicalUserType<'tcx>> {
+        crate::thir::util::user_args_applied_to_ty_of_hir_id(self.typeck_results, hir_id)
     }
 }
 

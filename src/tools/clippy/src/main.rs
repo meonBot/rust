@@ -1,4 +1,6 @@
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
+// We need this feature as it changes `dylib` linking behavior and allows us to link to
+// `rustc_driver`.
+#![feature(rustc_private)]
 // warn on lints, that are included in `rust-lang/rust`s bootstrap
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
@@ -105,7 +107,7 @@ impl ClippyCmd {
     }
 
     fn into_std_cmd(self) -> Command {
-        let mut cmd = Command::new("cargo");
+        let mut cmd = Command::new(env::var("CARGO").unwrap_or("cargo".into()));
         let clippy_args: String = self
             .clippy_args
             .iter()
@@ -174,8 +176,13 @@ To allow or deny a lint from the command line you can use <cyan,bold>cargo clipp
 You can use tool lints to allow or deny lints from your code, e.g.:
 
     <yellow,bold>#[allow(clippy::needless_lifetimes)]</>
-"
-    )
+
+<green,bold>Manifest Options:</>
+    <cyan,bold>--manifest-path</> <cyan><<PATH>></>  Path to Cargo.toml
+    <cyan,bold>--frozen</>                Require Cargo.lock and cache are up to date
+    <cyan,bold>--locked</>                Require Cargo.lock is up to date
+    <cyan,bold>--offline</>               Run without accessing the network
+")
 }
 #[cfg(test)]
 mod tests {

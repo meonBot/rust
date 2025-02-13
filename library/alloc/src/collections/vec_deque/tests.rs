@@ -1,3 +1,6 @@
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#![allow(static_mut_refs)]
+
 use core::iter::TrustedLen;
 
 use super::*;
@@ -1085,7 +1088,7 @@ fn test_clone_from() {
 fn test_vec_deque_truncate_drop() {
     static mut DROPS: u32 = 0;
     #[derive(Clone)]
-    struct Elem(i32);
+    struct Elem(#[allow(dead_code)] i32);
     impl Drop for Elem {
         fn drop(&mut self) {
             unsafe {

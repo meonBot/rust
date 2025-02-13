@@ -1,6 +1,5 @@
-// check-fail
-// known-bug: #102682
-// edition: 2021
+//@ known-bug: #130935
+//@ edition: 2021
 
 use std::fmt::Debug;
 use std::hash::Hash;

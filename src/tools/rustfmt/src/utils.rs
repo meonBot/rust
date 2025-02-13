@@ -1,16 +1,16 @@
 use std::borrow::Cow;
 
 use rustc_ast::ast::{
-    self, Attribute, MetaItem, MetaItemKind, NestedMetaItem, NodeId, Path, Visibility,
+    self, Attribute, MetaItem, MetaItemInner, MetaItemKind, NodeId, Path, Visibility,
     VisibilityKind,
 };
 use rustc_ast::ptr;
 use rustc_ast_pretty::pprust;
-use rustc_span::{sym, symbol, BytePos, LocalExpnId, Span, Symbol, SyntaxContext};
+use rustc_span::{BytePos, LocalExpnId, Span, Symbol, SyntaxContext, sym, symbol};
 use unicode_width::UnicodeWidthStr;
 
-use crate::comment::{filter_normal_code, CharClasses, FullCodeCharKind, LineClasses};
-use crate::config::{Config, Version};
+use crate::comment::{CharClasses, FullCodeCharKind, LineClasses, filter_normal_code};
+use crate::config::{Config, StyleEdition};
 use crate::rewrite::RewriteContext;
 use crate::shape::{Indent, Shape};
 
@@ -75,10 +75,11 @@ pub(crate) fn format_visibility(
 }
 
 #[inline]
-pub(crate) fn format_async(is_async: &ast::Async) -> &'static str {
-    match is_async {
-        ast::Async::Yes { .. } => "async ",
-        ast::Async::No => "",
+pub(crate) fn format_coro(coroutine_kind: &ast::CoroutineKind) -> &'static str {
+    match coroutine_kind {
+        ast::CoroutineKind::Async { .. } => "async ",
+        ast::CoroutineKind::Gen { .. } => "gen ",
+        ast::CoroutineKind::AsyncGen { .. } => "async gen ",
     }
 }
 
@@ -107,10 +108,11 @@ pub(crate) fn format_defaultness(defaultness: ast::Defaultness) -> &'static str 
 }
 
 #[inline]
-pub(crate) fn format_unsafety(unsafety: ast::Unsafe) -> &'static str {
+pub(crate) fn format_safety(unsafety: ast::Safety) -> &'static str {
     match unsafety {
-        ast::Unsafe::Yes(..) => "unsafe ",
-        ast::Unsafe::No => "",
+        ast::Safety::Unsafe(..) => "unsafe ",
+        ast::Safety::Safe(..) => "safe ",
+        ast::Safety::Default => "",
     }
 }
 
@@ -255,10 +257,10 @@ fn is_skip(meta_item: &MetaItem) -> bool {
 }
 
 #[inline]
-fn is_skip_nested(meta_item: &NestedMetaItem) -> bool {
+fn is_skip_nested(meta_item: &MetaItemInner) -> bool {
     match meta_item {
-        NestedMetaItem::MetaItem(ref mi) => is_skip(mi),
-        NestedMetaItem::Lit(_) => false,
+        MetaItemInner::MetaItem(ref mi) => is_skip(mi),
+        MetaItemInner::Lit(_) => false,
     }
 }
 
@@ -294,7 +296,7 @@ pub(crate) fn semicolon_for_stmt(
 ) -> bool {
     match stmt.kind {
         ast::StmtKind::Semi(ref expr) => match expr.kind {
-            ast::ExprKind::While(..) | ast::ExprKind::Loop(..) | ast::ExprKind::ForLoop(..) => {
+            ast::ExprKind::While(..) | ast::ExprKind::Loop(..) | ast::ExprKind::ForLoop { .. } => {
                 false
             }
             ast::ExprKind::Break(..) | ast::ExprKind::Continue(..) | ast::ExprKind::Ret(..) => {
@@ -361,14 +363,14 @@ macro_rules! out_of_file_lines_range {
             && !$self
                 .config
                 .file_lines()
-                .intersects(&$self.parse_sess.lookup_line_range($span))
+                .intersects(&$self.psess.lookup_line_range($span))
     };
 }
 
-macro_rules! skip_out_of_file_lines_range {
+macro_rules! skip_out_of_file_lines_range_err {
     ($self:ident, $span:expr) => {
         if out_of_file_lines_range!($self, $span) {
-            return None;
+            return Err(RewriteError::SkipFormatting);
         }
     };
 }
@@ -475,7 +477,7 @@ pub(crate) fn is_block_expr(context: &RewriteContext<'_>, expr: &ast::Expr, repr
         | ast::ExprKind::ConstBlock(..)
         | ast::ExprKind::Gen(..)
         | ast::ExprKind::Loop(..)
-        | ast::ExprKind::ForLoop(..)
+        | ast::ExprKind::ForLoop { .. }
         | ast::ExprKind::TryBlock(..)
         | ast::ExprKind::Match(..) => repr.contains('\n'),
         ast::ExprKind::Paren(ref expr)
@@ -496,11 +498,13 @@ pub(crate) fn is_block_expr(context: &RewriteContext<'_>, expr: &ast::Expr, repr
         | ast::ExprKind::Break(..)
         | ast::ExprKind::Cast(..)
         | ast::ExprKind::Continue(..)
-        | ast::ExprKind::Err
+        | ast::ExprKind::Dummy
+        | ast::ExprKind::Err(_)
         | ast::ExprKind::Field(..)
         | ast::ExprKind::IncludedBytes(..)
         | ast::ExprKind::InlineAsm(..)
         | ast::ExprKind::OffsetOf(..)
+        | ast::ExprKind::UnsafeBinderCast(..)
         | ast::ExprKind::Let(..)
         | ast::ExprKind::Path(..)
         | ast::ExprKind::Range(..)
@@ -593,7 +597,7 @@ pub(crate) fn trim_left_preserve_layout(
 
             // just InString{Commented} in order to allow the start of a string to be indented
             let new_veto_trim_value = (kind == FullCodeCharKind::InString
-                || (config.version() == Version::Two
+                || (config.style_edition() >= StyleEdition::Edition2024
                     && kind == FullCodeCharKind::InStringCommented))
                 && !line.ends_with('\\');
             let line = if veto_trim || new_veto_trim_value {
@@ -609,7 +613,7 @@ pub(crate) fn trim_left_preserve_layout(
             // such lines should not be taken into account when computing the minimum.
             match kind {
                 FullCodeCharKind::InStringCommented | FullCodeCharKind::EndStringCommented
-                    if config.version() == Version::Two =>
+                    if config.style_edition() >= StyleEdition::Edition2024 =>
                 {
                     None
                 }
@@ -653,7 +657,7 @@ pub(crate) fn indent_next_line(kind: FullCodeCharKind, line: &str, config: &Conf
         // formatting the code block, therefore the string's indentation needs
         // to be adjusted for the code surrounding the code block.
         config.format_strings() && line.ends_with('\\')
-    } else if config.version() == Version::Two {
+    } else if config.style_edition() >= StyleEdition::Edition2024 {
         !kind.is_commented_string()
     } else {
         true

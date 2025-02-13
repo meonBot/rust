@@ -1,16 +1,19 @@
-use crate::{
-    lints::{SupertraitAsDerefTarget, SupertraitAsDerefTargetLabel},
-    LateContext, LateLintPass, LintContext,
-};
-
-use rustc_hir as hir;
+use rustc_hir::{self as hir, LangItem};
 use rustc_middle::ty;
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::sym;
 use rustc_trait_selection::traits::supertraits;
 
+use crate::lints::{SupertraitAsDerefTarget, SupertraitAsDerefTargetLabel};
+use crate::{LateContext, LateLintPass, LintContext};
+
 declare_lint! {
-    /// The `deref_into_dyn_supertrait` lint is output whenever there is a use of the
-    /// `Deref` implementation with a `dyn SuperTrait` type as `Output`.
+    /// The `deref_into_dyn_supertrait` lint is emitted whenever there is a `Deref` implementation
+    /// for `dyn SubTrait` with a `dyn SuperTrait` type as the `Output` type.
+    ///
+    /// These implementations are "shadowed" by trait upcasting (stabilized since
+    /// CURRENT_RUSTC_VERSION). The `deref` functions is no longer called implicitly, which might
+    /// change behavior compared to previous rustc versions.
     ///
     /// ### Example
     ///
@@ -40,10 +43,14 @@ declare_lint! {
     ///
     /// ### Explanation
     ///
-    /// The implicit dyn upcasting coercion take priority over those `Deref` impls.
+    /// The trait upcasting coercion added a new coercion rule, taking priority over certain other
+    /// coercion rules, which causes some behavior change compared to older `rustc` versions.
+    ///
+    /// `deref` can be still called explicitly, it just isn't called as part of a deref coercion
+    /// (since trait upcasting coercion takes priority).
     pub DEREF_INTO_DYN_SUPERTRAIT,
-    Warn,
-    "`Deref` implementation usage with a supertrait trait object for output are shadow by implicit coercion",
+    Allow,
+    "`Deref` implementation with a supertrait trait object for output is shadowed by trait upcasting",
 }
 
 declare_lint_pass!(DerefIntoDynSupertrait => [DEREF_INTO_DYN_SUPERTRAIT]);
@@ -56,7 +63,7 @@ impl<'tcx> LateLintPass<'tcx> for DerefIntoDynSupertrait {
             // the trait is a `Deref` implementation
             && let Some(trait_) = &impl_.of_trait
             && let Some(did) = trait_.trait_def_id()
-            && Some(did) == tcx.lang_items().deref_trait()
+            && tcx.is_lang_item(did, LangItem::Deref)
             // the self type is `dyn t_principal`
             && let self_ty = tcx.type_of(item.owner_id).instantiate_identity()
             && let ty::Dynamic(data, _, ty::Dyn) = self_ty.kind()
@@ -78,7 +85,7 @@ impl<'tcx> LateLintPass<'tcx> for DerefIntoDynSupertrait {
                 .find_map(|i| (i.ident.name == sym::Target).then_some(i.span))
                 .map(|label| SupertraitAsDerefTargetLabel { label });
             let span = tcx.def_span(item.owner_id.def_id);
-            cx.emit_spanned_lint(
+            cx.emit_span_lint(
                 DEREF_INTO_DYN_SUPERTRAIT,
                 span,
                 SupertraitAsDerefTarget {

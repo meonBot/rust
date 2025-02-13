@@ -1,7 +1,7 @@
 #![feature(coroutines, coroutine_trait, rustc_attrs)]
 #![feature(type_alias_impl_trait)]
 
-// check-pass
+//@ check-pass
 
 mod gen {
     use std::ops::Coroutine;
@@ -9,6 +9,7 @@ mod gen {
     pub type CoroOnce<Y, R> = impl Coroutine<Yield = Y, Return = R>;
 
     pub const fn const_coroutine<Y, R>(yielding: Y, returning: R) -> CoroOnce<Y, R> {
+        #[coroutine]
         move || {
             yield yielding;
 

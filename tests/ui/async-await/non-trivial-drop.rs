@@ -1,5 +1,5 @@
-// build-pass
-// edition:2018
+//@ build-pass
+//@ edition:2018
 
 #![feature(coroutines)]
 
@@ -8,7 +8,7 @@ fn main() {
 }
 
 fn foo() {
-    || {
+    #[coroutine] || {
         yield drop(Config {
             nickname: NonCopy,
             b: NonCopy2,

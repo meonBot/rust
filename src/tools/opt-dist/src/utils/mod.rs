@@ -1,10 +1,11 @@
-use sysinfo::{DiskExt, RefreshKind, System, SystemExt};
+use std::time::Duration;
+
+use humansize::BINARY;
+use sysinfo::Disks;
 
 use crate::environment::Environment;
 use crate::timer::Timer;
 use crate::utils::io::delete_directory;
-use humansize::BINARY;
-use std::time::Duration;
 
 pub mod artifact_size;
 pub mod io;
@@ -15,9 +16,9 @@ pub fn format_env_variables() -> String {
 }
 
 pub fn print_free_disk_space() -> anyhow::Result<()> {
-    let sys = System::new_with_specifics(RefreshKind::default().with_disks_list().with_disks());
-    let available_space: u64 = sys.disks().iter().map(|d| d.available_space()).sum();
-    let total_space: u64 = sys.disks().iter().map(|d| d.total_space()).sum();
+    let disks = Disks::new_with_refreshed_list();
+    let available_space: u64 = disks.list().iter().map(|d| d.available_space()).sum();
+    let total_space: u64 = disks.list().iter().map(|d| d.total_space()).sum();
     let used_space = total_space - available_space;
 
     log::info!(

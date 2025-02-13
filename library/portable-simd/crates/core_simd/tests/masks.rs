@@ -100,6 +100,18 @@ macro_rules! test_mask_api {
             }
 
             #[test]
+            fn roundtrip_bitmask_conversion_odd() {
+                let values = [
+                    true, false, true, false, true, true, false, false, false, true, true,
+                ];
+                let mask = Mask::<$type, 11>::from_array(values);
+                let bitmask = mask.to_bitmask();
+                assert_eq!(bitmask, 0b11000110101);
+                assert_eq!(Mask::<$type, 11>::from_bitmask(bitmask), mask);
+            }
+
+
+            #[test]
             fn cast() {
                 fn cast_impl<T: core_simd::simd::MaskElement>()
                 where
@@ -120,19 +132,6 @@ macro_rules! test_mask_api {
                 cast_impl::<i32>();
                 cast_impl::<i64>();
                 cast_impl::<isize>();
-            }
-
-            #[test]
-            fn roundtrip_bitmask_vector_conversion() {
-                use core_simd::simd::ToBytes;
-                let values = [
-                    true, false, false, true, false, false, true, false,
-                    true, true, false, false, false, false, false, true,
-                ];
-                let mask = Mask::<$type, 16>::from_array(values);
-                let bitmask = mask.to_bitmask_vector();
-                assert_eq!(bitmask.resize::<2>(0).to_ne_bytes()[..2], [0b01001001, 0b10000011]);
-                assert_eq!(Mask::<$type, 16>::from_bitmask_vector(bitmask), mask);
             }
         }
     }

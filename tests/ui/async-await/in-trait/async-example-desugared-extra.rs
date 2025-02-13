@@ -1,7 +1,5 @@
-// check-pass
-// edition: 2021
-
-#![feature(lint_reasons)]
+//@ check-pass
+//@ edition: 2021
 
 use std::future::Future;
 use std::pin::Pin;

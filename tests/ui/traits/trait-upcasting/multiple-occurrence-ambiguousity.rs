@@ -1,4 +1,4 @@
-// check-fail
+//@ check-fail
 
 trait Bar<T> {
     fn bar(&self, _: T) {}

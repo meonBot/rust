@@ -1,37 +1,36 @@
-pub mod query;
+pub(super) mod query;
 
 mod counters;
 mod graph;
+mod mappings;
 mod spans;
-
 #[cfg(test)]
 mod tests;
+mod unexpand;
 
-use self::counters::{BcbCounter, CoverageCounters};
-use self::graph::CoverageGraph;
-use self::spans::CoverageSpans;
-
-use crate::MirPass;
-
-use rustc_data_structures::sync::Lrc;
-use rustc_middle::hir;
-use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::mir::coverage::*;
-use rustc_middle::mir::{
-    self, BasicBlock, BasicBlockData, Coverage, SourceInfo, Statement, StatementKind, Terminator,
-    TerminatorKind,
+use rustc_hir as hir;
+use rustc_hir::intravisit::{Visitor, walk_expr};
+use rustc_middle::hir::map::Map;
+use rustc_middle::hir::nested_filter;
+use rustc_middle::mir::coverage::{
+    CoverageKind, DecisionInfo, FunctionCoverageInfo, Mapping, MappingKind,
 };
+use rustc_middle::mir::{self, BasicBlock, Statement, StatementKind, TerminatorKind};
 use rustc_middle::ty::TyCtxt;
-use rustc_span::def_id::DefId;
-use rustc_span::source_map::SourceMap;
-use rustc_span::{ExpnKind, SourceFile, Span, Symbol};
+use rustc_span::Span;
+use rustc_span::def_id::LocalDefId;
+use tracing::{debug, debug_span, trace};
+
+use crate::coverage::counters::BcbCountersData;
+use crate::coverage::graph::CoverageGraph;
+use crate::coverage::mappings::ExtractedMappings;
 
 /// Inserts `StatementKind::Coverage` statements that either instrument the binary with injected
 /// counters, via intrinsic `llvm.instrprof.increment`, and/or inject metadata used during codegen
 /// to construct the coverage map.
-pub struct InstrumentCoverage;
+pub(super) struct InstrumentCoverage;
 
-impl<'tcx> MirPass<'tcx> for InstrumentCoverage {
+impl<'tcx> crate::MirPass<'tcx> for InstrumentCoverage {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
         sess.instrument_coverage()
     }
@@ -39,31 +38,19 @@ impl<'tcx> MirPass<'tcx> for InstrumentCoverage {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, mir_body: &mut mir::Body<'tcx>) {
         let mir_source = mir_body.source;
 
-        // If the InstrumentCoverage pass is called on promoted MIRs, skip them.
-        // See: https://github.com/rust-lang/rust/pull/73011#discussion_r438317601
-        if mir_source.promoted.is_some() {
-            trace!(
-                "InstrumentCoverage skipped for {:?} (already promoted for Miri evaluation)",
-                mir_source.def_id()
-            );
+        // This pass runs after MIR promotion, but before promoted MIR starts to
+        // be transformed, so it should never see promoted MIR.
+        assert!(mir_source.promoted.is_none());
+
+        let def_id = mir_source.def_id().expect_local();
+
+        if !tcx.is_eligible_for_coverage(def_id) {
+            trace!("InstrumentCoverage skipped for {def_id:?} (not eligible)");
             return;
         }
 
-        let is_fn_like =
-            tcx.hir().get_by_def_id(mir_source.def_id().expect_local()).fn_kind().is_some();
-
-        // Only instrument functions, methods, and closures (not constants since they are evaluated
-        // at compile time by Miri).
-        // FIXME(#73156): Handle source code coverage in const eval, but note, if and when const
-        // expressions get coverage spans, we will probably have to "carve out" space for const
-        // expressions from coverage spans in enclosing MIR's, like we do for closures. (That might
-        // be tricky if const expressions have no corresponding statements in the enclosing MIR.
-        // Closures are carved out by their initial `Assign` statement.)
-        if !is_fn_like {
-            trace!("InstrumentCoverage skipped for {:?} (not an fn-like)", mir_source.def_id());
-            return;
-        }
-
+        // An otherwise-eligible function is still skipped if its start block
+        // is known to be unreachable.
         match mir_body.basic_blocks[mir::START_BLOCK].terminator().kind {
             TerminatorKind::Unreachable => {
                 trace!("InstrumentCoverage skipped for unreachable `START_BLOCK`");
@@ -72,307 +59,344 @@ impl<'tcx> MirPass<'tcx> for InstrumentCoverage {
             _ => {}
         }
 
-        let codegen_fn_attrs = tcx.codegen_fn_attrs(mir_source.def_id());
-        if codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::NO_COVERAGE) {
-            return;
-        }
+        instrument_function_for_coverage(tcx, mir_body);
+    }
 
-        trace!("InstrumentCoverage starting for {:?}", mir_source.def_id());
-        Instrumentor::new(tcx, mir_body).inject_counters();
-        trace!("InstrumentCoverage done for {:?}", mir_source.def_id());
+    fn is_required(&self) -> bool {
+        false
     }
 }
 
-struct Instrumentor<'a, 'tcx> {
-    tcx: TyCtxt<'tcx>,
-    mir_body: &'a mut mir::Body<'tcx>,
-    source_file: Lrc<SourceFile>,
-    fn_sig_span: Span,
-    body_span: Span,
-    function_source_hash: u64,
-    basic_coverage_blocks: CoverageGraph,
-    coverage_counters: CoverageCounters,
+fn instrument_function_for_coverage<'tcx>(tcx: TyCtxt<'tcx>, mir_body: &mut mir::Body<'tcx>) {
+    let def_id = mir_body.source.def_id();
+    let _span = debug_span!("instrument_function_for_coverage", ?def_id).entered();
+
+    let hir_info = extract_hir_info(tcx, def_id.expect_local());
+
+    // Build the coverage graph, which is a simplified view of the MIR control-flow
+    // graph that ignores some details not relevant to coverage instrumentation.
+    let graph = CoverageGraph::from_mir(mir_body);
+
+    ////////////////////////////////////////////////////
+    // Extract coverage spans and other mapping info from MIR.
+    let extracted_mappings =
+        mappings::extract_all_mapping_info_from_mir(tcx, mir_body, &hir_info, &graph);
+
+    let mappings = create_mappings(&extracted_mappings);
+    if mappings.is_empty() {
+        // No spans could be converted into valid mappings, so skip this function.
+        debug!("no spans could be converted into valid mappings; skipping");
+        return;
+    }
+
+    // Use the coverage graph to prepare intermediate data that will eventually
+    // be used to assign physical counters and counter expressions to points in
+    // the control-flow graph
+    let BcbCountersData { node_flow_data, priority_list } =
+        counters::prepare_bcb_counters_data(&graph);
+
+    // Inject coverage statements into MIR.
+    inject_coverage_statements(mir_body, &graph);
+    inject_mcdc_statements(mir_body, &graph, &extracted_mappings);
+
+    let mcdc_num_condition_bitmaps = extracted_mappings
+        .mcdc_mappings
+        .iter()
+        .map(|&(mappings::MCDCDecision { decision_depth, .. }, _)| decision_depth)
+        .max()
+        .map_or(0, |max| usize::from(max) + 1);
+
+    mir_body.function_coverage_info = Some(Box::new(FunctionCoverageInfo {
+        function_source_hash: hir_info.function_source_hash,
+        body_span: hir_info.body_span,
+
+        node_flow_data,
+        priority_list,
+
+        mappings,
+
+        mcdc_bitmap_bits: extracted_mappings.mcdc_bitmap_bits,
+        mcdc_num_condition_bitmaps,
+    }));
 }
 
-impl<'a, 'tcx> Instrumentor<'a, 'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, mir_body: &'a mut mir::Body<'tcx>) -> Self {
-        let source_map = tcx.sess.source_map();
-        let def_id = mir_body.source.def_id();
-        let (some_fn_sig, hir_body) = fn_sig_and_body(tcx, def_id);
+/// For each coverage span extracted from MIR, create a corresponding mapping.
+///
+/// FIXME(Zalathar): This used to be where BCBs in the extracted mappings were
+/// resolved to a `CovTerm`. But that is now handled elsewhere, so this
+/// function can potentially be simplified even further.
+fn create_mappings(extracted_mappings: &ExtractedMappings) -> Vec<Mapping> {
+    // Fully destructure the mappings struct to make sure we don't miss any kinds.
+    let ExtractedMappings {
+        code_mappings,
+        branch_pairs,
+        mcdc_bitmap_bits: _,
+        mcdc_degraded_branches,
+        mcdc_mappings,
+    } = extracted_mappings;
+    let mut mappings = Vec::new();
 
-        let body_span = get_body_span(tcx, hir_body, mir_body);
+    mappings.extend(code_mappings.iter().map(
+        // Ordinary code mappings are the simplest kind.
+        |&mappings::CodeMapping { span, bcb }| {
+            let kind = MappingKind::Code { bcb };
+            Mapping { kind, span }
+        },
+    ));
 
-        let source_file = source_map.lookup_source_file(body_span.lo());
-        let fn_sig_span = match some_fn_sig.filter(|fn_sig| {
-            fn_sig.span.eq_ctxt(body_span)
-                && Lrc::ptr_eq(&source_file, &source_map.lookup_source_file(fn_sig.span.lo()))
-        }) {
-            Some(fn_sig) => fn_sig.span.with_hi(body_span.lo()),
-            None => body_span.shrink_to_lo(),
-        };
+    mappings.extend(branch_pairs.iter().map(
+        |&mappings::BranchPair { span, true_bcb, false_bcb }| {
+            let kind = MappingKind::Branch { true_bcb, false_bcb };
+            Mapping { kind, span }
+        },
+    ));
 
-        debug!(
-            "instrumenting {}: {:?}, fn sig span: {:?}, body span: {:?}",
-            if tcx.is_closure(def_id) { "closure" } else { "function" },
-            def_id,
-            fn_sig_span,
-            body_span
-        );
+    // MCDC branch mappings are appended with their decisions in case decisions were ignored.
+    mappings.extend(mcdc_degraded_branches.iter().map(
+        |&mappings::MCDCBranch {
+             span,
+             true_bcb,
+             false_bcb,
+             condition_info: _,
+             true_index: _,
+             false_index: _,
+         }| { Mapping { kind: MappingKind::Branch { true_bcb, false_bcb }, span } },
+    ));
 
-        let function_source_hash = hash_mir_source(tcx, hir_body);
-        let basic_coverage_blocks = CoverageGraph::from_mir(mir_body);
-        let coverage_counters = CoverageCounters::new(&basic_coverage_blocks);
+    for (decision, branches) in mcdc_mappings {
+        // FIXME(#134497): Previously it was possible for some of these branch
+        // conversions to fail, in which case the remaining branches in the
+        // decision would be degraded to plain `MappingKind::Branch`.
+        // The changes in #134497 made that failure impossible, because the
+        // fallible step was deferred to codegen. But the corresponding code
+        // in codegen wasn't updated to detect the need for a degrade step.
+        let conditions = branches
+            .into_iter()
+            .map(
+                |&mappings::MCDCBranch {
+                     span,
+                     true_bcb,
+                     false_bcb,
+                     condition_info,
+                     true_index: _,
+                     false_index: _,
+                 }| {
+                    Mapping {
+                        kind: MappingKind::MCDCBranch {
+                            true_bcb,
+                            false_bcb,
+                            mcdc_params: condition_info,
+                        },
+                        span,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
 
-        Self {
-            tcx,
-            mir_body,
-            source_file,
-            fn_sig_span,
-            body_span,
-            function_source_hash,
-            basic_coverage_blocks,
-            coverage_counters,
+        // LLVM requires end index for counter mapping regions.
+        let kind = MappingKind::MCDCDecision(DecisionInfo {
+            bitmap_idx: (decision.bitmap_idx + decision.num_test_vectors) as u32,
+            num_conditions: u16::try_from(conditions.len()).unwrap(),
+        });
+        let span = decision.span;
+        mappings.extend(std::iter::once(Mapping { kind, span }).chain(conditions.into_iter()));
+    }
+
+    mappings
+}
+
+/// Inject any necessary coverage statements into MIR, so that they influence codegen.
+fn inject_coverage_statements<'tcx>(mir_body: &mut mir::Body<'tcx>, graph: &CoverageGraph) {
+    for (bcb, data) in graph.iter_enumerated() {
+        let target_bb = data.leader_bb();
+        inject_statement(mir_body, CoverageKind::VirtualCounter { bcb }, target_bb);
+    }
+}
+
+/// For each conditions inject statements to update condition bitmap after it has been evaluated.
+/// For each decision inject statements to update test vector bitmap after it has been evaluated.
+fn inject_mcdc_statements<'tcx>(
+    mir_body: &mut mir::Body<'tcx>,
+    graph: &CoverageGraph,
+    extracted_mappings: &ExtractedMappings,
+) {
+    for (decision, conditions) in &extracted_mappings.mcdc_mappings {
+        // Inject test vector update first because `inject_statement` always insert new statement at head.
+        for &end in &decision.end_bcbs {
+            let end_bb = graph[end].leader_bb();
+            inject_statement(
+                mir_body,
+                CoverageKind::TestVectorBitmapUpdate {
+                    bitmap_idx: decision.bitmap_idx as u32,
+                    decision_depth: decision.decision_depth,
+                },
+                end_bb,
+            );
         }
-    }
 
-    fn inject_counters(&'a mut self) {
-        let fn_sig_span = self.fn_sig_span;
-        let body_span = self.body_span;
-
-        ////////////////////////////////////////////////////
-        // Compute coverage spans from the `CoverageGraph`.
-        let coverage_spans = CoverageSpans::generate_coverage_spans(
-            self.mir_body,
-            fn_sig_span,
-            body_span,
-            &self.basic_coverage_blocks,
-        );
-
-        ////////////////////////////////////////////////////
-        // Create an optimized mix of `Counter`s and `Expression`s for the `CoverageGraph`. Ensure
-        // every coverage span has a `Counter` or `Expression` assigned to its `BasicCoverageBlock`
-        // and all `Expression` dependencies (operands) are also generated, for any other
-        // `BasicCoverageBlock`s not already associated with a coverage span.
-        let bcb_has_coverage_spans = |bcb| coverage_spans.bcb_has_coverage_spans(bcb);
-        self.coverage_counters
-            .make_bcb_counters(&self.basic_coverage_blocks, bcb_has_coverage_spans);
-
-        let mappings = self.create_mappings_and_inject_coverage_statements(&coverage_spans);
-
-        self.mir_body.function_coverage_info = Some(Box::new(FunctionCoverageInfo {
-            function_source_hash: self.function_source_hash,
-            num_counters: self.coverage_counters.num_counters(),
-            expressions: self.coverage_counters.take_expressions(),
-            mappings,
-        }));
-    }
-
-    /// For each [`BcbCounter`] associated with a BCB node or BCB edge, create
-    /// any corresponding mappings (for BCB nodes only), and inject any necessary
-    /// coverage statements into MIR.
-    fn create_mappings_and_inject_coverage_statements(
-        &mut self,
-        coverage_spans: &CoverageSpans,
-    ) -> Vec<Mapping> {
-        let source_map = self.tcx.sess.source_map();
-        let body_span = self.body_span;
-
-        use rustc_session::RemapFileNameExt;
-        let file_name =
-            Symbol::intern(&self.source_file.name.for_codegen(self.tcx.sess).to_string_lossy());
-
-        let mut mappings = Vec::new();
-
-        // Process the counters and spans associated with BCB nodes.
-        for (bcb, counter_kind) in self.coverage_counters.bcb_node_counters() {
-            let spans = coverage_spans.spans_for_bcb(bcb);
-            let has_mappings = !spans.is_empty();
-
-            // If this BCB has any coverage spans, add corresponding mappings to
-            // the mappings table.
-            if has_mappings {
-                let term = counter_kind.as_term();
-                mappings.extend(spans.iter().map(|&span| {
-                    let code_region = make_code_region(source_map, file_name, span, body_span);
-                    Mapping { code_region, term }
-                }));
-            }
-
-            let do_inject = match counter_kind {
-                // Counter-increment statements always need to be injected.
-                BcbCounter::Counter { .. } => true,
-                // The only purpose of expression-used statements is to detect
-                // when a mapping is unreachable, so we only inject them for
-                // expressions with one or more mappings.
-                BcbCounter::Expression { .. } => has_mappings,
-            };
-            if do_inject {
+        for &mappings::MCDCBranch {
+            span: _,
+            true_bcb,
+            false_bcb,
+            condition_info: _,
+            true_index,
+            false_index,
+        } in conditions
+        {
+            for (index, bcb) in [(false_index, false_bcb), (true_index, true_bcb)] {
+                let bb = graph[bcb].leader_bb();
                 inject_statement(
-                    self.mir_body,
-                    self.make_mir_coverage_kind(counter_kind),
-                    self.basic_coverage_blocks[bcb].leader_bb(),
+                    mir_body,
+                    CoverageKind::CondBitmapUpdate {
+                        index: index as u32,
+                        decision_depth: decision.decision_depth,
+                    },
+                    bb,
                 );
             }
         }
-
-        // Process the counters associated with BCB edges.
-        for (from_bcb, to_bcb, counter_kind) in self.coverage_counters.bcb_edge_counters() {
-            let do_inject = match counter_kind {
-                // Counter-increment statements always need to be injected.
-                BcbCounter::Counter { .. } => true,
-                // BCB-edge expressions never have mappings, so they never need
-                // a corresponding statement.
-                BcbCounter::Expression { .. } => false,
-            };
-            if !do_inject {
-                continue;
-            }
-
-            // We need to inject a coverage statement into a new BB between the
-            // last BB of `from_bcb` and the first BB of `to_bcb`.
-            let from_bb = self.basic_coverage_blocks[from_bcb].last_bb();
-            let to_bb = self.basic_coverage_blocks[to_bcb].leader_bb();
-
-            let new_bb = inject_edge_counter_basic_block(self.mir_body, from_bb, to_bb);
-            debug!(
-                "Edge {from_bcb:?} (last {from_bb:?}) -> {to_bcb:?} (leader {to_bb:?}) \
-                requires a new MIR BasicBlock {new_bb:?} for edge counter {counter_kind:?}",
-            );
-
-            // Inject a counter into the newly-created BB.
-            inject_statement(self.mir_body, self.make_mir_coverage_kind(counter_kind), new_bb);
-        }
-
-        mappings
     }
-
-    fn make_mir_coverage_kind(&self, counter_kind: &BcbCounter) -> CoverageKind {
-        match *counter_kind {
-            BcbCounter::Counter { id } => CoverageKind::CounterIncrement { id },
-            BcbCounter::Expression { id } => CoverageKind::ExpressionUsed { id },
-        }
-    }
-}
-
-fn inject_edge_counter_basic_block(
-    mir_body: &mut mir::Body<'_>,
-    from_bb: BasicBlock,
-    to_bb: BasicBlock,
-) -> BasicBlock {
-    let span = mir_body[from_bb].terminator().source_info.span.shrink_to_hi();
-    let new_bb = mir_body.basic_blocks_mut().push(BasicBlockData {
-        statements: vec![], // counter will be injected here
-        terminator: Some(Terminator {
-            source_info: SourceInfo::outermost(span),
-            kind: TerminatorKind::Goto { target: to_bb },
-        }),
-        is_cleanup: false,
-    });
-    let edge_ref = mir_body[from_bb]
-        .terminator_mut()
-        .successors_mut()
-        .find(|successor| **successor == to_bb)
-        .expect("from_bb should have a successor for to_bb");
-    *edge_ref = new_bb;
-    new_bb
 }
 
 fn inject_statement(mir_body: &mut mir::Body<'_>, counter_kind: CoverageKind, bb: BasicBlock) {
     debug!("  injecting statement {counter_kind:?} for {bb:?}");
     let data = &mut mir_body[bb];
     let source_info = data.terminator().source_info;
-    let statement = Statement {
-        source_info,
-        kind: StatementKind::Coverage(Box::new(Coverage { kind: counter_kind })),
-    };
+    let statement = Statement { source_info, kind: StatementKind::Coverage(counter_kind) };
     data.statements.insert(0, statement);
 }
 
-/// Convert the Span into its file name, start line and column, and end line and column
-fn make_code_region(
-    source_map: &SourceMap,
-    file_name: Symbol,
-    span: Span,
+/// Function information extracted from HIR by the coverage instrumentor.
+#[derive(Debug)]
+struct ExtractedHirInfo {
+    function_source_hash: u64,
+    is_async_fn: bool,
+    /// The span of the function's signature, extended to the start of `body_span`.
+    /// Must have the same context and filename as the body span.
+    fn_sig_span_extended: Option<Span>,
     body_span: Span,
-) -> CodeRegion {
-    debug!(
-        "Called make_code_region(file_name={}, span={}, body_span={})",
-        file_name,
-        source_map.span_to_diagnostic_string(span),
-        source_map.span_to_diagnostic_string(body_span)
-    );
-
-    let (file, mut start_line, mut start_col, mut end_line, mut end_col) =
-        source_map.span_to_location_info(span);
-    if span.hi() == span.lo() {
-        // Extend an empty span by one character so the region will be counted.
-        if span.hi() == body_span.hi() {
-            start_col = start_col.saturating_sub(1);
-        } else {
-            end_col = start_col + 1;
-        }
-    };
-    if let Some(file) = file {
-        start_line = source_map.doctest_offset_line(&file.name, start_line);
-        end_line = source_map.doctest_offset_line(&file.name, end_line);
-    }
-    CodeRegion {
-        file_name,
-        start_line: start_line as u32,
-        start_col: start_col as u32,
-        end_line: end_line as u32,
-        end_col: end_col as u32,
-    }
+    /// "Holes" are regions within the body span that should not be included in
+    /// coverage spans for this function (e.g. closures and nested items).
+    hole_spans: Vec<Span>,
 }
 
-fn fn_sig_and_body(
-    tcx: TyCtxt<'_>,
-    def_id: DefId,
-) -> (Option<&rustc_hir::FnSig<'_>>, &rustc_hir::Body<'_>) {
+fn extract_hir_info<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> ExtractedHirInfo {
     // FIXME(#79625): Consider improving MIR to provide the information needed, to avoid going back
     // to HIR for it.
-    let hir_node = tcx.hir().get_if_local(def_id).expect("expected DefId is local");
-    let (_, fn_body_id) =
-        hir::map::associated_body(hir_node).expect("HIR node is a function with body");
-    (hir_node.fn_sig(), tcx.hir().body(fn_body_id))
+
+    // HACK: For synthetic MIR bodies (async closures), use the def id of the HIR body.
+    if tcx.is_synthetic_mir(def_id) {
+        return extract_hir_info(tcx, tcx.local_parent(def_id));
+    }
+
+    let hir_node = tcx.hir_node_by_def_id(def_id);
+    let fn_body_id = hir_node.body_id().expect("HIR node is a function with body");
+    let hir_body = tcx.hir().body(fn_body_id);
+
+    let maybe_fn_sig = hir_node.fn_sig();
+    let is_async_fn = maybe_fn_sig.is_some_and(|fn_sig| fn_sig.header.is_async());
+
+    let mut body_span = hir_body.value.span;
+
+    use hir::{Closure, Expr, ExprKind, Node};
+    // Unexpand a closure's body span back to the context of its declaration.
+    // This helps with closure bodies that consist of just a single bang-macro,
+    // and also with closure bodies produced by async desugaring.
+    if let Node::Expr(&Expr { kind: ExprKind::Closure(&Closure { fn_decl_span, .. }), .. }) =
+        hir_node
+    {
+        body_span = body_span.find_ancestor_in_same_ctxt(fn_decl_span).unwrap_or(body_span);
+    }
+
+    // The actual signature span is only used if it has the same context and
+    // filename as the body, and precedes the body.
+    let fn_sig_span_extended = maybe_fn_sig
+        .map(|fn_sig| fn_sig.span)
+        .filter(|&fn_sig_span| {
+            let source_map = tcx.sess.source_map();
+            let file_idx = |span: Span| source_map.lookup_source_file_idx(span.lo());
+
+            fn_sig_span.eq_ctxt(body_span)
+                && fn_sig_span.hi() <= body_span.lo()
+                && file_idx(fn_sig_span) == file_idx(body_span)
+        })
+        // If so, extend it to the start of the body span.
+        .map(|fn_sig_span| fn_sig_span.with_hi(body_span.lo()));
+
+    let function_source_hash = hash_mir_source(tcx, hir_body);
+
+    let hole_spans = extract_hole_spans_from_hir(tcx, body_span, hir_body);
+
+    ExtractedHirInfo {
+        function_source_hash,
+        is_async_fn,
+        fn_sig_span_extended,
+        body_span,
+        hole_spans,
+    }
 }
 
-fn get_body_span<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    hir_body: &rustc_hir::Body<'tcx>,
-    mir_body: &mut mir::Body<'tcx>,
-) -> Span {
-    let mut body_span = hir_body.value.span;
-    let def_id = mir_body.source.def_id();
+fn hash_mir_source<'tcx>(tcx: TyCtxt<'tcx>, hir_body: &'tcx hir::Body<'tcx>) -> u64 {
+    // FIXME(cjgillot) Stop hashing HIR manually here.
+    let owner = hir_body.id().hir_id.owner;
+    tcx.hir_owner_nodes(owner).opt_hash_including_bodies.unwrap().to_smaller_hash().as_u64()
+}
 
-    if tcx.is_closure(def_id) {
-        // If the MIR function is a closure, and if the closure body span
-        // starts from a macro, but it's content is not in that macro, try
-        // to find a non-macro callsite, and instrument the spans there
-        // instead.
-        loop {
-            let expn_data = body_span.ctxt().outer_expn_data();
-            if expn_data.is_root() {
-                break;
-            }
-            if let ExpnKind::Macro { .. } = expn_data.kind {
-                body_span = expn_data.call_site;
-            } else {
-                break;
+fn extract_hole_spans_from_hir<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body_span: Span, // Usually `hir_body.value.span`, but not always
+    hir_body: &hir::Body<'tcx>,
+) -> Vec<Span> {
+    struct HolesVisitor<'hir, F> {
+        hir: Map<'hir>,
+        visit_hole_span: F,
+    }
+
+    impl<'hir, F: FnMut(Span)> Visitor<'hir> for HolesVisitor<'hir, F> {
+        /// - We need `NestedFilter::INTRA = true` so that `visit_item` will be called.
+        /// - Bodies of nested items don't actually get visited, because of the
+        ///   `visit_item` override.
+        /// - For nested bodies that are not part of an item, we do want to visit any
+        ///   items contained within them.
+        type NestedFilter = nested_filter::All;
+
+        fn nested_visit_map(&mut self) -> Self::Map {
+            self.hir
+        }
+
+        fn visit_item(&mut self, item: &'hir hir::Item<'hir>) {
+            (self.visit_hole_span)(item.span);
+            // Having visited this item, we don't care about its children,
+            // so don't call `walk_item`.
+        }
+
+        // We override `visit_expr` instead of the more specific expression
+        // visitors, so that we have direct access to the expression span.
+        fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) {
+            match expr.kind {
+                hir::ExprKind::Closure(_) | hir::ExprKind::ConstBlock(_) => {
+                    (self.visit_hole_span)(expr.span);
+                    // Having visited this expression, we don't care about its
+                    // children, so don't call `walk_expr`.
+                }
+
+                // For other expressions, recursively visit as normal.
+                _ => walk_expr(self, expr),
             }
         }
     }
 
-    body_span
-}
+    let mut hole_spans = vec![];
+    let mut visitor = HolesVisitor {
+        hir: tcx.hir(),
+        visit_hole_span: |hole_span| {
+            // Discard any holes that aren't directly visible within the body span.
+            if body_span.contains(hole_span) && body_span.eq_ctxt(hole_span) {
+                hole_spans.push(hole_span);
+            }
+        },
+    };
 
-fn hash_mir_source<'tcx>(tcx: TyCtxt<'tcx>, hir_body: &'tcx rustc_hir::Body<'tcx>) -> u64 {
-    // FIXME(cjgillot) Stop hashing HIR manually here.
-    let owner = hir_body.id().hir_id.owner;
-    tcx.hir_owner_nodes(owner)
-        .unwrap()
-        .opt_hash_including_bodies
-        .unwrap()
-        .to_smaller_hash()
-        .as_u64()
+    visitor.visit_body(hir_body);
+    hole_spans
 }

@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 
 trait Foo<T: Default + ToString>: Bar<i32> + Bar<T> {}
 trait Bar<T: Default + ToString> {

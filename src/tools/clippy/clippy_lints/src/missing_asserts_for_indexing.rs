@@ -1,26 +1,27 @@
 use std::mem;
 use std::ops::ControlFlow;
 
-use clippy_utils::comparisons::{normalize_comparison, Rel};
+use clippy_utils::comparisons::{Rel, normalize_comparison};
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet;
-use clippy_utils::visitors::for_each_expr;
+use clippy_utils::visitors::for_each_expr_without_closures;
 use clippy_utils::{eq_expr_value, hash_expr, higher};
 use rustc_ast::{LitKind, RangeLimits};
-use rustc_data_structures::unhash::UnhashMap;
-use rustc_errors::{Applicability, Diagnostic};
+use rustc_data_structures::packed::Pu128;
+use rustc_data_structures::unhash::UnindexMap;
+use rustc_errors::{Applicability, Diag};
 use rustc_hir::{BinOp, Block, Body, Expr, ExprKind, UnOp};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
 use rustc_span::source_map::Spanned;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for repeated slice indexing without asserting beforehand that the length
     /// is greater than the largest index used to index into the slice.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// In the general case where the compiler does not have a lot of information
     /// about the length of a slice, indexing it repeatedly will generate a bounds check
     /// for every single index.
@@ -52,7 +53,7 @@ declare_clippy_lint! {
     /// Use instead:
     /// ```no_run
     /// fn sum(v: &[u8]) -> u8 {
-    ///     assert!(v.len() > 4);
+    ///     assert!(v.len() > 3);
     ///     // no bounds checks
     ///     v[0] + v[1] + v[2] + v[3]
     /// }
@@ -64,9 +65,9 @@ declare_clippy_lint! {
 }
 declare_lint_pass!(MissingAssertsForIndexing => [MISSING_ASSERTS_FOR_INDEXING]);
 
-fn report_lint<F>(cx: &LateContext<'_>, full_span: Span, msg: &str, indexes: &[Span], f: F)
+fn report_lint<F>(cx: &LateContext<'_>, full_span: Span, msg: &'static str, indexes: &[Span], f: F)
 where
-    F: FnOnce(&mut Diagnostic),
+    F: FnOnce(&mut Diag<'_, ()>),
 {
     span_lint_and_then(cx, MISSING_ASSERTS_FOR_INDEXING, full_span, msg, |diag| {
         f(diag);
@@ -87,11 +88,14 @@ enum LengthComparison {
     LengthLessThanOrEqualInt,
     /// `5 <= v.len()`
     IntLessThanOrEqualLength,
+    /// `5 == v.len()`
+    /// `v.len() == 5`
+    LengthEqualInt,
 }
 
 /// Extracts parts out of a length comparison expression.
 ///
-/// E.g. for `v.len() > 5` this returns `Some((LengthComparison::IntLessThanLength, 5, `v.len()`))`
+/// E.g. for `v.len() > 5` this returns `Some((LengthComparison::IntLessThanLength, 5, v.len()))`
 fn len_comparison<'hir>(
     bin_op: BinOp,
     left: &'hir Expr<'hir>,
@@ -99,8 +103,8 @@ fn len_comparison<'hir>(
 ) -> Option<(LengthComparison, usize, &'hir Expr<'hir>)> {
     macro_rules! int_lit_pat {
         ($id:ident) => {
-            ExprKind::Lit(Spanned {
-                node: LitKind::Int($id, _),
+            ExprKind::Lit(&Spanned {
+                node: LitKind::Int(Pu128($id), _),
                 ..
             })
         };
@@ -109,11 +113,13 @@ fn len_comparison<'hir>(
     // normalize comparison, `v.len() > 4` becomes `4 < v.len()`
     // this simplifies the logic a bit
     let (op, left, right) = normalize_comparison(bin_op.node, left, right)?;
-    match (op, &left.kind, &right.kind) {
-        (Rel::Lt, int_lit_pat!(left), _) => Some((LengthComparison::IntLessThanLength, *left as usize, right)),
-        (Rel::Lt, _, int_lit_pat!(right)) => Some((LengthComparison::LengthLessThanInt, *right as usize, left)),
-        (Rel::Le, int_lit_pat!(left), _) => Some((LengthComparison::IntLessThanOrEqualLength, *left as usize, right)),
-        (Rel::Le, _, int_lit_pat!(right)) => Some((LengthComparison::LengthLessThanOrEqualInt, *right as usize, left)),
+    match (op, left.kind, right.kind) {
+        (Rel::Lt, int_lit_pat!(left), _) => Some((LengthComparison::IntLessThanLength, left as usize, right)),
+        (Rel::Lt, _, int_lit_pat!(right)) => Some((LengthComparison::LengthLessThanInt, right as usize, left)),
+        (Rel::Le, int_lit_pat!(left), _) => Some((LengthComparison::IntLessThanOrEqualLength, left as usize, right)),
+        (Rel::Le, _, int_lit_pat!(right)) => Some((LengthComparison::LengthLessThanOrEqualInt, right as usize, left)),
+        (Rel::Eq, int_lit_pat!(left), _) => Some((LengthComparison::LengthEqualInt, left as usize, right)),
+        (Rel::Eq, _, int_lit_pat!(right)) => Some((LengthComparison::LengthEqualInt, right as usize, left)),
         _ => None,
     }
 }
@@ -133,7 +139,7 @@ fn assert_len_expr<'hir>(
         && let ExprKind::Binary(bin_op, left, right) = &condition.kind
 
         && let Some((cmp, asserted_len, slice_len)) = len_comparison(*bin_op, left, right)
-        && let ExprKind::MethodCall(method, recv, ..) = &slice_len.kind
+        && let ExprKind::MethodCall(method, recv, [], _) = &slice_len.kind
         && cx.typeck_results().expr_ty_adjusted(recv).peel_refs().is_slice()
         && method.ident.name == sym::len
 
@@ -201,14 +207,14 @@ impl<'hir> IndexEntry<'hir> {
 /// for `..=5` this returns `Some(5)`
 fn upper_index_expr(expr: &Expr<'_>) -> Option<usize> {
     if let ExprKind::Lit(lit) = &expr.kind
-        && let LitKind::Int(index, _) = lit.node
+        && let LitKind::Int(Pu128(index), _) = lit.node
     {
         Some(index as usize)
     } else if let Some(higher::Range {
         end: Some(end), limits, ..
     }) = higher::Range::hir(expr)
         && let ExprKind::Lit(lit) = &end.kind
-        && let LitKind::Int(index @ 1.., _) = lit.node
+        && let LitKind::Int(Pu128(index @ 1..), _) = lit.node
     {
         match limits {
             RangeLimits::HalfOpen => Some(index as usize - 1),
@@ -220,7 +226,7 @@ fn upper_index_expr(expr: &Expr<'_>) -> Option<usize> {
 }
 
 /// Checks if the expression is an index into a slice and adds it to `indexes`
-fn check_index<'hir>(cx: &LateContext<'_>, expr: &'hir Expr<'hir>, map: &mut UnhashMap<u64, Vec<IndexEntry<'hir>>>) {
+fn check_index<'hir>(cx: &LateContext<'_>, expr: &'hir Expr<'hir>, map: &mut UnindexMap<u64, Vec<IndexEntry<'hir>>>) {
     if let ExprKind::Index(slice, index_lit, _) = expr.kind
         && cx.typeck_results().expr_ty_adjusted(slice).peel_refs().is_slice()
         && let Some(index) = upper_index_expr(index_lit)
@@ -268,7 +274,7 @@ fn check_index<'hir>(cx: &LateContext<'_>, expr: &'hir Expr<'hir>, map: &mut Unh
 }
 
 /// Checks if the expression is an `assert!` expression and adds it to `asserts`
-fn check_assert<'hir>(cx: &LateContext<'_>, expr: &'hir Expr<'hir>, map: &mut UnhashMap<u64, Vec<IndexEntry<'hir>>>) {
+fn check_assert<'hir>(cx: &LateContext<'_>, expr: &'hir Expr<'hir>, map: &mut UnindexMap<u64, Vec<IndexEntry<'hir>>>) {
     if let Some((comparison, asserted_len, slice)) = assert_len_expr(cx, expr) {
         let hash = hash_expr(cx, slice);
         let indexes = map.entry(hash).or_default();
@@ -305,7 +311,7 @@ fn check_assert<'hir>(cx: &LateContext<'_>, expr: &'hir Expr<'hir>, map: &mut Un
 /// Inspects indexes and reports lints.
 ///
 /// Called at the end of this lint after all indexing and `assert!` expressions have been collected.
-fn report_indexes(cx: &LateContext<'_>, map: &UnhashMap<u64, Vec<IndexEntry<'_>>>) {
+fn report_indexes(cx: &LateContext<'_>, map: &UnindexMap<u64, Vec<IndexEntry<'_>>>) {
     for bucket in map.values() {
         for entry in bucket {
             let Some(full_span) = entry
@@ -316,17 +322,17 @@ fn report_indexes(cx: &LateContext<'_>, map: &UnhashMap<u64, Vec<IndexEntry<'_>>
                 continue;
             };
 
-            match entry {
+            match *entry {
                 IndexEntry::AssertWithIndex {
                     highest_index,
                     asserted_len,
-                    indexes,
+                    ref indexes,
                     comparison,
                     assert_span,
                     slice,
                 } if indexes.len() > 1 => {
                     // if we have found an `assert!`, let's also check that it's actually right
-                    // and if it convers the highest index and if not, suggest the correct length
+                    // and if it covers the highest index and if not, suggest the correct length
                     let sugg = match comparison {
                         // `v.len() < 5` and `v.len() <= 5` does nothing in terms of bounds checks.
                         // The user probably meant `v.len() > 5`
@@ -343,6 +349,12 @@ fn report_indexes(cx: &LateContext<'_>, map: &UnhashMap<u64, Vec<IndexEntry<'_>>
                             "assert!({}.len() > {highest_index})",
                             snippet(cx, slice.span, "..")
                         )),
+                        // `highest_index` here is rather a length, so we need to add 1 to it
+                        LengthComparison::LengthEqualInt if asserted_len < highest_index + 1 => Some(format!(
+                            "assert!({}.len() == {})",
+                            snippet(cx, slice.span, ".."),
+                            highest_index + 1
+                        )),
                         _ => None,
                     };
 
@@ -354,7 +366,7 @@ fn report_indexes(cx: &LateContext<'_>, map: &UnhashMap<u64, Vec<IndexEntry<'_>>
                             indexes,
                             |diag| {
                                 diag.span_suggestion(
-                                    *assert_span,
+                                    assert_span,
                                     "provide the highest index that is indexed with",
                                     sugg,
                                     Applicability::MachineApplicable,
@@ -364,7 +376,7 @@ fn report_indexes(cx: &LateContext<'_>, map: &UnhashMap<u64, Vec<IndexEntry<'_>>
                     }
                 },
                 IndexEntry::IndexWithoutAssert {
-                    indexes,
+                    ref indexes,
                     highest_index,
                     slice,
                 } if indexes.len() > 1 => {
@@ -391,9 +403,9 @@ fn report_indexes(cx: &LateContext<'_>, map: &UnhashMap<u64, Vec<IndexEntry<'_>>
 
 impl LateLintPass<'_> for MissingAssertsForIndexing {
     fn check_body(&mut self, cx: &LateContext<'_>, body: &Body<'_>) {
-        let mut map = UnhashMap::default();
+        let mut map = UnindexMap::default();
 
-        for_each_expr(body.value, |expr| {
+        for_each_expr_without_closures(body.value, |expr| {
             check_index(cx, expr, &mut map);
             check_assert(cx, expr, &mut map);
             ControlFlow::<!, ()>::Continue(())

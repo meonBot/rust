@@ -8,13 +8,12 @@
 //! Note that these tokens, unlike the tokens we feed into the parser, do
 //! include info about comments and whitespace.
 
-use rustc_dependencies::lexer as rustc_lexer;
-
 use std::ops;
 
 use rustc_lexer::unescape::{EscapeError, Mode};
 
 use crate::{
+    Edition,
     SyntaxKind::{self, *},
     T,
 };
@@ -32,14 +31,17 @@ struct LexError {
 }
 
 impl<'a> LexedStr<'a> {
-    pub fn new(text: &'a str) -> LexedStr<'a> {
-        let mut conv = Converter::new(text);
+    pub fn new(edition: Edition, text: &'a str) -> LexedStr<'a> {
+        let _p = tracing::info_span!("LexedStr::new").entered();
+        let mut conv = Converter::new(edition, text);
         if let Some(shebang_len) = rustc_lexer::strip_shebang(text) {
             conv.res.push(SHEBANG, conv.offset);
             conv.offset = shebang_len;
         };
 
-        for token in rustc_lexer::tokenize(&text[conv.offset..]) {
+        // Re-create the tokenizer from scratch every token because `GuardedStrPrefix` is one token in the lexer
+        // but we want to split it to two in edition <2024.
+        while let Some(token) = rustc_lexer::tokenize(&text[conv.offset..]).next() {
             let token_text = &text[conv.offset..][..token.len as usize];
 
             conv.extend_token(&token.kind, token_text);
@@ -48,7 +50,7 @@ impl<'a> LexedStr<'a> {
         conv.finalize_with_eof()
     }
 
-    pub fn single_token(text: &'a str) -> Option<(SyntaxKind, Option<String>)> {
+    pub fn single_token(edition: Edition, text: &'a str) -> Option<(SyntaxKind, Option<String>)> {
         if text.is_empty() {
             return None;
         }
@@ -58,7 +60,7 @@ impl<'a> LexedStr<'a> {
             return None;
         }
 
-        let mut conv = Converter::new(text);
+        let mut conv = Converter::new(edition, text);
         conv.extend_token(&token.kind, text);
         match &*conv.res.kind {
             [kind] => Some((*kind, conv.res.error.pop().map(|it| it.msg))),
@@ -130,13 +132,15 @@ impl<'a> LexedStr<'a> {
 struct Converter<'a> {
     res: LexedStr<'a>,
     offset: usize,
+    edition: Edition,
 }
 
 impl<'a> Converter<'a> {
-    fn new(text: &'a str) -> Self {
+    fn new(edition: Edition, text: &'a str) -> Self {
         Self {
             res: LexedStr { text, kind: Vec::new(), start: Vec::new(), error: Vec::new() },
             offset: 0,
+            edition,
         }
     }
 
@@ -151,12 +155,12 @@ impl<'a> Converter<'a> {
 
         if let Some(err) = err {
             let token = self.res.len() as u32;
-            let msg = err.to_string();
+            let msg = err.to_owned();
             self.res.error.push(LexError { msg, token });
         }
     }
 
-    fn extend_token(&mut self, kind: &rustc_lexer::TokenKind, token_text: &str) {
+    fn extend_token(&mut self, kind: &rustc_lexer::TokenKind, mut token_text: &str) {
         // A note on an intended tradeoff:
         // We drop some useful information here (see patterns with double dots `..`)
         // Storing that info in `SyntaxKind` is not possible due to its layout requirements of
@@ -177,7 +181,7 @@ impl<'a> Converter<'a> {
 
                 rustc_lexer::TokenKind::Ident if token_text == "_" => UNDERSCORE,
                 rustc_lexer::TokenKind::Ident => {
-                    SyntaxKind::from_keyword(token_text).unwrap_or(IDENT)
+                    SyntaxKind::from_keyword(token_text, self.edition).unwrap_or(IDENT)
                 }
                 rustc_lexer::TokenKind::InvalidIdent => {
                     err = "Ident contains invalid characters";
@@ -185,6 +189,18 @@ impl<'a> Converter<'a> {
                 }
 
                 rustc_lexer::TokenKind::RawIdent => IDENT,
+
+                rustc_lexer::TokenKind::GuardedStrPrefix if self.edition.at_least_2024() => {
+                    // FIXME: rustc does something better for recovery.
+                    err = "Invalid string literal (reserved syntax)";
+                    ERROR
+                }
+                rustc_lexer::TokenKind::GuardedStrPrefix => {
+                    // The token is `#"` or `##`, split it into two.
+                    token_text = &token_text[1..];
+                    POUND
+                }
+
                 rustc_lexer::TokenKind::Literal { kind, .. } => {
                     self.extend_literal(token_text.len(), kind);
                     return;
@@ -196,6 +212,11 @@ impl<'a> Converter<'a> {
                     }
                     LIFETIME_IDENT
                 }
+                rustc_lexer::TokenKind::UnknownPrefixLifetime => {
+                    err = "Unknown lifetime prefix";
+                    LIFETIME_IDENT
+                }
+                rustc_lexer::TokenKind::RawLifetime => LIFETIME_IDENT,
 
                 rustc_lexer::TokenKind::Semi => T![;],
                 rustc_lexer::TokenKind::Comma => T![,],
@@ -371,6 +392,7 @@ fn error_to_diagnostic_message(error: EscapeError, mode: Mode) -> &'static str {
             "non-ASCII character in byte string literal"
         }
         EscapeError::NonAsciiCharInByte => "non-ASCII character in raw byte string literal",
+        EscapeError::NulInCStr => "null character in C string literal",
         EscapeError::UnskippedWhitespaceWarning => "",
         EscapeError::MultipleSkippedLinesWarning => "",
     }
@@ -380,14 +402,14 @@ fn unescape_string_error_message(text: &str, mode: Mode) -> &'static str {
     let mut error_message = "";
     match mode {
         Mode::CStr => {
-            rustc_lexer::unescape::unescape_c_string(text, mode, &mut |_, res| {
+            rustc_lexer::unescape::unescape_mixed(text, mode, &mut |_, res| {
                 if let Err(e) = res {
                     error_message = error_to_diagnostic_message(e, mode);
                 }
             });
         }
         Mode::ByteStr | Mode::Str => {
-            rustc_lexer::unescape::unescape_literal(text, mode, &mut |_, res| {
+            rustc_lexer::unescape::unescape_unicode(text, mode, &mut |_, res| {
                 if let Err(e) = res {
                     error_message = error_to_diagnostic_message(e, mode);
                 }

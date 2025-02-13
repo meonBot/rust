@@ -1,10 +1,9 @@
-// only-x86_64
-// ignore-sgx Tests incompatible with LVI mitigations
-// assembly-output: emit-asm
+//@ only-x86_64
+//@ ignore-sgx Tests incompatible with LVI mitigations
+//@ assembly-output: emit-asm
 // make sure the feature is not enabled at compile-time
-// compile-flags: -C opt-level=3 -C target-feature=-sse4.1 -C llvm-args=-x86-asm-syntax=intel
+//@ compile-flags: -C opt-level=3 -C target-feature=-sse4.1 -C llvm-args=-x86-asm-syntax=intel
 
-#![feature(target_feature_11)]
 #![crate_type = "rlib"]
 
 use std::arch::x86_64::{__m128, _mm_blend_ps};
@@ -18,7 +17,8 @@ pub unsafe fn sse41_blend_nofeature(x: __m128, y: __m128) -> __m128 {
         // CHECK: {{call .*_mm_blend_ps.*}}
         // CHECK-NOT: blendps
         // CHECK: ret
-        #[inline(never)] |x, y| _mm_blend_ps(x, y, 0b0101)
+        #[inline(never)]
+        |x, y| _mm_blend_ps(x, y, 0b0101)
     };
     f(x, y)
 }
@@ -33,9 +33,8 @@ pub fn sse41_blend_noinline(x: __m128, y: __m128) -> __m128 {
         // CHECK: blendps
         // CHECK-NOT: _mm_blend_ps
         // CHECK: ret
-        #[inline(never)] |x, y| unsafe {
-            _mm_blend_ps(x, y, 0b0101)
-        }
+        #[inline(never)]
+        |x, y| unsafe { _mm_blend_ps(x, y, 0b0101) }
     };
     f(x, y)
 }
@@ -52,9 +51,8 @@ pub fn sse41_blend_doinline(x: __m128, y: __m128) -> __m128 {
     // CHECK-NOT: _mm_blend_ps
     // CHECK: ret
     let f = {
-        #[inline] |x, y| unsafe {
-            _mm_blend_ps(x, y, 0b0101)
-        }
+        #[inline]
+        |x, y| unsafe { _mm_blend_ps(x, y, 0b0101) }
     };
     f(x, y)
 }

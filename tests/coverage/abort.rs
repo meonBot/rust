@@ -1,4 +1,3 @@
-#![feature(c_unwind)]
 #![allow(unused_assignments)]
 
 extern "C" fn might_abort(should_abort: bool) {
@@ -10,6 +9,7 @@ extern "C" fn might_abort(should_abort: bool) {
     }
 }
 
+#[rustfmt::skip]
 fn main() -> Result<(), u8> {
     let mut countdown = 10;
     while countdown > 0 {

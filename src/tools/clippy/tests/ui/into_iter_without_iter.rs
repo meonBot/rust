@@ -1,5 +1,7 @@
 //@no-rustfix
+//@aux-build:proc_macros.rs
 #![warn(clippy::into_iter_without_iter)]
+extern crate proc_macros;
 
 use std::iter::IntoIterator;
 
@@ -111,6 +113,43 @@ impl IntoIterator for &Alias {
     }
 }
 
+// Fine to lint, the impls comes from a local macro.
+pub struct Issue12037;
+macro_rules! generate_impl {
+    () => {
+        impl<'a> IntoIterator for &'a Issue12037 {
+            type IntoIter = std::slice::Iter<'a, u8>;
+            type Item = &'a u8;
+            fn into_iter(self) -> Self::IntoIter {
+                todo!()
+            }
+        }
+    };
+}
+generate_impl!();
+
+// Impl comes from an external crate
+proc_macros::external! {
+    pub struct ImplWithForeignSpan;
+    impl<'a> IntoIterator for &'a ImplWithForeignSpan {
+        type IntoIter = std::slice::Iter<'a, u8>;
+        type Item = &'a u8;
+        fn into_iter(self) -> Self::IntoIter {
+            todo!()
+        }
+    }
+}
+
+pub struct Allowed;
+#[allow(clippy::into_iter_without_iter)]
+impl<'a> IntoIterator for &'a Allowed {
+    type IntoIter = std::slice::Iter<'a, u8>;
+    type Item = &'a u8;
+    fn into_iter(self) -> Self::IntoIter {
+        todo!()
+    }
+}
+
 fn main() {}
 
 pub mod issue11635 {
@@ -143,6 +182,45 @@ pub mod issue11635 {
 
         fn into_iter(self) -> Self::IntoIter {
             self.0.iter()
+        }
+    }
+}
+
+pub mod issue12964 {
+    pub struct MyIter<'a, T: 'a> {
+        iter: std::slice::Iter<'a, T>,
+    }
+
+    impl<'a, T> Iterator for MyIter<'a, T> {
+        type Item = &'a T;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.iter.next()
+        }
+    }
+
+    pub struct MyContainer<T> {
+        inner: Vec<T>,
+    }
+
+    impl<T> MyContainer<T> {}
+
+    impl<T> MyContainer<T> {
+        #[must_use]
+        pub fn iter(&self) -> MyIter<'_, T> {
+            <&Self as IntoIterator>::into_iter(self)
+        }
+    }
+
+    impl<'a, T> IntoIterator for &'a MyContainer<T> {
+        type Item = &'a T;
+
+        type IntoIter = MyIter<'a, T>;
+
+        fn into_iter(self) -> Self::IntoIter {
+            Self::IntoIter {
+                iter: self.inner.as_slice().iter(),
+            }
         }
     }
 }

@@ -1,6 +1,5 @@
 // Doesn't need an aliasing model.
 //@compile-flags: -Zmiri-disable-stacked-borrows
-#![feature(raw_ref_op)]
 #![feature(core_intrinsics)]
 #![feature(custom_mir)]
 
@@ -14,7 +13,7 @@ struct S(i32, [u8; 128]);
 fn docall(out: &mut S) {
     mir! {
         {
-            Call(*out = callee(), after_call, UnwindContinue())
+            Call(*out = callee(), ReturnTo(after_call), UnwindContinue())
         }
 
         after_call = {
@@ -37,7 +36,7 @@ fn callee() -> S {
             // become visible to the outside. In codegen we can see them
             // but Miri should detect this as UB!
             RET.0 = 42;
-            Call(_unit = startpanic(), after_call, UnwindContinue())
+            Call(_unit = startpanic(), ReturnTo(after_call), UnwindContinue())
         }
 
         after_call = {

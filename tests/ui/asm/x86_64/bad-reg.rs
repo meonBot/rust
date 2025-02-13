@@ -1,7 +1,5 @@
-// only-x86_64
-// compile-flags: -C target-feature=+avx2
-
-#![feature(asm_const)]
+//@ only-x86_64
+//@ compile-flags: -C target-feature=+avx2
 
 use std::arch::asm;
 

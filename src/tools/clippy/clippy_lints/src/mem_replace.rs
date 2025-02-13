@@ -1,17 +1,19 @@
-use clippy_config::msrvs::{self, Msrv};
+use clippy_config::Conf;
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_sugg, span_lint_and_then};
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::{snippet, snippet_with_applicability};
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::is_non_aggregate_primitive_type;
-use clippy_utils::{is_default_equivalent, is_res_lang_ctor, path_res, peel_ref_operators};
+use clippy_utils::{
+    is_default_equivalent, is_expr_used_or_unified, is_res_lang_ctor, path_res, peel_ref_operators, std_or_core,
+};
 use rustc_errors::Applicability;
 use rustc_hir::LangItem::OptionNone;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::lint::in_external_macro;
 use rustc_session::impl_lint_pass;
-use rustc_span::symbol::sym;
 use rustc_span::Span;
+use rustc_span::symbol::sym;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -128,6 +130,7 @@ fn check_replace_with_uninit(cx: &LateContext<'_>, src: &Expr<'_>, dest: &Expr<'
         // check if replacement is mem::MaybeUninit::uninit().assume_init()
         && cx.tcx.is_diagnostic_item(sym::assume_init, method_def_id)
     {
+        let Some(top_crate) = std_or_core(cx) else { return };
         let mut applicability = Applicability::MachineApplicable;
         span_lint_and_sugg(
             cx,
@@ -136,7 +139,7 @@ fn check_replace_with_uninit(cx: &LateContext<'_>, src: &Expr<'_>, dest: &Expr<'
             "replacing with `mem::MaybeUninit::uninit().assume_init()`",
             "consider using",
             format!(
-                "std::ptr::read({})",
+                "{top_crate}::ptr::read({})",
                 snippet_with_applicability(cx, dest.span, "", &mut applicability)
             ),
             applicability,
@@ -149,6 +152,7 @@ fn check_replace_with_uninit(cx: &LateContext<'_>, src: &Expr<'_>, dest: &Expr<'
         && let Some(repl_def_id) = cx.qpath_res(repl_func_qpath, repl_func.hir_id).opt_def_id()
     {
         if cx.tcx.is_diagnostic_item(sym::mem_uninitialized, repl_def_id) {
+            let Some(top_crate) = std_or_core(cx) else { return };
             let mut applicability = Applicability::MachineApplicable;
             span_lint_and_sugg(
                 cx,
@@ -157,7 +161,7 @@ fn check_replace_with_uninit(cx: &LateContext<'_>, src: &Expr<'_>, dest: &Expr<'
                 "replacing with `mem::uninitialized()`",
                 "consider using",
                 format!(
-                    "std::ptr::read({})",
+                    "{top_crate}::ptr::read({})",
                     snippet_with_applicability(cx, dest.span, "", &mut applicability)
                 ),
                 applicability,
@@ -183,15 +187,18 @@ fn check_replace_with_default(cx: &LateContext<'_>, src: &Expr<'_>, dest: &Expr<
     if is_non_aggregate_primitive_type(expr_type) {
         return;
     }
-    if is_default_equivalent(cx, src) && !in_external_macro(cx.tcx.sess, expr_span) {
+    if is_default_equivalent(cx, src) && !expr_span.in_external_macro(cx.tcx.sess.source_map()) {
+        let Some(top_crate) = std_or_core(cx) else { return };
         span_lint_and_then(
             cx,
             MEM_REPLACE_WITH_DEFAULT,
             expr_span,
-            "replacing a value of type `T` with `T::default()` is better expressed using `std::mem::take`",
+            format!(
+                "replacing a value of type `T` with `T::default()` is better expressed using `{top_crate}::mem::take`"
+            ),
             |diag| {
                 if !expr_span.from_expansion() {
-                    let suggestion = format!("std::mem::take({})", snippet(cx, dest.span, ""));
+                    let suggestion = format!("{top_crate}::mem::take({})", snippet(cx, dest.span, ""));
 
                     diag.span_suggestion(
                         expr_span,
@@ -210,9 +217,10 @@ pub struct MemReplace {
 }
 
 impl MemReplace {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            msrv: conf.msrv.clone(),
+        }
     }
 }
 
@@ -227,7 +235,7 @@ impl<'tcx> LateLintPass<'tcx> for MemReplace {
             // Check that second argument is `Option::None`
             if is_res_lang_ctor(cx, path_res(cx, src), OptionNone) {
                 check_replace_option_with_none(cx, dest, expr.span);
-            } else if self.msrv.meets(msrvs::MEM_TAKE) {
+            } else if self.msrv.meets(msrvs::MEM_TAKE) && is_expr_used_or_unified(cx.tcx, expr) {
                 check_replace_with_default(cx, src, dest, expr.span);
             }
             check_replace_with_uninit(cx, src, dest, expr.span);

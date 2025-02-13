@@ -4,28 +4,18 @@
 //! other areas of the compiler as well.
 
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_middle::traits::{DefiningAnchor, ObligationCause};
-use rustc_middle::ty::{ParamEnv, Ty, TyCtxt, Variance};
+use rustc_middle::traits::ObligationCause;
+use rustc_middle::ty::{Ty, TyCtxt, TypingEnv, Variance};
 use rustc_trait_selection::traits::ObligationCtxt;
 
-/// Returns whether the two types are equal up to subtyping.
-///
-/// This is used in case we don't know the expected subtyping direction
-/// and still want to check whether anything is broken.
-pub fn is_equal_up_to_subtyping<'tcx>(
+/// Returns whether `src` is a subtype of `dest`, i.e. `src <: dest`.
+pub fn sub_types<'tcx>(
     tcx: TyCtxt<'tcx>,
-    param_env: ParamEnv<'tcx>,
+    typing_env: TypingEnv<'tcx>,
     src: Ty<'tcx>,
     dest: Ty<'tcx>,
 ) -> bool {
-    // Fast path.
-    if src == dest {
-        return true;
-    }
-
-    // Check for subtyping in either direction.
-    relate_types(tcx, param_env, Variance::Covariant, src, dest)
-        || relate_types(tcx, param_env, Variance::Covariant, dest, src)
+    relate_types(tcx, typing_env, Variance::Covariant, src, dest)
 }
 
 /// Returns whether `src` is a subtype of `dest`, i.e. `src <: dest`.
@@ -33,12 +23,9 @@ pub fn is_equal_up_to_subtyping<'tcx>(
 /// When validating assignments, the variance should be `Covariant`. When checking
 /// during `MirPhase` >= `MirPhase::Runtime(RuntimePhase::Initial)` variance should be `Invariant`
 /// because we want to check for type equality.
-///
-/// This mostly ignores opaque types as it can be used in constraining contexts
-/// while still computing the final underlying type.
 pub fn relate_types<'tcx>(
     tcx: TyCtxt<'tcx>,
-    param_env: ParamEnv<'tcx>,
+    typing_env: TypingEnv<'tcx>,
     variance: Variance,
     src: Ty<'tcx>,
     dest: Ty<'tcx>,
@@ -47,9 +34,7 @@ pub fn relate_types<'tcx>(
         return true;
     }
 
-    let mut builder =
-        tcx.infer_ctxt().ignoring_regions().with_opaque_type_inference(DefiningAnchor::Bubble);
-    let infcx = builder.build();
+    let (infcx, param_env) = tcx.infer_ctxt().ignoring_regions().build_with_typing_env(typing_env);
     let ocx = ObligationCtxt::new(&infcx);
     let cause = ObligationCause::dummy();
     let src = ocx.normalize(&cause, param_env, src);
@@ -58,20 +43,5 @@ pub fn relate_types<'tcx>(
         Ok(()) => {}
         Err(_) => return false,
     };
-    let errors = ocx.select_all_or_error();
-    // With `Reveal::All`, opaque types get normalized away, with `Reveal::UserFacing`
-    // we would get unification errors because we're unable to look into opaque types,
-    // even if they're constrained in our current function.
-    for (key, ty) in infcx.take_opaque_types() {
-        let hidden_ty = tcx.type_of(key.def_id).instantiate(tcx, key.args);
-        if hidden_ty != ty.hidden_type.ty {
-            span_bug!(
-                ty.hidden_type.span,
-                "{}, {}",
-                tcx.type_of(key.def_id).instantiate(tcx, key.args),
-                ty.hidden_type.ty
-            );
-        }
-    }
-    errors.is_empty()
+    ocx.select_all_or_error().is_empty()
 }

@@ -1,8 +1,8 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::{is_res_lang_ctor, path_res, peel_blocks};
+use clippy_utils::{is_none_arm, is_res_lang_ctor, path_res, peel_blocks};
 use rustc_errors::Applicability;
-use rustc_hir::{Arm, BindingAnnotation, ByRef, Expr, ExprKind, LangItem, Mutability, PatKind, QPath};
+use rustc_hir::{Arm, BindingMode, ByRef, Expr, ExprKind, LangItem, Mutability, PatKind, QPath};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
 
@@ -43,7 +43,7 @@ pub(crate) fn check(cx: &LateContext<'_>, ex: &Expr<'_>, arms: &[Arm<'_>], expr:
                 cx,
                 MATCH_AS_REF,
                 expr.span,
-                &format!("use `{suggestion}()` instead"),
+                format!("use `{suggestion}()` instead"),
                 "try",
                 format!(
                     "{}.{suggestion}(){cast}",
@@ -55,19 +55,11 @@ pub(crate) fn check(cx: &LateContext<'_>, ex: &Expr<'_>, arms: &[Arm<'_>], expr:
     }
 }
 
-// Checks if arm has the form `None => None`
-fn is_none_arm(cx: &LateContext<'_>, arm: &Arm<'_>) -> bool {
-    matches!(
-        arm.pat.kind,
-        PatKind::Path(ref qpath) if is_res_lang_ctor(cx, cx.qpath_res(qpath, arm.pat.hir_id), LangItem::OptionNone)
-    )
-}
-
 // Checks if arm has the form `Some(ref v) => Some(v)` (checks for `ref` and `ref mut`)
 fn is_ref_some_arm(cx: &LateContext<'_>, arm: &Arm<'_>) -> Option<Mutability> {
     if let PatKind::TupleStruct(ref qpath, [first_pat, ..], _) = arm.pat.kind
         && is_res_lang_ctor(cx, cx.qpath_res(qpath, arm.pat.hir_id), LangItem::OptionSome)
-        && let PatKind::Binding(BindingAnnotation(ByRef::Yes, mutabl), .., ident, _) = first_pat.kind
+        && let PatKind::Binding(BindingMode(ByRef::Yes(mutabl), _), .., ident, _) = first_pat.kind
         && let ExprKind::Call(e, [arg]) = peel_blocks(arm.body).kind
         && is_res_lang_ctor(cx, path_res(cx, e), LangItem::OptionSome)
         && let ExprKind::Path(QPath::Resolved(_, path2)) = arg.kind

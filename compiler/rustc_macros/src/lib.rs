@@ -1,27 +1,26 @@
-#![feature(allow_internal_unstable)]
+// tidy-alphabetical-start
+#![allow(rustc::default_hash_types)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
 #![feature(never_type)]
 #![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_span)]
 #![feature(proc_macro_tracked_env)]
-#![allow(rustc::default_hash_types)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-#![allow(internal_features)]
-#![recursion_limit = "128"]
-
-use synstructure::decl_derive;
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 use proc_macro::TokenStream;
+use synstructure::decl_derive;
 
 mod current_version;
 mod diagnostics;
+mod extension;
 mod hash_stable;
 mod lift;
 mod query;
 mod serialize;
 mod symbols;
+mod try_from;
 mod type_foldable;
 mod type_visitable;
 
@@ -43,6 +42,25 @@ pub fn symbols(input: TokenStream) -> TokenStream {
     symbols::symbols(input.into()).into()
 }
 
+/// Derive an extension trait for a given impl block. The trait name
+/// goes into the parenthesized args of the macro, for greppability.
+/// For example:
+/// ```
+/// use rustc_macros::extension;
+/// #[extension(pub trait Foo)]
+/// impl i32 { fn hello() {} }
+/// ```
+///
+/// expands to:
+/// ```
+/// pub trait Foo { fn hello(); }
+/// impl Foo for i32 { fn hello() {} }
+/// ```
+#[proc_macro_attribute]
+pub fn extension(attr: TokenStream, input: TokenStream) -> TokenStream {
+    extension::extension(attr, input)
+}
+
 decl_derive!([HashStable, attributes(stable_hasher)] => hash_stable::hash_stable_derive);
 decl_derive!(
     [HashStable_Generic, attributes(stable_hasher)] =>
@@ -56,6 +74,8 @@ decl_derive!(
     hash_stable::hash_stable_no_context_derive
 );
 
+decl_derive!([Decodable_Generic] => serialize::decodable_generic_derive);
+decl_derive!([Encodable_Generic] => serialize::encodable_generic_derive);
 decl_derive!([Decodable] => serialize::decodable_derive);
 decl_derive!([Encodable] => serialize::encodable_derive);
 decl_derive!([TyDecodable] => serialize::type_decodable_derive);
@@ -89,7 +109,9 @@ decl_derive!(
         // struct attributes
         diag,
         help,
+        help_once,
         note,
+        note_once,
         warning,
         // field attributes
         skip_arg,
@@ -99,14 +121,16 @@ decl_derive!(
         suggestion,
         suggestion_short,
         suggestion_hidden,
-        suggestion_verbose)] => diagnostics::session_diagnostic_derive
+        suggestion_verbose)] => diagnostics::diagnostic_derive
 );
 decl_derive!(
     [LintDiagnostic, attributes(
         // struct attributes
         diag,
         help,
+        help_once,
         note,
+        note_once,
         warning,
         // field attributes
         skip_arg,
@@ -123,8 +147,11 @@ decl_derive!(
         // struct/variant attributes
         label,
         help,
+        help_once,
         note,
+        note_once,
         warning,
+        subdiagnostic,
         suggestion,
         suggestion_short,
         suggestion_hidden,
@@ -137,5 +164,14 @@ decl_derive!(
         skip_arg,
         primary_span,
         suggestion_part,
-        applicability)] => diagnostics::session_subdiagnostic_derive
+        applicability)] => diagnostics::subdiagnostic_derive
 );
+
+decl_derive! {
+    [TryFromU32] =>
+    /// Derives `TryFrom<u32>` for the annotated `enum`, which must have no fields.
+    /// Each variant maps to the value it would produce under an `as u32` cast.
+    ///
+    /// The error type is `u32`.
+    try_from::try_from_u32
+}

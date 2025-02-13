@@ -710,7 +710,6 @@ impl<T> Bound<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(bound_map)]
     /// use std::ops::Bound::*;
     ///
     /// let bound_string = Included("Hello, World!");
@@ -719,7 +718,6 @@ impl<T> Bound<T> {
     /// ```
     ///
     /// ```
-    /// #![feature(bound_map)]
     /// use std::ops::Bound;
     /// use Bound::*;
     ///
@@ -728,7 +726,7 @@ impl<T> Bound<T> {
     /// assert_eq!(unbounded_string.map(|s| s.len()), Unbounded);
     /// ```
     #[inline]
-    #[unstable(feature = "bound_map", issue = "86026")]
+    #[stable(feature = "bound_map", since = "1.77.0")]
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Bound<U> {
         match self {
             Unbounded => Unbounded,
@@ -981,6 +979,19 @@ impl<T> RangeBounds<T> for RangeToInclusive<&T> {
     }
 }
 
+/// An internal helper for `split_off` functions indicating
+/// which end a `OneSidedRange` is bounded on.
+#[unstable(feature = "one_sided_range", issue = "69780")]
+#[allow(missing_debug_implementations)]
+pub enum OneSidedRangeBound {
+    /// The range is bounded inclusively from below and is unbounded above.
+    StartInclusive,
+    /// The range is bounded exclusively from above and is unbounded below.
+    End,
+    /// The range is bounded inclusively from above and is unbounded below.
+    EndInclusive,
+}
+
 /// `OneSidedRange` is implemented for built-in range types that are unbounded
 /// on one side. For example, `a..`, `..b` and `..=c` implement `OneSidedRange`,
 /// but `..`, `d..e`, and `f..=g` do not.
@@ -988,13 +999,38 @@ impl<T> RangeBounds<T> for RangeToInclusive<&T> {
 /// Types that implement `OneSidedRange<T>` must return `Bound::Unbounded`
 /// from one of `RangeBounds::start_bound` or `RangeBounds::end_bound`.
 #[unstable(feature = "one_sided_range", issue = "69780")]
-pub trait OneSidedRange<T: ?Sized>: RangeBounds<T> {}
+pub trait OneSidedRange<T: ?Sized>: RangeBounds<T> {
+    /// An internal-only helper function for `split_off` and
+    /// `split_off_mut` that returns the bound of the one-sided range.
+    fn bound(self) -> (OneSidedRangeBound, T);
+}
 
 #[unstable(feature = "one_sided_range", issue = "69780")]
-impl<T> OneSidedRange<T> for RangeTo<T> where Self: RangeBounds<T> {}
+impl<T> OneSidedRange<T> for RangeTo<T>
+where
+    Self: RangeBounds<T>,
+{
+    fn bound(self) -> (OneSidedRangeBound, T) {
+        (OneSidedRangeBound::End, self.end)
+    }
+}
 
 #[unstable(feature = "one_sided_range", issue = "69780")]
-impl<T> OneSidedRange<T> for RangeFrom<T> where Self: RangeBounds<T> {}
+impl<T> OneSidedRange<T> for RangeFrom<T>
+where
+    Self: RangeBounds<T>,
+{
+    fn bound(self) -> (OneSidedRangeBound, T) {
+        (OneSidedRangeBound::StartInclusive, self.start)
+    }
+}
 
 #[unstable(feature = "one_sided_range", issue = "69780")]
-impl<T> OneSidedRange<T> for RangeToInclusive<T> where Self: RangeBounds<T> {}
+impl<T> OneSidedRange<T> for RangeToInclusive<T>
+where
+    Self: RangeBounds<T>,
+{
+    fn bound(self) -> (OneSidedRangeBound, T) {
+        (OneSidedRangeBound::EndInclusive, self.end)
+    }
+}

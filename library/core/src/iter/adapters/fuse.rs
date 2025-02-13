@@ -1,9 +1,8 @@
 use crate::intrinsics;
-use crate::iter::adapters::zip::try_get_unchecked;
 use crate::iter::adapters::SourceIter;
+use crate::iter::adapters::zip::try_get_unchecked;
 use crate::iter::{
-    DoubleEndedIterator, ExactSizeIterator, FusedIterator, TrustedFused, TrustedLen,
-    TrustedRandomAccess, TrustedRandomAccessNoCoerce,
+    FusedIterator, TrustedFused, TrustedLen, TrustedRandomAccess, TrustedRandomAccessNoCoerce,
 };
 use crate::ops::Try;
 
@@ -24,6 +23,10 @@ pub struct Fuse<I> {
 impl<I> Fuse<I> {
     pub(in crate::iter) fn new(iter: I) -> Fuse<I> {
         Fuse { iter: Some(iter) }
+    }
+
+    pub(crate) fn into_inner(self) -> Option<I> {
+        self.iter
     }
 }
 

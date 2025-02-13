@@ -23,43 +23,38 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::{env, iter};
 
 use crate::core::config::TargetSelection;
-use crate::utils::helpers::output;
+use crate::utils::exec::{BootstrapCommand, command};
 use crate::{Build, CLang, GitRepo};
 
-// The `cc` crate doesn't provide a way to obtain a path to the detected archiver,
-// so use some simplified logic here. First we respect the environment variable `AR`, then
-// try to infer the archiver path from the C compiler path.
-// In the future this logic should be replaced by calling into the `cc` crate.
-fn cc2ar(cc: &Path, target: TargetSelection) -> Option<PathBuf> {
-    if let Some(ar) = env::var_os(format!("AR_{}", target.triple.replace("-", "_"))) {
+/// FIXME(onur-ozkan): This logic should be replaced by calling into the `cc` crate.
+fn cc2ar(cc: &Path, target: TargetSelection, default_ar: PathBuf) -> Option<PathBuf> {
+    if let Some(ar) = env::var_os(format!("AR_{}", target.triple.replace('-', "_"))) {
         Some(PathBuf::from(ar))
     } else if let Some(ar) = env::var_os("AR") {
         Some(PathBuf::from(ar))
-    } else if target.contains("msvc") {
+    } else if target.is_msvc() {
         None
-    } else if target.contains("musl") {
-        Some(PathBuf::from("ar"))
-    } else if target.contains("openbsd") {
+    } else if target.contains("musl") || target.contains("openbsd") {
         Some(PathBuf::from("ar"))
     } else if target.contains("vxworks") {
         Some(PathBuf::from("wr-ar"))
-    } else if target.contains("android") {
+    } else if target.contains("-nto-") {
+        if target.starts_with("i586") {
+            Some(PathBuf::from("ntox86-ar"))
+        } else if target.starts_with("aarch64") {
+            Some(PathBuf::from("ntoaarch64-ar"))
+        } else if target.starts_with("x86_64") {
+            Some(PathBuf::from("ntox86_64-ar"))
+        } else {
+            panic!("Unknown architecture, cannot determine archiver for Neutrino QNX");
+        }
+    } else if target.contains("android") || target.contains("-wasi") {
         Some(cc.parent().unwrap().join(PathBuf::from("llvm-ar")))
     } else {
-        let parent = cc.parent().unwrap();
-        let file = cc.file_name().unwrap().to_str().unwrap();
-        for suffix in &["gcc", "cc", "clang"] {
-            if let Some(idx) = file.rfind(suffix) {
-                let mut file = file[..idx].to_owned();
-                file.push_str("ar");
-                return Some(parent.join(&file));
-            }
-        }
-        Some(parent.join(file))
+        Some(default_ar)
     }
 }
 
@@ -78,7 +73,7 @@ fn new_cc_build(build: &Build, target: TargetSelection) -> cc::Build {
             cfg.static_crt(a);
         }
         None => {
-            if target.contains("msvc") {
+            if target.is_msvc() {
                 cfg.static_crt(true);
             }
             if target.contains("musl") {
@@ -90,15 +85,28 @@ fn new_cc_build(build: &Build, target: TargetSelection) -> cc::Build {
 }
 
 pub fn find(build: &Build) {
-    // For all targets we're going to need a C compiler for building some shims
-    // and such as well as for being a linker for Rust code.
-    let targets = build
-        .targets
-        .iter()
-        .chain(&build.hosts)
-        .cloned()
-        .chain(iter::once(build.build))
-        .collect::<HashSet<_>>();
+    let targets: HashSet<_> = match build.config.cmd {
+        // We don't need to check cross targets for these commands.
+        crate::Subcommand::Clean { .. }
+        | crate::Subcommand::Suggest { .. }
+        | crate::Subcommand::Format { .. }
+        | crate::Subcommand::Setup { .. } => {
+            build.hosts.iter().cloned().chain(iter::once(build.build)).collect()
+        }
+
+        _ => {
+            // For all targets we're going to need a C compiler for building some shims
+            // and such as well as for being a linker for Rust code.
+            build
+                .targets
+                .iter()
+                .chain(&build.hosts)
+                .cloned()
+                .chain(iter::once(build.build))
+                .collect()
+        }
+    };
+
     for target in targets.into_iter() {
         find_target(build, target);
     }
@@ -118,11 +126,12 @@ pub fn find_target(build: &Build, target: TargetSelection) {
     let ar = if let ar @ Some(..) = config.and_then(|c| c.ar.clone()) {
         ar
     } else {
-        cc2ar(compiler.path(), target)
+        cc2ar(compiler.path(), target, PathBuf::from(cfg.get_archiver().get_program()))
     };
 
     build.cc.borrow_mut().insert(target, compiler.clone());
-    let cflags = build.cflags(target, GitRepo::Rustc, CLang::C);
+    let mut cflags = build.cc_handled_clags(target, CLang::C);
+    cflags.extend(build.cc_unhandled_cflags(target, GitRepo::Rustc, CLang::C));
 
     // If we use llvm-libunwind, we will need a C++ compiler as well for all targets
     // We'll need one anyways if the target triple is also a host triple
@@ -145,15 +154,16 @@ pub fn find_target(build: &Build, target: TargetSelection) {
         build.cxx.borrow_mut().insert(target, compiler);
     }
 
-    build.verbose(&format!("CC_{} = {:?}", &target.triple, build.cc(target)));
-    build.verbose(&format!("CFLAGS_{} = {:?}", &target.triple, cflags));
+    build.verbose(|| println!("CC_{} = {:?}", target.triple, build.cc(target)));
+    build.verbose(|| println!("CFLAGS_{} = {cflags:?}", target.triple));
     if let Ok(cxx) = build.cxx(target) {
-        let cxxflags = build.cflags(target, GitRepo::Rustc, CLang::Cxx);
-        build.verbose(&format!("CXX_{} = {:?}", &target.triple, cxx));
-        build.verbose(&format!("CXXFLAGS_{} = {:?}", &target.triple, cxxflags));
+        let mut cxxflags = build.cc_handled_clags(target, CLang::Cxx);
+        cxxflags.extend(build.cc_unhandled_cflags(target, GitRepo::Rustc, CLang::Cxx));
+        build.verbose(|| println!("CXX_{} = {cxx:?}", target.triple));
+        build.verbose(|| println!("CXXFLAGS_{} = {cxxflags:?}", target.triple));
     }
     if let Some(ar) = ar {
-        build.verbose(&format!("AR_{} = {:?}", &target.triple, ar));
+        build.verbose(|| println!("AR_{} = {ar:?}", target.triple));
         build.ar.borrow_mut().insert(target, ar);
     }
 
@@ -172,11 +182,9 @@ fn default_compiler(
         // When compiling for android we may have the NDK configured in the
         // config.toml in which case we look there. Otherwise the default
         // compiler already takes into account the triple in question.
-        t if t.contains("android") => build
-            .config
-            .android_ndk
-            .as_ref()
-            .map(|ndk| ndk_compiler(compiler, &*target.triple, ndk)),
+        t if t.contains("android") => {
+            build.config.android_ndk.as_ref().map(|ndk| ndk_compiler(compiler, &target.triple, ndk))
+        }
 
         // The default gcc version from OpenBSD may be too old, try using egcc,
         // which is a gcc version from ports, if this is the case.
@@ -187,14 +195,15 @@ fn default_compiler(
                 return None;
             }
 
-            let output = output(c.to_command().arg("--version"));
+            let mut cmd = BootstrapCommand::from(c.to_command());
+            let output = cmd.arg("--version").run_capture_stdout(build).stdout();
             let i = output.find(" 4.")?;
             match output[i + 3..].chars().next().unwrap() {
                 '0'..='6' => {}
                 _ => return None,
             }
             let alternative = format!("e{gnu_compiler}");
-            if Command::new(&alternative).output().is_ok() {
+            if command(&alternative).run_capture(build).is_success() {
                 Some(PathBuf::from(alternative))
             } else {
                 None
@@ -225,12 +234,22 @@ fn default_compiler(
             }
         }
 
+        t if t.contains("-wasi") => {
+            let root = PathBuf::from(std::env::var_os("WASI_SDK_PATH")?);
+            let compiler = match compiler {
+                Language::C => format!("{t}-clang"),
+                Language::CPlusPlus => format!("{t}-clang++"),
+            };
+            let compiler = root.join("bin").join(compiler);
+            Some(compiler)
+        }
+
         _ => None,
     }
 }
 
 pub(crate) fn ndk_compiler(compiler: Language, triple: &str, ndk: &Path) -> PathBuf {
-    let mut triple_iter = triple.split("-");
+    let mut triple_iter = triple.split('-');
     let triple_translated = if let Some(arch) = triple_iter.next() {
         let arch_new = match arch {
             "arm" | "armv7" | "armv7neon" | "thumbv7" | "thumbv7neon" => "armv7a",
@@ -241,10 +260,8 @@ pub(crate) fn ndk_compiler(compiler: Language, triple: &str, ndk: &Path) -> Path
         triple.to_string()
     };
 
-    // API 19 is the earliest API level supported by NDK r25b but AArch64 and x86_64 support
-    // begins at API level 21.
-    let api_level =
-        if triple.contains("aarch64") || triple.contains("x86_64") { "21" } else { "19" };
+    // The earliest API supported by NDK r26d is 21.
+    let api_level = "21";
     let compiler = format!("{}{}-{}", triple_translated, api_level, compiler.clang());
     let host_tag = if cfg!(target_os = "macos") {
         // The NDK uses universal binaries, so this is correct even on ARM.
@@ -252,7 +269,7 @@ pub(crate) fn ndk_compiler(compiler: Language, triple: &str, ndk: &Path) -> Path
     } else if cfg!(target_os = "windows") {
         "windows-x86_64"
     } else {
-        // NDK r25b only has official releases for macOS, Windows and Linux.
+        // NDK r26d only has official releases for macOS, Windows and Linux.
         // Try the Linux directory everywhere else, on the assumption that the OS has an
         // emulation layer that can cope (e.g. BSDs).
         "linux-x86_64"

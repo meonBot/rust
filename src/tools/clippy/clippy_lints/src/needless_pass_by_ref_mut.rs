@@ -1,36 +1,33 @@
 use super::needless_pass_by_value::requires_exact_signature;
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::source::snippet;
-use clippy_utils::visitors::for_each_expr_with_closures;
-use clippy_utils::{get_parent_node, inherits_cfg, is_from_proc_macro, is_self};
-use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
+use clippy_utils::visitors::for_each_expr;
+use clippy_utils::{inherits_cfg, is_from_proc_macro, is_self};
+use core::ops::ControlFlow;
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_errors::Applicability;
-use rustc_hir::intravisit::{walk_qpath, FnKind, Visitor};
+use rustc_hir::intravisit::FnKind;
 use rustc_hir::{
     BlockCheckMode, Body, Closure, Expr, ExprKind, FnDecl, HirId, HirIdMap, HirIdSet, Impl, ItemKind, Mutability, Node,
-    PatKind, QPath,
+    PatKind,
 };
 use rustc_hir_typeck::expr_use_visitor as euv;
-use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::hir::map::associated_body;
-use rustc_middle::hir::nested_filter::OnlyBodies;
 use rustc_middle::mir::FakeReadCause;
 use rustc_middle::ty::{self, Ty, TyCtxt, UpvarId, UpvarPath};
 use rustc_session::impl_lint_pass;
+use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::kw;
-use rustc_span::Span;
-use rustc_target::spec::abi::Abi;
-
-use core::ops::ControlFlow;
+use rustc_abi::ExternAbi;
 
 declare_clippy_lint! {
     /// ### What it does
     /// Check if a `&mut` function argument is actually used mutably.
     ///
     /// Be careful if the function is publicly reexported as it would break compatibility with
-    /// users of this function.
+    /// users of this function, when the users pass this function as an argument.
     ///
     /// ### Why is this bad?
     /// Less `mut` means less fights with the borrow checker. It can also lead to more
@@ -54,7 +51,6 @@ declare_clippy_lint! {
     "using a `&mut` argument when it's not mutated"
 }
 
-#[derive(Clone)]
 pub struct NeedlessPassByRefMut<'tcx> {
     avoid_breaking_exported_api: bool,
     used_fn_def_ids: FxHashSet<LocalDefId>,
@@ -62,9 +58,9 @@ pub struct NeedlessPassByRefMut<'tcx> {
 }
 
 impl NeedlessPassByRefMut<'_> {
-    pub fn new(avoid_breaking_exported_api: bool) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            avoid_breaking_exported_api,
+            avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
             used_fn_def_ids: FxHashSet::default(),
             fn_def_ids_to_maybe_unused_mut: FxIndexMap::default(),
         }
@@ -85,7 +81,9 @@ fn should_skip<'tcx>(
     }
 
     if is_self(arg) {
-        return true;
+        // Interestingly enough, `self` arguments make `is_from_proc_macro` return `true`, hence why
+        // we return early here.
+        return false;
     }
 
     if let PatKind::Binding(.., name, _) = arg.pat.kind {
@@ -102,9 +100,8 @@ fn should_skip<'tcx>(
 fn check_closures<'tcx>(
     ctx: &mut MutablyUsedVariablesCtxt<'tcx>,
     cx: &LateContext<'tcx>,
-    infcx: &InferCtxt<'tcx>,
     checked_closures: &mut FxHashSet<LocalDefId>,
-    closures: FxHashSet<LocalDefId>,
+    closures: FxIndexSet<LocalDefId>,
 ) {
     let hir = cx.tcx.hir();
     for closure in closures {
@@ -113,12 +110,15 @@ fn check_closures<'tcx>(
         }
         ctx.prev_bind = None;
         ctx.prev_move_to_closure.clear();
-        if let Some(body) = hir
-            .find_by_def_id(closure)
-            .and_then(associated_body)
+        if let Some(body) = cx
+            .tcx
+            .hir_node_by_def_id(closure)
+            .associated_body()
             .map(|(_, body_id)| hir.body(body_id))
         {
-            euv::ExprUseVisitor::new(ctx, infcx, closure, cx.param_env, cx.typeck_results()).consume_body(body);
+            euv::ExprUseVisitor::for_clippy(cx, closure, &mut *ctx)
+                .consume_body(body)
+                .into_ok();
         }
     }
 }
@@ -137,6 +137,10 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByRefMut<'tcx> {
             return;
         }
 
+        if self.avoid_breaking_exported_api && cx.effective_visibilities.is_exported(fn_def_id) {
+            return;
+        }
+
         let hir_id = cx.tcx.local_def_id_to_hir_id(fn_def_id);
         let is_async = match kind {
             FnKind::ItemFn(.., header) => {
@@ -145,7 +149,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByRefMut<'tcx> {
                     return;
                 }
                 let attrs = cx.tcx.hir().attrs(hir_id);
-                if header.abi != Abi::Rust || requires_exact_signature(attrs) {
+                if header.abi != ExternAbi::Rust || requires_exact_signature(attrs) {
                     return;
                 }
                 header.is_async()
@@ -161,7 +165,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByRefMut<'tcx> {
         };
 
         // Exclude non-inherent impls
-        if let Some(Node::Item(item)) = cx.tcx.hir().find_parent(hir_id) {
+        if let Node::Item(item) = cx.tcx.parent_hir_node(hir_id) {
             if matches!(
                 item.kind,
                 ItemKind::Impl(Impl { of_trait: Some(_), .. }) | ItemKind::Trait(..)
@@ -179,46 +183,47 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByRefMut<'tcx> {
             .iter()
             .zip(fn_sig.inputs())
             .zip(body.params)
-            .filter(|((&input, &ty), arg)| !should_skip(cx, input, ty, arg))
+            .filter(|&((&input, &ty), arg)| !should_skip(cx, input, ty, arg))
             .peekable();
         if it.peek().is_none() {
             return;
         }
         // Collect variables mutably used and spans which will need dereferencings from the
         // function body.
-        let MutablyUsedVariablesCtxt { mutably_used_vars, .. } = {
+        let mutably_used_vars = {
             let mut ctx = MutablyUsedVariablesCtxt {
                 mutably_used_vars: HirIdSet::default(),
                 prev_bind: None,
                 prev_move_to_closure: HirIdSet::default(),
                 aliases: HirIdMap::default(),
-                async_closures: FxHashSet::default(),
+                async_closures: FxIndexSet::default(),
                 tcx: cx.tcx,
             };
-            let infcx = cx.tcx.infer_ctxt().build();
-            euv::ExprUseVisitor::new(&mut ctx, &infcx, fn_def_id, cx.param_env, cx.typeck_results()).consume_body(body);
+            euv::ExprUseVisitor::for_clippy(cx, fn_def_id, &mut ctx)
+                .consume_body(body)
+                .into_ok();
 
             let mut checked_closures = FxHashSet::default();
 
             // We retrieve all the closures declared in the function because they will not be found
             // by `euv::Delegate`.
-            let mut closures: FxHashSet<LocalDefId> = FxHashSet::default();
-            for_each_expr_with_closures(cx, body, |expr| {
+            let mut closures: FxIndexSet<LocalDefId> = FxIndexSet::default();
+            for_each_expr(cx, body, |expr| {
                 if let ExprKind::Closure(closure) = expr.kind {
                     closures.insert(closure.def_id);
                 }
                 ControlFlow::<()>::Continue(())
             });
-            check_closures(&mut ctx, cx, &infcx, &mut checked_closures, closures);
+            check_closures(&mut ctx, cx, &mut checked_closures, closures);
 
             if is_async {
                 while !ctx.async_closures.is_empty() {
                     let async_closures = ctx.async_closures.clone();
                     ctx.async_closures.clear();
-                    check_closures(&mut ctx, cx, &infcx, &mut checked_closures, async_closures);
+                    check_closures(&mut ctx, cx, &mut checked_closures, async_closures);
                 }
             }
-            ctx
+            ctx.generate_mutably_used_ids_from_aliases()
         };
         for ((&input, &_), arg) in it {
             // Only take `&mut` arguments.
@@ -233,20 +238,33 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByRefMut<'tcx> {
         }
     }
 
-    fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
-        cx.tcx.hir().visit_all_item_likes_in_crate(&mut FnNeedsMutVisitor {
-            cx,
-            used_fn_def_ids: &mut self.used_fn_def_ids,
-        });
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
+        // #11182; do not lint if mutability is required elsewhere
+        if let ExprKind::Path(..) = expr.kind
+            && let ty::FnDef(def_id, _) = cx.typeck_results().expr_ty(expr).kind()
+            && let Some(def_id) = def_id.as_local()
+        {
+            if let Node::Expr(e) = cx.tcx.parent_hir_node(expr.hir_id)
+                && let ExprKind::Call(call, _) = e.kind
+                && call.hir_id == expr.hir_id
+            {
+                return;
+            }
 
+            // We don't need to check each argument individually as you cannot coerce a function
+            // taking `&mut` -> `&`, for some reason, so if we've gotten this far we know it's
+            // passed as a `fn`-like argument (or is unified) and should ignore every "unused"
+            // argument entirely
+            self.used_fn_def_ids.insert(def_id);
+        }
+    }
+
+    fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
         for (fn_def_id, unused) in self
             .fn_def_ids_to_maybe_unused_mut
             .iter()
             .filter(|(def_id, _)| !self.used_fn_def_ids.contains(def_id))
         {
-            let show_semver_warning =
-                self.avoid_breaking_exported_api && cx.effective_visibilities.is_exported(*fn_def_id);
-
             let mut is_cfged = None;
             for input in unused {
                 // If the argument is never used mutably, we emit the warning.
@@ -266,7 +284,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByRefMut<'tcx> {
                                 format!("&{}", snippet(cx, cx.tcx.hir().span(inner_ty.ty.hir_id), "_"),),
                                 Applicability::Unspecified,
                             );
-                            if show_semver_warning {
+                            if cx.effective_visibilities.is_exported(*fn_def_id) {
                                 diag.warn("changing this function will impact semver compatibility");
                             }
                             if *is_cfged {
@@ -289,17 +307,27 @@ struct MutablyUsedVariablesCtxt<'tcx> {
     /// use of a variable.
     prev_move_to_closure: HirIdSet,
     aliases: HirIdMap<HirId>,
-    async_closures: FxHashSet<LocalDefId>,
+    async_closures: FxIndexSet<LocalDefId>,
     tcx: TyCtxt<'tcx>,
 }
 
-impl<'tcx> MutablyUsedVariablesCtxt<'tcx> {
-    fn add_mutably_used_var(&mut self, mut used_id: HirId) {
-        while let Some(id) = self.aliases.get(&used_id) {
-            self.mutably_used_vars.insert(used_id);
-            used_id = *id;
-        }
+impl MutablyUsedVariablesCtxt<'_> {
+    fn add_mutably_used_var(&mut self, used_id: HirId) {
         self.mutably_used_vars.insert(used_id);
+    }
+
+    // Because the alias may come after the mutable use of a variable, we need to fill the map at
+    // the end.
+    fn generate_mutably_used_ids_from_aliases(mut self) -> HirIdSet {
+        let all_ids = self.mutably_used_vars.iter().copied().collect::<Vec<_>>();
+        for mut used_id in all_ids {
+            while let Some(id) = self.aliases.get(&used_id) {
+                self.mutably_used_vars.insert(used_id);
+                used_id = *id;
+            }
+            self.mutably_used_vars.insert(used_id);
+        }
+        self.mutably_used_vars
     }
 
     fn would_be_alias_cycle(&self, alias: HirId, mut target: HirId) -> bool {
@@ -365,7 +393,8 @@ impl<'tcx> euv::Delegate<'tcx> for MutablyUsedVariablesCtxt<'tcx> {
                 self.add_mutably_used_var(*vid);
             }
             self.prev_bind = None;
-            self.prev_move_to_closure.remove(vid);
+            // FIXME(rust/#120456) - is `swap_remove` correct?
+            self.prev_move_to_closure.swap_remove(vid);
         }
     }
 
@@ -388,8 +417,8 @@ impl<'tcx> euv::Delegate<'tcx> for MutablyUsedVariablesCtxt<'tcx> {
             // a closure, it'll return this variant whereas if you have just an index access, it'll
             // return `ImmBorrow`. So if there is "Unique" and it's a mutable reference, we add it
             // to the mutably used variables set.
-            if borrow == ty::BorrowKind::MutBorrow
-                || (borrow == ty::BorrowKind::UniqueImmBorrow && base_ty.ref_mutability() == Some(Mutability::Mut))
+            if borrow == ty::BorrowKind::Mutable
+                || (borrow == ty::BorrowKind::UniqueImmutable && base_ty.ref_mutability() == Some(Mutability::Mut))
             {
                 self.add_mutably_used_var(*vid);
             } else if self.is_in_unsafe_block(id) {
@@ -397,7 +426,7 @@ impl<'tcx> euv::Delegate<'tcx> for MutablyUsedVariablesCtxt<'tcx> {
                 // upon!
                 self.add_mutably_used_var(*vid);
             }
-        } else if borrow == ty::ImmBorrow {
+        } else if borrow == ty::BorrowKind::Immutable {
             // If there is an `async block`, it'll contain a call to a closure which we need to
             // go into to ensure all "mutate" checks are found.
             if let Node::Expr(Expr {
@@ -412,7 +441,7 @@ impl<'tcx> euv::Delegate<'tcx> for MutablyUsedVariablesCtxt<'tcx> {
                         ],
                     ),
                 ..
-            }) = self.tcx.hir().get(cmt.hir_id)
+            }) = self.tcx.hir_node(cmt.hir_id)
             {
                 self.async_closures.insert(*def_id);
             }
@@ -497,51 +526,6 @@ impl<'tcx> euv::Delegate<'tcx> for MutablyUsedVariablesCtxt<'tcx> {
             if self.is_in_unsafe_block(id) {
                 self.add_mutably_used_var(*vid);
             }
-        }
-    }
-}
-
-/// A final pass to check for paths referencing this function that require the argument to be
-/// `&mut`, basically if the function is ever used as a `fn`-like argument.
-struct FnNeedsMutVisitor<'a, 'tcx> {
-    cx: &'a LateContext<'tcx>,
-    used_fn_def_ids: &'a mut FxHashSet<LocalDefId>,
-}
-
-impl<'tcx> Visitor<'tcx> for FnNeedsMutVisitor<'_, 'tcx> {
-    type NestedFilter = OnlyBodies;
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.cx.tcx.hir()
-    }
-
-    fn visit_qpath(&mut self, qpath: &'tcx QPath<'tcx>, hir_id: HirId, _: Span) {
-        walk_qpath(self, qpath, hir_id);
-
-        let Self { cx, used_fn_def_ids } = self;
-
-        // #11182; do not lint if mutability is required elsewhere
-        if let Node::Expr(expr) = cx.tcx.hir().get(hir_id)
-            && let Some(parent) = get_parent_node(cx.tcx, expr.hir_id)
-            && let ty::FnDef(def_id, _) = cx
-                .tcx
-                .typeck(cx.tcx.hir().enclosing_body_owner(hir_id))
-                .expr_ty(expr)
-                .kind()
-            && let Some(def_id) = def_id.as_local()
-        {
-            if let Node::Expr(e) = parent
-                && let ExprKind::Call(call, _) = e.kind
-                && call.hir_id == expr.hir_id
-            {
-                return;
-            }
-
-            // We don't need to check each argument individually as you cannot coerce a function
-            // taking `&mut` -> `&`, for some reason, so if we've gotten this far we know it's
-            // passed as a `fn`-like argument (or is unified) and should ignore every "unused"
-            // argument entirely
-            used_fn_def_ids.insert(def_id);
         }
     }
 }

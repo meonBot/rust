@@ -2,18 +2,18 @@
 // Checks that we leave the target alone when MACOSX_DEPLOYMENT_TARGET is unset.
 // See issue #60235.
 
-// compile-flags: -O --target=x86_64-apple-darwin --crate-type=rlib
-// needs-llvm-components: x86
-// unset-rustc-env:MACOSX_DEPLOYMENT_TARGET
+//@ compile-flags: -Copt-level=3 --target=x86_64-apple-darwin --crate-type=rlib
+//@ needs-llvm-components: x86
+//@ unset-rustc-env:MACOSX_DEPLOYMENT_TARGET
 #![feature(no_core, lang_items)]
 #![no_core]
 
-#[lang="sized"]
-trait Sized { }
-#[lang="freeze"]
-trait Freeze { }
-#[lang="copy"]
-trait Copy { }
+#[lang = "sized"]
+trait Sized {}
+#[lang = "freeze"]
+trait Freeze {}
+#[lang = "copy"]
+trait Copy {}
 
 #[repr(C)]
 pub struct Bool {

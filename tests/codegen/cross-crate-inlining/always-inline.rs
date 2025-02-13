@@ -1,5 +1,5 @@
-// compile-flags: -O
-// aux-build:always.rs
+//@ compile-flags: -Copt-level=3
+//@ aux-build:always.rs
 
 #![crate_type = "lib"]
 

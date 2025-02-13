@@ -1,55 +1,82 @@
+// tidy-alphabetical-start
+#![allow(rustc::usage_of_ty_tykind)]
+#![allow(rustc::usage_of_type_ir_inherent)]
 #![cfg_attr(
     feature = "nightly",
-    feature(associated_type_defaults, min_specialization, never_type, rustc_attrs)
+    feature(associated_type_defaults, never_type, rustc_attrs, negative_impls)
 )]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 #![cfg_attr(feature = "nightly", allow(internal_features))]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
-#[cfg(feature = "nightly")]
 extern crate self as rustc_type_ir;
 
-#[macro_use]
-extern crate bitflags;
-#[cfg(feature = "nightly")]
-#[macro_use]
-extern crate rustc_macros;
-
-#[cfg(feature = "nightly")]
-use rustc_data_structures::sync::Lrc;
 use std::fmt;
 use std::hash::Hash;
-#[cfg(not(feature = "nightly"))]
-use std::sync::Arc as Lrc;
 
 #[cfg(feature = "nightly")]
-pub mod codec;
-pub mod fold;
-pub mod ty_info;
-pub mod ty_kind;
-pub mod visit;
+use rustc_macros::{Decodable, Encodable, HashStable_NoContext};
 
+// These modules are `pub` since they are not glob-imported.
+#[macro_use]
+pub mod visit;
+#[cfg(feature = "nightly")]
+pub mod codec;
+pub mod data_structures;
+pub mod elaborate;
+pub mod error;
+pub mod fast_reject;
+pub mod fold;
+#[cfg_attr(feature = "nightly", rustc_diagnostic_item = "type_ir_inherent")]
+pub mod inherent;
+pub mod ir_print;
+pub mod lang_items;
+pub mod lift;
+pub mod outlives;
+pub mod relate;
+pub mod search_graph;
+pub mod solve;
+
+// These modules are not `pub` since they are glob-imported.
 #[macro_use]
 mod macros;
+mod binder;
 mod canonical;
 mod const_kind;
-mod debug;
 mod flags;
+mod generic_arg;
+mod infer_ctxt;
 mod interner;
+mod opaque_ty;
+mod predicate;
 mod predicate_kind;
 mod region_kind;
+mod ty_info;
+mod ty_kind;
+mod upcast;
 
+pub use AliasTyKind::*;
+pub use DynKind::*;
+pub use InferTy::*;
+pub use RegionKind::*;
+pub use TyKind::*;
+pub use Variance::*;
+pub use binder::*;
 pub use canonical::*;
 #[cfg(feature = "nightly")]
 pub use codec::*;
 pub use const_kind::*;
-pub use debug::{DebugWithInfcx, InferCtxtLike, WithInfcx};
 pub use flags::*;
+pub use generic_arg::*;
+pub use infer_ctxt::*;
 pub use interner::*;
+pub use opaque_ty::*;
+pub use predicate::*;
 pub use predicate_kind::*;
 pub use region_kind::*;
 pub use ty_info::*;
 pub use ty_kind::*;
+pub use upcast::*;
 
 rustc_index::newtype_index! {
     /// A [De Bruijn index][dbi] is a standard means of representing
@@ -177,8 +204,8 @@ pub fn debug_bound_var<T: std::fmt::Write>(
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "nightly", derive(Decodable, Encodable, Hash, HashStable_NoContext))]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "nightly", derive(Decodable, Encodable, HashStable_NoContext))]
 #[cfg_attr(feature = "nightly", rustc_pass_by_value)]
 pub enum Variance {
     Covariant,     // T<A> <: T<B> iff A <: B -- e.g., function return type
@@ -303,7 +330,7 @@ rustc_index::newtype_index! {
 }
 
 impl UniverseIndex {
-    pub const ROOT: UniverseIndex = UniverseIndex::from_u32(0);
+    pub const ROOT: UniverseIndex = UniverseIndex::ZERO;
 
     /// Returns the "next" universe index in order -- this new index
     /// is considered to extend all previous universes. This
@@ -319,21 +346,32 @@ impl UniverseIndex {
     /// name the region `'a`, but that region was not nameable from
     /// `U` because it was not in scope there.
     pub fn next_universe(self) -> UniverseIndex {
-        UniverseIndex::from_u32(self.private.checked_add(1).unwrap())
+        UniverseIndex::from_u32(self.as_u32().checked_add(1).unwrap())
     }
 
     /// Returns `true` if `self` can name a name from `other` -- in other words,
     /// if the set of names in `self` is a superset of those in
     /// `other` (`self >= other`).
     pub fn can_name(self, other: UniverseIndex) -> bool {
-        self.private >= other.private
+        self >= other
     }
 
     /// Returns `true` if `self` cannot name some names from `other` -- in other
     /// words, if the set of names in `self` is a strict subset of
     /// those in `other` (`self < other`).
     pub fn cannot_name(self, other: UniverseIndex) -> bool {
-        self.private < other.private
+        self < other
+    }
+
+    /// Returns `true` if `self` is the root universe, otherwise false.
+    pub fn is_root(self) -> bool {
+        self == Self::ROOT
+    }
+}
+
+impl Default for UniverseIndex {
+    fn default() -> Self {
+        Self::ROOT
     }
 }
 
@@ -344,4 +382,60 @@ rustc_index::newtype_index! {
     #[debug_format = "{}"]
     #[gate_rustc_only]
     pub struct BoundVar {}
+}
+
+impl<I: Interner> inherent::BoundVarLike<I> for BoundVar {
+    fn var(self) -> BoundVar {
+        self
+    }
+
+    fn assert_eq(self, _var: I::BoundVarKind) {
+        unreachable!("FIXME: We really should have a separate `BoundConst` for consts")
+    }
+}
+
+/// Represents the various closure traits in the language. This
+/// will determine the type of the environment (`self`, in the
+/// desugaring) argument that the closure expects.
+///
+/// You can get the environment type of a closure using
+/// `tcx.closure_env_ty()`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, HashStable_NoContext))]
+pub enum ClosureKind {
+    Fn,
+    FnMut,
+    FnOnce,
+}
+
+impl ClosureKind {
+    /// This is the initial value used when doing upvar inference.
+    pub const LATTICE_BOTTOM: ClosureKind = ClosureKind::Fn;
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ClosureKind::Fn => "Fn",
+            ClosureKind::FnMut => "FnMut",
+            ClosureKind::FnOnce => "FnOnce",
+        }
+    }
+
+    /// Returns `true` if a type that impls this closure kind
+    /// must also implement `other`.
+    #[rustfmt::skip]
+    pub fn extends(self, other: ClosureKind) -> bool {
+        use ClosureKind::*;
+        match (self, other) {
+              (Fn, Fn | FnMut | FnOnce)
+            | (FnMut,   FnMut | FnOnce)
+            | (FnOnce,          FnOnce) => true,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for ClosureKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_str().fmt(f)
+    }
 }

@@ -3,13 +3,13 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 
 /// A trivial wrapper for [`memmap2::Mmap`] (or `Vec<u8>` on WASM).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(miri, target_arch = "wasm32")))]
 pub struct Mmap(memmap2::Mmap);
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(miri, target_arch = "wasm32"))]
 pub struct Mmap(Vec<u8>);
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(miri, target_arch = "wasm32")))]
 impl Mmap {
     /// # Safety
     ///
@@ -18,12 +18,18 @@ impl Mmap {
     /// However in practice most callers do not ensure this, so uses of this function are likely unsound.
     #[inline]
     pub unsafe fn map(file: File) -> io::Result<Self> {
-        // Safety: the caller must ensure that this is safe.
-        unsafe { memmap2::Mmap::map(&file).map(Mmap) }
+        // By default, memmap2 creates shared mappings, implying that we could see updates to the
+        // file through the mapping. That would violate our precondition; so by requesting a
+        // map_copy_read_only we do not lose anything.
+        // This mapping mode also improves our support for filesystems such as cacheless virtiofs.
+        // For more details see https://github.com/rust-lang/rust/issues/122262
+        //
+        // SAFETY: The caller must ensure that this is safe.
+        unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file).map(Mmap) }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(miri, target_arch = "wasm32"))]
 impl Mmap {
     #[inline]
     pub unsafe fn map(mut file: File) -> io::Result<Self> {
@@ -50,13 +56,13 @@ impl AsRef<[u8]> for Mmap {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(miri, target_arch = "wasm32")))]
 pub struct MmapMut(memmap2::MmapMut);
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(miri, target_arch = "wasm32"))]
 pub struct MmapMut(Vec<u8>);
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(miri, target_arch = "wasm32")))]
 impl MmapMut {
     #[inline]
     pub fn map_anon(len: usize) -> io::Result<Self> {
@@ -76,7 +82,7 @@ impl MmapMut {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(miri, target_arch = "wasm32"))]
 impl MmapMut {
     #[inline]
     pub fn map_anon(len: usize) -> io::Result<Self> {

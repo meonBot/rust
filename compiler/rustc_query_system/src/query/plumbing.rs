@@ -2,33 +2,32 @@
 //! generate the actual methods on tcx which find and execute the provider,
 //! manage the caches, and so forth.
 
-use crate::dep_graph::DepGraphData;
-use crate::dep_graph::{DepContext, DepNode, DepNodeIndex, DepNodeParams};
-use crate::ich::StableHashingContext;
-use crate::query::caches::QueryCache;
-#[cfg(parallel_compiler)]
-use crate::query::job::QueryLatch;
-use crate::query::job::{report_cycle, QueryInfo, QueryJob, QueryJobId, QueryJobInfo};
-use crate::query::SerializedDepNodeIndex;
-use crate::query::{QueryContext, QueryMap, QuerySideEffects, QueryStackFrame};
-use crate::HandleCycleError;
-use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::sharded::Sharded;
-use rustc_data_structures::stack::ensure_sufficient_stack;
-use rustc_data_structures::sync::Lock;
-#[cfg(parallel_compiler)]
-use rustc_data_structures::{outline, sync};
-use rustc_errors::{DiagnosticBuilder, ErrorGuaranteed, FatalError, StashKey};
-use rustc_span::{Span, DUMMY_SP};
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem;
+
+use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::sharded::Sharded;
+use rustc_data_structures::stack::ensure_sufficient_stack;
+use rustc_data_structures::sync::Lock;
+use rustc_data_structures::{outline, sync};
+use rustc_errors::{Diag, FatalError, StashKey};
+use rustc_span::{DUMMY_SP, Span};
 use thin_vec::ThinVec;
+use tracing::instrument;
 
 use super::QueryConfig;
+use crate::HandleCycleError;
+use crate::dep_graph::{DepContext, DepGraphData, DepNode, DepNodeIndex, DepNodeParams};
+use crate::ich::StableHashingContext;
+use crate::query::caches::QueryCache;
+use crate::query::job::{QueryInfo, QueryJob, QueryJobId, QueryJobInfo, QueryLatch, report_cycle};
+use crate::query::{
+    QueryContext, QueryMap, QuerySideEffects, QueryStackFrame, SerializedDepNodeIndex,
+};
 
 pub struct QueryState<K> {
     active: Sharded<FxHashMap<K, QueryResult>>,
@@ -42,6 +41,18 @@ enum QueryResult {
     /// The query panicked. Queries trying to wait on this will raise a fatal error which will
     /// silently panic.
     Poisoned,
+}
+
+impl QueryResult {
+    /// Unwraps the query job expecting that it has started.
+    fn expect_job(self) -> QueryJob {
+        match self {
+            Self::Started(job) => job,
+            Self::Poisoned => {
+                panic!("job for query failed to start and was poisoned")
+            }
+        }
+    }
 }
 
 impl<K> QueryState<K>
@@ -112,7 +123,7 @@ fn handle_cycle_error<Q, Qcx>(
     query: Q,
     qcx: Qcx,
     cycle_error: &CycleError,
-    mut error: DiagnosticBuilder<'_, ErrorGuaranteed>,
+    error: Diag<'_>,
 ) -> Q::Value
 where
     Q: QueryConfig<Qcx>,
@@ -122,27 +133,26 @@ where
     match query.handle_cycle_error() {
         Error => {
             let guar = error.emit();
-            query.value_from_cycle_error(*qcx.dep_context(), &cycle_error.cycle, guar)
+            query.value_from_cycle_error(*qcx.dep_context(), cycle_error, guar)
         }
         Fatal => {
             error.emit();
-            qcx.dep_context().sess().abort_if_errors();
+            qcx.dep_context().sess().dcx().abort_if_errors();
             unreachable!()
         }
         DelayBug => {
             let guar = error.delay_as_bug();
-            query.value_from_cycle_error(*qcx.dep_context(), &cycle_error.cycle, guar)
+            query.value_from_cycle_error(*qcx.dep_context(), cycle_error, guar)
         }
         Stash => {
             let guar = if let Some(root) = cycle_error.cycle.first()
                 && let Some(span) = root.query.span
             {
-                error.stash(span, StashKey::Cycle);
-                qcx.dep_context().sess().span_delayed_bug(span, "delayed cycle error")
+                error.stash(span, StashKey::Cycle).unwrap()
             } else {
                 error.emit()
             };
-            query.value_from_cycle_error(*qcx.dep_context(), &cycle_error.cycle, guar)
+            query.value_from_cycle_error(*qcx.dep_context(), cycle_error, guar)
         }
     }
 }
@@ -168,11 +178,15 @@ where
         cache.complete(key, result, dep_node_index);
 
         let job = {
-            let mut lock = state.active.lock_shard_by_value(&key);
-            match lock.remove(&key).unwrap() {
-                QueryResult::Started(job) => job,
-                QueryResult::Poisoned => panic!(),
-            }
+            let val = {
+                // don't keep the lock during the `unwrap()` of the retrieved value, or we taint the
+                // underlying shard.
+                // since unwinding also wants to look at this map, this can also prevent a double
+                // panic.
+                let mut lock = state.active.lock_shard_by_value(&key);
+                lock.remove(&key)
+            };
+            val.unwrap().expect_job()
         };
 
         job.signal_complete();
@@ -190,10 +204,8 @@ where
         let state = self.state;
         let job = {
             let mut shard = state.active.lock_shard_by_value(&self.key);
-            let job = match shard.remove(&self.key).unwrap() {
-                QueryResult::Started(job) => job,
-                QueryResult::Poisoned => panic!(),
-            };
+            let job = shard.remove(&self.key).unwrap().expect_job();
+
             shard.insert(self.key, QueryResult::Poisoned);
             job
         };
@@ -204,16 +216,16 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CycleError {
+pub struct CycleError {
     /// The query and related span that uses the cycle.
     pub usage: Option<(Span, QueryStackFrame)>,
     pub cycle: Vec<QueryInfo>,
 }
 
-/// Checks if the query is already computed and in the cache.
-/// It returns the shard index and a lock guard to the shard,
-/// which will be used if the query is not in the cache and we need
-/// to compute it.
+/// Checks whether there is already a value for this key in the in-memory
+/// query cache, returning that value if present.
+///
+/// (Also performs some associated bookkeeping, if a value was found.)
 #[inline(always)]
 pub fn try_get_cached<Tcx, C>(tcx: Tcx, cache: &C, key: &C::Key) -> Option<C::Value>
 where
@@ -248,7 +260,6 @@ where
 }
 
 #[inline(always)]
-#[cfg(parallel_compiler)]
 fn wait_for_query<Q, Qcx>(
     query: Q,
     qcx: Qcx,
@@ -277,11 +288,13 @@ where
                     // We didn't find the query result in the query cache. Check if it was
                     // poisoned due to a panic instead.
                     let lock = query.query_state(qcx).active.get_shard_by_value(&key).lock();
+
                     match lock.get(&key) {
                         // The query we waited on panicked. Continue unwinding here.
                         Some(QueryResult::Poisoned) => FatalError.raise(),
                         _ => panic!(
-                            "query result must in the cache or the query must be poisoned after a wait"
+                            "query '{}' result must be in the cache or the query must be poisoned after a wait",
+                            query.name()
                         ),
                     }
                 })
@@ -317,7 +330,7 @@ where
     // re-executing the query since `try_start` only checks that the query is not currently
     // executing, but another thread may have already completed the query and stores it result
     // in the query cache.
-    if cfg!(parallel_compiler) && qcx.dep_context().sess().threads() > 1 {
+    if qcx.dep_context().sess().threads() > 1 {
         if let Some((value, index)) = query.query_cache(qcx).lookup(&key) {
             qcx.dep_context().profiler().query_cache_hit(index.into());
             return (value, Some(index));
@@ -342,7 +355,6 @@ where
         Entry::Occupied(mut entry) => {
             match entry.get_mut() {
                 QueryResult::Started(job) => {
-                    #[cfg(parallel_compiler)]
                     if sync::is_dyn_thread_safe() {
                         // Get the latch out
                         let latch = job.latch();
@@ -419,18 +431,15 @@ where
             let formatter = query.format_value();
             if old_hash != new_hash {
                 // We have an inconsistency. This can happen if one of the two
-                // results is tainted by errors. In this case, delay a bug to
-                // ensure compilation is doomed.
-                qcx.dep_context().sess().span_delayed_bug(
-                    DUMMY_SP,
-                    format!(
-                        "Computed query value for {:?}({:?}) is inconsistent with fed value,\n\
+                // results is tainted by errors.
+                assert!(
+                    qcx.dep_context().sess().dcx().has_errors().is_some(),
+                    "Computed query value for {:?}({:?}) is inconsistent with fed value,\n\
                         computed={:#?}\nfed={:#?}",
-                        query.dep_kind(),
-                        key,
-                        formatter(&result),
-                        formatter(&cached_result),
-                    ),
+                    query.dep_kind(),
+                    key,
+                    formatter(&result),
+                    formatter(&cached_result),
                 );
             }
         }
@@ -511,9 +520,11 @@ where
     let (result, dep_node_index) =
         qcx.start_query(job_id, query.depth_limit(), Some(&diagnostics), || {
             if query.anon() {
-                return dep_graph_data.with_anon_task(*qcx.dep_context(), query.dep_kind(), || {
-                    query.compute(qcx, key)
-                });
+                return dep_graph_data.with_anon_task_inner(
+                    *qcx.dep_context(),
+                    query.dep_kind(),
+                    || query.compute(qcx, key),
+                );
             }
 
             // `to_dep_node` is expensive for some `DepKind`s.
@@ -531,10 +542,9 @@ where
 
     prof_timer.finish_with_query_invocation_id(dep_node_index.into());
 
-    let diagnostics = diagnostics.into_inner();
-    let side_effects = QuerySideEffects { diagnostics };
+    let side_effects = QuerySideEffects { diagnostics: diagnostics.into_inner() };
 
-    if std::intrinsics::unlikely(!side_effects.is_empty()) {
+    if std::intrinsics::unlikely(side_effects.maybe_any()) {
         if query.anon() {
             qcx.store_side_effects_for_anon_node(dep_node_index, side_effects);
         } else {
@@ -705,7 +715,7 @@ fn incremental_verify_ich_failed<Tcx>(
     let old_in_panic = INSIDE_VERIFY_PANIC.with(|in_panic| in_panic.replace(true));
 
     if old_in_panic {
-        tcx.sess().emit_err(crate::error::Reentrant);
+        tcx.sess().dcx().emit_err(crate::error::Reentrant);
     } else {
         let run_cmd = if let Some(crate_name) = &tcx.sess().opts.crate_name {
             format!("`cargo clean -p {crate_name}` or `cargo clean`")
@@ -714,7 +724,7 @@ fn incremental_verify_ich_failed<Tcx>(
         };
 
         let dep_node = tcx.dep_graph().data().unwrap().prev_node_of(prev_index);
-        tcx.sess().emit_err(crate::error::IncrementCompilation {
+        tcx.sess().dcx().emit_err(crate::error::IncrementCompilation {
             run_cmd,
             dep_node: format!("{dep_node:?}"),
         });

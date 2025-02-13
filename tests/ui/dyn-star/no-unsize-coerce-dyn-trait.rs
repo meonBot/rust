@@ -1,5 +1,5 @@
+#![expect(incomplete_features)]
 #![feature(dyn_star)]
-//~^ WARN the feature `dyn_star` is incomplete and may not be safe to use and/or cause compiler crashes
 
 trait A: B {}
 trait B {}

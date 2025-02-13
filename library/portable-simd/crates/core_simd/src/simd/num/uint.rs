@@ -1,5 +1,5 @@
 use super::sealed::Sealed;
-use crate::simd::{intrinsics, LaneCount, Simd, SimdCast, SimdElement, SupportedLaneCount};
+use crate::simd::{cmp::SimdOrd, LaneCount, Simd, SimdCast, SimdElement, SupportedLaneCount};
 
 /// Operations on SIMD vectors of unsigned integers.
 pub trait SimdUint: Copy + Sealed {
@@ -57,6 +57,22 @@ pub trait SimdUint: Copy + Sealed {
     /// assert_eq!(sat, Simd::splat(0));
     fn saturating_sub(self, second: Self) -> Self;
 
+    /// Lanewise absolute difference.
+    /// Every element becomes the absolute difference of `self` and `second`.
+    ///
+    /// # Examples
+    /// ```
+    /// # #![feature(portable_simd)]
+    /// # #[cfg(feature = "as_crate")] use core_simd::simd;
+    /// # #[cfg(not(feature = "as_crate"))] use core::simd;
+    /// # use simd::prelude::*;
+    /// use core::u32::MAX;
+    /// let a = Simd::from_array([0, MAX, 100, 20]);
+    /// let b = Simd::from_array([MAX, 0, 80, 200]);
+    /// assert_eq!(a.abs_diff(b), Simd::from_array([MAX, MAX, 20, 180]));
+    /// ```
+    fn abs_diff(self, second: Self) -> Self;
+
     /// Returns the sum of the elements of the vector, with wrapping addition.
     fn reduce_sum(self) -> Self::Scalar;
 
@@ -84,6 +100,12 @@ pub trait SimdUint: Copy + Sealed {
     /// Reverses the order of bits in each elemnent.
     /// The least significant bit becomes the most significant bit, second least-significant bit becomes second most-significant bit, etc.
     fn reverse_bits(self) -> Self;
+
+    /// Returns the number of ones in the binary representation of each element.
+    fn count_ones(self) -> Self;
+
+    /// Returns the number of zeros in the binary representation of each element.
+    fn count_zeros(self) -> Self;
 
     /// Returns the number of leading zeros in the binary representation of each element.
     fn leading_zeros(self) -> Self;
@@ -117,7 +139,7 @@ macro_rules! impl_trait {
             #[inline]
             fn cast<T: SimdCast>(self) -> Self::Cast<T> {
                 // Safety: supported types are guaranteed by SimdCast
-                unsafe { intrinsics::simd_as(self) }
+                unsafe { core::intrinsics::simd::simd_as(self) }
             }
 
             #[inline]
@@ -129,79 +151,97 @@ macro_rules! impl_trait {
             #[inline]
             fn saturating_add(self, second: Self) -> Self {
                 // Safety: `self` is a vector
-                unsafe { intrinsics::simd_saturating_add(self, second) }
+                unsafe { core::intrinsics::simd::simd_saturating_add(self, second) }
             }
 
             #[inline]
             fn saturating_sub(self, second: Self) -> Self {
                 // Safety: `self` is a vector
-                unsafe { intrinsics::simd_saturating_sub(self, second) }
+                unsafe { core::intrinsics::simd::simd_saturating_sub(self, second) }
+            }
+
+            #[inline]
+            fn abs_diff(self, second: Self) -> Self {
+                let max = self.simd_max(second);
+                let min = self.simd_min(second);
+                max - min
             }
 
             #[inline]
             fn reduce_sum(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_add_ordered(self, 0) }
+                unsafe { core::intrinsics::simd::simd_reduce_add_ordered(self, 0) }
             }
 
             #[inline]
             fn reduce_product(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_mul_ordered(self, 1) }
+                unsafe { core::intrinsics::simd::simd_reduce_mul_ordered(self, 1) }
             }
 
             #[inline]
             fn reduce_max(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_max(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_max(self) }
             }
 
             #[inline]
             fn reduce_min(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_min(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_min(self) }
             }
 
             #[inline]
             fn reduce_and(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_and(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_and(self) }
             }
 
             #[inline]
             fn reduce_or(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_or(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_or(self) }
             }
 
             #[inline]
             fn reduce_xor(self) -> Self::Scalar {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_reduce_xor(self) }
+                unsafe { core::intrinsics::simd::simd_reduce_xor(self) }
             }
 
             #[inline]
             fn swap_bytes(self) -> Self {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_bswap(self) }
+                unsafe { core::intrinsics::simd::simd_bswap(self) }
             }
 
             #[inline]
             fn reverse_bits(self) -> Self {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_bitreverse(self) }
+                unsafe { core::intrinsics::simd::simd_bitreverse(self) }
+            }
+
+            #[inline]
+            fn count_ones(self) -> Self {
+                // Safety: `self` is an integer vector
+                unsafe { core::intrinsics::simd::simd_ctpop(self) }
+            }
+
+            #[inline]
+            fn count_zeros(self) -> Self {
+                (!self).count_ones()
             }
 
             #[inline]
             fn leading_zeros(self) -> Self {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_ctlz(self) }
+                unsafe { core::intrinsics::simd::simd_ctlz(self) }
             }
 
             #[inline]
             fn trailing_zeros(self) -> Self {
                 // Safety: `self` is an integer vector
-                unsafe { intrinsics::simd_cttz(self) }
+                unsafe { core::intrinsics::simd::simd_cttz(self) }
             }
 
             #[inline]

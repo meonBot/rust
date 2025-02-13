@@ -5,16 +5,16 @@ use rustc_hir::{HirId, Impl, ItemKind, Node, Path, QPath, TraitRef, TyKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::AssocKind;
 use rustc_session::declare_lint_pass;
-use rustc_span::symbol::Symbol;
 use rustc_span::Span;
+use rustc_span::symbol::Symbol;
 use std::collections::{BTreeMap, BTreeSet};
 
 declare_clippy_lint! {
     /// ### What it does
     /// It lints if a struct has two methods with the same name:
-    /// one from a trait, another not from trait.
+    /// one from a trait, another not from a trait.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Confusing.
     ///
     /// ### Example
@@ -47,7 +47,6 @@ struct ExistingName {
 }
 
 impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
-    #[expect(clippy::too_many_lines)]
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
         let mut map = FxHashMap::<Res, ExistingName>::default();
 
@@ -55,11 +54,11 @@ impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
             if matches!(cx.tcx.def_kind(id.owner_id), DefKind::Impl { .. })
                 && let item = cx.tcx.hir().item(id)
                 && let ItemKind::Impl(Impl {
-                  items,
-                  of_trait,
-                  self_ty,
-                  ..
-                                      }) = &item.kind
+                    items,
+                    of_trait,
+                    self_ty,
+                    ..
+                }) = &item.kind
                 && let TyKind::Path(QPath::Resolved(_, Path { res, .. })) = self_ty.kind
             {
                 if !map.contains_key(res) {
@@ -75,9 +74,8 @@ impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
 
                 match of_trait {
                     Some(trait_ref) => {
-                        let mut methods_in_trait: BTreeSet<Symbol> = if let Some(Node::TraitRef(TraitRef {
-                            path, ..
-                        })) = cx.tcx.hir().find(trait_ref.hir_ref_id)
+                        let mut methods_in_trait: BTreeSet<Symbol> = if let Node::TraitRef(TraitRef { path, .. }) =
+                            cx.tcx.hir_node(trait_ref.hir_ref_id)
                             && let Res::Def(DefKind::Trait, did) = path.res
                         {
                             // FIXME: if

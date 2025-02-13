@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 
 #![allow(warnings)]
 #![feature(coroutines)]
@@ -115,7 +115,7 @@ impl<'unnecessary_lifetime> MyVec {
     }
 
     fn coroutine_doesnt_capture_unnecessary_lifetime<'s: 's>() -> impl Sized {
-        || yield
+        #[coroutine] || yield
     }
 }
 

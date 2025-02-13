@@ -1,6 +1,6 @@
-use crate::spec::{cvs, RelroLevel, TargetOptions};
+use crate::spec::{RelroLevel, TargetOptions, cvs};
 
-pub fn opts() -> TargetOptions {
+pub(crate) fn opts() -> TargetOptions {
     TargetOptions {
         os: "netbsd".into(),
         dynamic_linking: true,
@@ -9,6 +9,7 @@ pub fn opts() -> TargetOptions {
         has_rpath: true,
         position_independent_executables: true,
         relro_level: RelroLevel::Full,
+        has_thread_local: true,
         use_ctors_section: true,
         default_dwarf_version: 2,
         ..Default::default()

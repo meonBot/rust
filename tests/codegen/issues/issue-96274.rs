@@ -1,7 +1,6 @@
-// compile-flags: -O
+//@ compile-flags: -Copt-level=3
 
 #![crate_type = "lib"]
-#![feature(inline_const)]
 
 use std::mem::MaybeUninit;
 

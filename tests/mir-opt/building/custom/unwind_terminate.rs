@@ -1,5 +1,5 @@
-// compile-flags: --crate-type=lib
-// edition:2021
+//@ compile-flags: --crate-type=lib
+//@ edition:2021
 #![feature(custom_mir, core_intrinsics)]
 use core::intrinsics::mir::*;
 
@@ -8,14 +8,14 @@ use core::intrinsics::mir::*;
 // CHECK-NEXT:  terminate(abi);
 #[custom_mir(dialect = "runtime", phase = "optimized")]
 pub fn f() {
-    mir!(
+    mir! {
         {
             Return()
         }
         bb1(cleanup) = {
             UnwindTerminate(ReasonAbi)
         }
-    )
+    }
 }
 
 // CHECK-LABEL: fn g()
@@ -23,12 +23,12 @@ pub fn f() {
 // CHECK-NEXT:  terminate(cleanup);
 #[custom_mir(dialect = "runtime", phase = "optimized")]
 pub fn g() {
-    mir!(
+    mir! {
         {
             Return()
         }
         bb1(cleanup) = {
             UnwindTerminate(ReasonInCleanup)
         }
-    )
+    }
 }

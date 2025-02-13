@@ -1,17 +1,18 @@
 use itertools::Itertools;
+use rustc_abi::ExternAbi;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, EarlyBinder, GenericArgsRef, Ty, TyCtxt};
 use rustc_session::lint::builtin::FUNCTION_ITEM_REFERENCES;
-use rustc_span::{symbol::sym, Span};
-use rustc_target::spec::abi::Abi;
+use rustc_span::source_map::Spanned;
+use rustc_span::{Span, sym};
 
-use crate::{errors, MirLint};
+use crate::errors;
 
-pub struct FunctionItemReferences;
+pub(super) struct FunctionItemReferences;
 
-impl<'tcx> MirLint<'tcx> for FunctionItemReferences {
+impl<'tcx> crate::MirLint<'tcx> for FunctionItemReferences {
     fn run_lint(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
         let mut checker = FunctionItemRefChecker { tcx, body };
         checker.visit_body(body);
@@ -43,7 +44,7 @@ impl<'tcx> Visitor<'tcx> for FunctionItemRefChecker<'_, 'tcx> {
             if let ty::FnDef(def_id, args_ref) = *func_ty.kind() {
                 // Handle calls to `transmute`
                 if self.tcx.is_diagnostic_item(sym::transmute, def_id) {
-                    let arg_ty = args[0].ty(self.body, self.tcx);
+                    let arg_ty = args[0].node.ty(self.body, self.tcx);
                     for inner_ty in arg_ty.walk().filter_map(|arg| arg.as_type()) {
                         if let Some((fn_id, fn_args)) = FunctionItemRefChecker::is_fn_ref(inner_ty)
                         {
@@ -62,12 +63,12 @@ impl<'tcx> Visitor<'tcx> for FunctionItemRefChecker<'_, 'tcx> {
 
 impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
     /// Emits a lint for function reference arguments bound by `fmt::Pointer` in calls to the
-    /// function defined by `def_id` with the substitutions `args_ref`.
+    /// function defined by `def_id` with the generic parameters `args_ref`.
     fn check_bound_args(
         &self,
         def_id: DefId,
         args_ref: GenericArgsRef<'tcx>,
-        args: &[Operand<'tcx>],
+        args: &[Spanned<Operand<'tcx>>],
         source_info: SourceInfo,
     ) {
         let param_env = self.tcx.param_env(def_id);
@@ -82,16 +83,16 @@ impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
                     for inner_ty in arg_def.walk().filter_map(|arg| arg.as_type()) {
                         // If the inner type matches the type bound by `Pointer`
                         if inner_ty == bound_ty {
-                            // Do a substitution using the parameters from the callsite
-                            let subst_ty =
+                            // Do an instantiation using the parameters from the callsite
+                            let instantiated_ty =
                                 EarlyBinder::bind(inner_ty).instantiate(self.tcx, args_ref);
                             if let Some((fn_id, fn_args)) =
-                                FunctionItemRefChecker::is_fn_ref(subst_ty)
+                                FunctionItemRefChecker::is_fn_ref(instantiated_ty)
                             {
                                 let mut span = self.nth_arg_span(args, arg_num);
                                 if span.from_expansion() {
-                                    // The operand's ctxt wouldn't display the lint since it's inside a macro so
-                                    // we have to use the callsite's ctxt.
+                                    // The operand's ctxt wouldn't display the lint since it's
+                                    // inside a macro so we have to use the callsite's ctxt.
                                     let callsite_ctxt = span.source_callsite().ctxt();
                                     span = span.with_ctxt(callsite_ctxt);
                                 }
@@ -120,7 +121,7 @@ impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
     fn is_fn_ref(ty: Ty<'tcx>) -> Option<(DefId, GenericArgsRef<'tcx>)> {
         let referent_ty = match ty.kind() {
             ty::Ref(_, referent_ty, _) => Some(referent_ty),
-            ty::RawPtr(ty_and_mut) => Some(&ty_and_mut.ty),
+            ty::RawPtr(referent_ty, _) => Some(referent_ty),
             _ => None,
         };
         referent_ty
@@ -134,8 +135,8 @@ impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
             .unwrap_or(None)
     }
 
-    fn nth_arg_span(&self, args: &[Operand<'tcx>], n: usize) -> Span {
-        match &args[n] {
+    fn nth_arg_span(&self, args: &[Spanned<Operand<'tcx>>], n: usize) -> Span {
+        match &args[n].node {
             Operand::Copy(place) | Operand::Move(place) => {
                 self.body.local_decls[place.local].source_info.span
             }
@@ -157,17 +158,12 @@ impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
             .lint_root;
         // FIXME: use existing printing routines to print the function signature
         let fn_sig = self.tcx.fn_sig(fn_id).instantiate(self.tcx, fn_args);
-        let unsafety = fn_sig.unsafety().prefix_str();
+        let unsafety = fn_sig.safety().prefix_str();
         let abi = match fn_sig.abi() {
-            Abi::Rust => String::from(""),
-            other_abi => {
-                let mut s = String::from("extern \"");
-                s.push_str(other_abi.name());
-                s.push_str("\" ");
-                s
-            }
+            ExternAbi::Rust => String::from(""),
+            other_abi => format!("extern {other_abi} "),
         };
-        let ident = self.tcx.item_name(fn_id).to_ident_string();
+        let ident = self.tcx.item_ident(fn_id);
         let ty_params = fn_args.types().map(|ty| format!("{ty}"));
         let const_params = fn_args.consts().map(|c| format!("{c}"));
         let params = ty_params.chain(const_params).join(", ");
@@ -176,7 +172,7 @@ impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
         let ret = if fn_sig.output().skip_binder().is_unit() { "" } else { " -> _" };
         let sugg = format!(
             "{} as {}{}fn({}{}){}",
-            if params.is_empty() { ident.clone() } else { format!("{ident}::<{params}>") },
+            if params.is_empty() { ident.to_string() } else { format!("{ident}::<{params}>") },
             unsafety,
             abi,
             vec!["_"; num_args].join(", "),
@@ -184,7 +180,7 @@ impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
             ret,
         );
 
-        self.tcx.emit_spanned_lint(
+        self.tcx.emit_node_span_lint(
             FUNCTION_ITEM_REFERENCES,
             lint_root,
             span,

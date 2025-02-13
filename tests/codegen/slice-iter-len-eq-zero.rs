@@ -1,6 +1,4 @@
-// no-system-llvm
-// compile-flags: -O
-// ignore-debug: the debug assertions add extra comparisons
+//@ compile-flags: -Copt-level=3
 #![crate_type = "lib"]
 
 type Demo = [u8; 3];

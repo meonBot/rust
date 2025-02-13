@@ -1,33 +1,39 @@
 //! Missing batteries for standard libraries.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
-
 use std::io as sio;
 use std::process::Command;
 use std::{cmp::Ordering, ops, time::Instant};
 
-mod macros;
-pub mod process;
-pub mod panic_context;
-pub mod non_empty_vec;
-pub mod rand;
-pub mod thread;
 pub mod anymap;
+mod macros;
+pub mod non_empty_vec;
+pub mod panic_context;
+pub mod process;
+pub mod rand;
+pub mod thin_vec;
+pub mod thread;
 
 pub use always_assert::{always, never};
+pub use itertools;
 
 #[inline(always)]
 pub fn is_ci() -> bool {
     option_env!("CI").is_some()
 }
 
+pub fn hash_once<Hasher: std::hash::Hasher + Default>(thing: impl std::hash::Hash) -> u64 {
+    std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<Hasher>::default(), thing)
+}
+
 #[must_use]
+#[allow(clippy::print_stderr)]
 pub fn timeit(label: &'static str) -> impl Drop {
     let start = Instant::now();
     defer(move || eprintln!("{}: {:.2?}", label, start.elapsed()))
 }
 
 /// Prints backtrace to stderr, useful for debugging.
+#[allow(clippy::print_stderr)]
 pub fn print_backtrace() {
     #[cfg(feature = "backtrace")]
     eprintln!("{:?}", backtrace::Backtrace::new());
@@ -38,6 +44,35 @@ pub fn print_backtrace() {
 Uncomment `default = [ "backtrace" ]` in `crates/stdx/Cargo.toml`.
 "#
     );
+}
+
+pub trait TupleExt {
+    type Head;
+    type Tail;
+    fn head(self) -> Self::Head;
+    fn tail(self) -> Self::Tail;
+}
+
+impl<T, U> TupleExt for (T, U) {
+    type Head = T;
+    type Tail = U;
+    fn head(self) -> Self::Head {
+        self.0
+    }
+    fn tail(self) -> Self::Tail {
+        self.1
+    }
+}
+
+impl<T, U, V> TupleExt for (T, U, V) {
+    type Head = T;
+    type Tail = V;
+    fn head(self) -> Self::Head {
+        self.0
+    }
+    fn tail(self) -> Self::Tail {
+        self.2
+    }
 }
 
 pub fn to_lower_snake_case(s: &str) -> String {
@@ -139,6 +174,10 @@ pub fn to_camel_case(ident: &str) -> String {
 // Taken from rustc.
 pub fn char_has_case(c: char) -> bool {
     c.is_lowercase() || c.is_uppercase()
+}
+
+pub fn is_upper_snake_case(s: &str) -> bool {
+    s.chars().all(|c| c.is_uppercase() || c == '_' || c.is_numeric())
 }
 
 pub fn replace(buf: &mut String, from: char, to: &str) {

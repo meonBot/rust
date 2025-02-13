@@ -11,8 +11,9 @@ LL | #![deny(rustdoc::broken_intra_doc_links)]
    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 help: to link to the trait, prefix with `trait@`
    |
-LL | /// [`trait@Clone`]
-   |       ~~~~~~
+LL - /// [`struct@Clone`]
+LL + /// [`trait@Clone`]
+   |
 
 error: incompatible link kind for `Clone`
   --> $DIR/weird-syntax.rs:21:9
@@ -22,8 +23,9 @@ LL | /// [```struct@Clone```]
    |
 help: to link to the trait, prefix with `trait@`
    |
-LL | /// [```trait@Clone```]
-   |         ~~~~~~
+LL - /// [```struct@Clone```]
+LL + /// [```trait@Clone```]
+   |
 
 error: incompatible link kind for `Clone`
   --> $DIR/weird-syntax.rs:24:11
@@ -33,14 +35,15 @@ LL | /// [  `  struct@Clone  `  ]
    |
 help: to link to the trait, prefix with `trait@`
    |
-LL | /// [  `  trait@Clone  `  ]
-   |           ~~~~~~
+LL - /// [  `  struct@Clone  `  ]
+LL + /// [  `  trait@Clone  `  ]
+   |
 
 error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:27:9
    |
 LL | /// [  `Clone ()`  ]
-   |         ^^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |         ^^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -52,7 +55,7 @@ error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:30:7
    |
 LL | /// [`Clone ()`  ]
-   |       ^^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |       ^^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -64,7 +67,7 @@ error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:33:9
    |
 LL | /// [  `Clone ()`]
-   |         ^^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |         ^^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -76,7 +79,7 @@ error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:36:9
    |
 LL | /// [```Clone ()```]
-   |         ^^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |         ^^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -88,7 +91,7 @@ error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:42:13
    |
 LL | /// [  ```  Clone ()  ```  ]
-   |             ^^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |             ^^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -104,8 +107,9 @@ LL | /// [x][ struct@Clone]
    |
 help: to link to the trait, prefix with `trait@`
    |
-LL | /// [x][ trait@Clone]
-   |          ~~~~~~
+LL - /// [x][ struct@Clone]
+LL + /// [x][ trait@Clone]
+   |
 
 error: incompatible link kind for `Clone`
   --> $DIR/weird-syntax.rs:65:9
@@ -115,14 +119,15 @@ LL | /// [x][struct@Clone ]
    |
 help: to link to the trait, prefix with `trait@`
    |
-LL | /// [x][trait@Clone ]
-   |         ~~~~~~
+LL - /// [x][struct@Clone ]
+LL + /// [x][trait@Clone ]
+   |
 
 error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:74:9
    |
 LL | /// [x][Clone()]
-   |         ^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |         ^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -134,7 +139,7 @@ error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:77:9
    |
 LL | /// [x][Clone  ()]
-   |         ^^^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |         ^^^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -158,8 +163,9 @@ LL | /// [w]( struct@Clone)
    |
 help: to link to the trait, prefix with `trait@`
    |
-LL | /// [w]( trait@Clone)
-   |          ~~~~~~
+LL - /// [w]( struct@Clone)
+LL + /// [w]( trait@Clone)
+   |
 
 error: incompatible link kind for `Clone`
   --> $DIR/weird-syntax.rs:94:9
@@ -169,14 +175,15 @@ LL | /// [w](struct@Clone )
    |
 help: to link to the trait, prefix with `trait@`
    |
-LL | /// [w](trait@Clone )
-   |         ~~~~~~
+LL - /// [w](struct@Clone )
+LL + /// [w](trait@Clone )
+   |
 
 error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:97:9
    |
 LL | /// [w](Clone\(\))
-   |         ^^^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |         ^^^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -188,7 +195,7 @@ error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:103:9
    |
 LL | /// [w](Clone())
-   |         ^^^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |         ^^^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
 help: to link to the trait, prefix with `trait@`
    |
@@ -256,7 +263,7 @@ error: unresolved link to `Clone`
   --> $DIR/weird-syntax.rs:132:9
    |
 LL | /// The [cln][] link here will produce a plain text suggestion
-   |         ^^^^^ this link resolves to the trait `Clone`, which is not in the value namespace
+   |         ^^^^^ this link resolves to the trait `Clone`, which is not a function
    |
    = help: to link to the trait, prefix with `trait@`: trait@Clone
 

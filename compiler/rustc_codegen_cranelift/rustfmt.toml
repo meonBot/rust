@@ -1,5 +1,4 @@
 ignore = [
-    "y.rs",
     "example/gen_block_iterate.rs", # uses edition 2024
 ]
 
@@ -7,3 +6,5 @@ ignore = [
 version = "Two"
 use_small_heuristics = "Max"
 merge_derives = false
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"

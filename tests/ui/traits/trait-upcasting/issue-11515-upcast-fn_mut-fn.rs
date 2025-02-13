@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 
 struct Test {
     func: Box<dyn FnMut() + 'static>,

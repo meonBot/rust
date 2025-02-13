@@ -104,7 +104,7 @@ impl Parse for Newtype {
                 #gate_rustc_only
                 impl<E: ::rustc_serialize::Encoder> ::rustc_serialize::Encodable<E> for #name {
                     fn encode(&self, e: &mut E) {
-                        e.emit_u32(self.private);
+                        e.emit_u32(self.as_u32());
                     }
                 }
             }
@@ -122,7 +122,7 @@ impl Parse for Newtype {
                 #gate_rustc_only
                 impl ::std::iter::Step for #name {
                     #[inline]
-                    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
+                    fn steps_between(start: &Self, end: &Self) -> (usize, Option<usize>) {
                         <usize as ::std::iter::Step>::steps_between(
                             &Self::index(*start),
                             &Self::index(*end),
@@ -139,10 +139,6 @@ impl Parse for Newtype {
                         Self::index(start).checked_sub(u).map(Self::from_usize)
                     }
                 }
-
-                // Safety: The implementation of `Step` upholds all invariants.
-                #gate_rustc_only
-                unsafe impl ::std::iter::TrustedStep for #name {}
             }
         } else {
             quote! {}
@@ -156,39 +152,13 @@ impl Parse for Newtype {
             }
         };
 
-        let spec_partial_eq_impl = if let Lit::Int(max) = &max {
-            if let Ok(max_val) = max.base10_parse::<u32>() {
-                quote! {
-                    #gate_rustc_only
-                    impl core::option::SpecOptionPartialEq for #name {
-                        #[inline]
-                        fn eq(l: &Option<Self>, r: &Option<Self>) -> bool {
-                            if #max_val < u32::MAX {
-                                l.map(|i| i.private).unwrap_or(#max_val+1) == r.map(|i| i.private).unwrap_or(#max_val+1)
-                            } else {
-                                match (l, r) {
-                                    (Some(l), Some(r)) => r == l,
-                                    (None, None) => true,
-                                    _ => false
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                quote! {}
-            }
-        } else {
-            quote! {}
-        };
-
         Ok(Self(quote! {
             #(#attrs)*
             #[derive(Clone, Copy, PartialEq, Eq, Hash, #(#derive_paths),*)]
             #[cfg_attr(#gate_rustc_only_cfg, rustc_layout_scalar_valid_range_end(#max))]
             #[cfg_attr(#gate_rustc_only_cfg, rustc_pass_by_value)]
             #vis struct #name {
-                private: u32,
+                private_use_as_methods_instead: u32,
             }
 
             #(#consts)*
@@ -199,6 +169,9 @@ impl Parse for Newtype {
 
                 /// Maximum value the index can take.
                 #vis const MAX: Self = Self::from_u32(#max);
+
+                /// Zero value of the index.
+                #vis const ZERO: Self = Self::from_u32(0);
 
                 /// Creates a new index from a given `usize`.
                 ///
@@ -228,6 +201,21 @@ impl Parse for Newtype {
                     }
                 }
 
+                /// Creates a new index from a given `u16`.
+                ///
+                /// # Panics
+                ///
+                /// Will panic if `value` exceeds `MAX`.
+                #[inline]
+                #vis const fn from_u16(value: u16) -> Self {
+                    let value = value as u32;
+                    assert!(value <= #max);
+                    // SAFETY: We just checked that `value <= max`.
+                    unsafe {
+                        Self::from_u32_unchecked(value)
+                    }
+                }
+
                 /// Creates a new index from a given `u32`.
                 ///
                 /// # Safety
@@ -238,7 +226,7 @@ impl Parse for Newtype {
                 /// Prefer using `from_u32`.
                 #[inline]
                 #vis const unsafe fn from_u32_unchecked(value: u32) -> Self {
-                    Self { private: value }
+                    Self { private_use_as_methods_instead: value }
                 }
 
                 /// Extracts the value of this index as a `usize`.
@@ -250,7 +238,7 @@ impl Parse for Newtype {
                 /// Extracts the value of this index as a `u32`.
                 #[inline]
                 #vis const fn as_u32(self) -> u32 {
-                    self.private
+                    self.private_use_as_methods_instead
                 }
 
                 /// Extracts the value of this index as a `usize`.
@@ -263,6 +251,7 @@ impl Parse for Newtype {
             impl std::ops::Add<usize> for #name {
                 type Output = Self;
 
+                #[inline]
                 fn add(self, other: usize) -> Self {
                     Self::from_usize(self.index() + other)
                 }
@@ -281,8 +270,6 @@ impl Parse for Newtype {
             }
 
             #step
-
-            #spec_partial_eq_impl
 
             impl From<#name> for u32 {
                 #[inline]

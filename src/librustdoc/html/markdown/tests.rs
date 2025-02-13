@@ -1,9 +1,9 @@
-use super::{find_testable_code, plain_text_summary, short_markdown_summary};
+use rustc_span::edition::{DEFAULT_EDITION, Edition};
+
 use super::{
     ErrorCodes, HeadingOffset, IdMap, Ignore, LangString, LangStringToken, Markdown,
-    MarkdownItemInfo, TagIterator,
+    MarkdownItemInfo, TagIterator, find_testable_code, plain_text_summary, short_markdown_summary,
 };
-use rustc_span::edition::{Edition, DEFAULT_EDITION};
 
 #[test]
 fn test_unique_id() {
@@ -49,7 +49,7 @@ fn test_unique_id() {
 fn test_lang_string_parse() {
     fn t(lg: LangString) {
         let s = &lg.original;
-        assert_eq!(LangString::parse(s, ErrorCodes::Yes, true, None, true), lg)
+        assert_eq!(LangString::parse(s, ErrorCodes::Yes, true, None), lg)
     }
 
     t(Default::default());
@@ -61,7 +61,7 @@ fn test_lang_string_parse() {
         ..Default::default()
     });
     // error
-    t(LangString { original: "{rust}".into(), rust: true, ..Default::default() });
+    t(LangString { original: "{rust}".into(), rust: false, ..Default::default() });
     t(LangString {
         original: "{.rust}".into(),
         rust: true,
@@ -233,7 +233,7 @@ fn test_lang_string_parse() {
         ..Default::default()
     });
     // error
-    t(LangString { original: "{class=first=second}".into(), rust: true, ..Default::default() });
+    t(LangString { original: "{class=first=second}".into(), rust: false, ..Default::default() });
     // error
     t(LangString {
         original: "{class=first.second}".into(),
@@ -261,7 +261,7 @@ fn test_lang_string_parse() {
         ..Default::default()
     });
     // error
-    t(LangString { original: r#"{class=f"irst"}"#.into(), rust: true, ..Default::default() });
+    t(LangString { original: r#"{class=f"irst"}"#.into(), rust: false, ..Default::default() });
 }
 
 #[test]
@@ -305,31 +305,42 @@ fn test_header() {
             edition: DEFAULT_EDITION,
             playground: &None,
             heading_offset: HeadingOffset::H2,
-            custom_code_classes_in_docs: true,
         }
         .into_string();
         assert_eq!(output, expect, "original: {}", input);
     }
 
-    t("# Foo bar", "<h2 id=\"foo-bar\"><a href=\"#foo-bar\">Foo bar</a></h2>");
+    t(
+        "# Foo bar",
+        "<h2 id=\"foo-bar\"><a class=\"doc-anchor\" href=\"#foo-bar\">§</a>Foo bar</h2>",
+    );
     t(
         "## Foo-bar_baz qux",
         "<h3 id=\"foo-bar_baz-qux\">\
-         <a href=\"#foo-bar_baz-qux\">Foo-bar_baz qux</a></h3>",
+             <a class=\"doc-anchor\" href=\"#foo-bar_baz-qux\">§</a>\
+             Foo-bar_baz qux\
+         </h3>",
     );
     t(
         "### **Foo** *bar* baz!?!& -_qux_-%",
         "<h4 id=\"foo-bar-baz--qux-\">\
-            <a href=\"#foo-bar-baz--qux-\"><strong>Foo</strong> \
-            <em>bar</em> baz!?!&amp; -<em>qux</em>-%</a>\
+            <a class=\"doc-anchor\" href=\"#foo-bar-baz--qux-\">§</a>\
+            <strong>Foo</strong> <em>bar</em> baz!?!&amp; -<em>qux</em>-%\
          </h4>",
     );
     t(
         "#### **Foo?** & \\*bar?!*  _`baz`_ ❤ #qux",
         "<h5 id=\"foo--bar--baz--qux\">\
-             <a href=\"#foo--bar--baz--qux\"><strong>Foo?</strong> &amp; *bar?!*  \
-             <em><code>baz</code></em> ❤ #qux</a>\
+             <a class=\"doc-anchor\" href=\"#foo--bar--baz--qux\">§</a>\
+             <strong>Foo?</strong> &amp; *bar?!*  <em><code>baz</code></em> ❤ #qux\
          </h5>",
+    );
+    t(
+        "# Foo [bar](https://hello.yo)",
+        "<h2 id=\"foo-bar\">\
+             <a class=\"doc-anchor\" href=\"#foo-bar\">§</a>\
+             Foo <a href=\"https://hello.yo\">bar</a>\
+         </h2>",
     );
 }
 
@@ -345,18 +356,41 @@ fn test_header_ids_multiple_blocks() {
             edition: DEFAULT_EDITION,
             playground: &None,
             heading_offset: HeadingOffset::H2,
-            custom_code_classes_in_docs: true,
         }
         .into_string();
         assert_eq!(output, expect, "original: {}", input);
     }
 
-    t(&mut map, "# Example", "<h2 id=\"example\"><a href=\"#example\">Example</a></h2>");
-    t(&mut map, "# Panics", "<h2 id=\"panics\"><a href=\"#panics\">Panics</a></h2>");
-    t(&mut map, "# Example", "<h2 id=\"example-1\"><a href=\"#example-1\">Example</a></h2>");
-    t(&mut map, "# Search", "<h2 id=\"search-1\"><a href=\"#search-1\">Search</a></h2>");
-    t(&mut map, "# Example", "<h2 id=\"example-2\"><a href=\"#example-2\">Example</a></h2>");
-    t(&mut map, "# Panics", "<h2 id=\"panics-1\"><a href=\"#panics-1\">Panics</a></h2>");
+    t(
+        &mut map,
+        "# Example",
+        "<h2 id=\"example\"><a class=\"doc-anchor\" href=\"#example\">§</a>Example</h2>",
+    );
+    t(
+        &mut map,
+        "# Panics",
+        "<h2 id=\"panics\"><a class=\"doc-anchor\" href=\"#panics\">§</a>Panics</h2>",
+    );
+    t(
+        &mut map,
+        "# Example",
+        "<h2 id=\"example-1\"><a class=\"doc-anchor\" href=\"#example-1\">§</a>Example</h2>",
+    );
+    t(
+        &mut map,
+        "# Search",
+        "<h2 id=\"search-1\"><a class=\"doc-anchor\" href=\"#search-1\">§</a>Search</h2>",
+    );
+    t(
+        &mut map,
+        "# Example",
+        "<h2 id=\"example-2\"><a class=\"doc-anchor\" href=\"#example-2\">§</a>Example</h2>",
+    );
+    t(
+        &mut map,
+        "# Panics",
+        "<h2 id=\"panics-1\"><a class=\"doc-anchor\" href=\"#panics-1\">§</a>Panics</h2>",
+    );
 }
 
 #[test]
@@ -444,13 +478,8 @@ fn test_markdown_html_escape() {
 #[test]
 fn test_find_testable_code_line() {
     fn t(input: &str, expect: &[usize]) {
-        impl crate::doctest::Tester for Vec<usize> {
-            fn add_test(&mut self, _test: String, _config: LangString, line: usize) {
-                self.push(line);
-            }
-        }
         let mut lines = Vec::<usize>::new();
-        find_testable_code(input, &mut lines, ErrorCodes::No, false, None, true);
+        find_testable_code(input, &mut lines, ErrorCodes::No, false, None);
         assert_eq!(lines, expect);
     }
 
@@ -475,7 +504,6 @@ fn test_ascii_with_prepending_hashtag() {
             edition: DEFAULT_EDITION,
             playground: &None,
             heading_offset: HeadingOffset::H2,
-            custom_code_classes_in_docs: true,
         }
         .into_string();
         assert_eq!(output, expect, "original: {}", input);
@@ -496,15 +524,13 @@ fn test_ascii_with_prepending_hashtag() {
 ####.###..#....#....#..#.
 #..#.#....#....#....#..#.
 #..#.#....#....#....#..#.
-#..#.####.####.####..##..
-</code></pre></div>",
+#..#.####.####.####..##..</code></pre></div>",
     );
     t(
         r#"```markdown
 # hello
 ```"#,
         "<div class=\"example-wrap\"><pre class=\"language-markdown\"><code>\
-# hello
-</code></pre></div>",
+# hello</code></pre></div>",
     );
 }

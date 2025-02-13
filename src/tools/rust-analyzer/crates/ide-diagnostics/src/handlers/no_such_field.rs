@@ -1,11 +1,11 @@
 use either::Either;
-use hir::{db::ExpandDatabase, HasSource, HirDisplay, Semantics};
-use ide_db::{base_db::FileId, source_change::SourceChange, RootDatabase};
+use hir::{db::ExpandDatabase, HasSource, HirDisplay, HirFileIdExt, Semantics, VariantId};
+use ide_db::text_edit::TextEdit;
+use ide_db::{source_change::SourceChange, EditionedFileId, RootDatabase};
 use syntax::{
     ast::{self, edit::IndentLevel, make},
     AstNode,
 };
-use text_edit::TextEdit;
 
 use crate::{fix, Assist, Diagnostic, DiagnosticCode, DiagnosticsContext};
 
@@ -13,7 +13,7 @@ use crate::{fix, Assist, Diagnostic, DiagnosticCode, DiagnosticsContext};
 //
 // This diagnostic is triggered if created structure does not have field provided in record.
 pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) -> Diagnostic {
-    let node = d.field.clone().map(Into::into);
+    let node = d.field.map(Into::into);
     if d.private {
         // FIXME: quickfix to add required visibility
         Diagnostic::new_with_syntax_node_ptr(
@@ -25,7 +25,10 @@ pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) 
     } else {
         Diagnostic::new_with_syntax_node_ptr(
             ctx,
-            DiagnosticCode::RustcHardError("E0559"),
+            match d.variant {
+                VariantId::EnumVariantId(_) => DiagnosticCode::RustcHardError("E0559"),
+                _ => DiagnosticCode::RustcHardError("E0560"),
+            },
             "no such field",
             node,
         )
@@ -48,7 +51,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) -> Option<Vec<Assis
 
 fn missing_record_expr_field_fixes(
     sema: &Semantics<'_, RootDatabase>,
-    usage_file_id: FileId,
+    usage_file_id: EditionedFileId,
     record_expr_field: &ast::RecordExprField,
 ) -> Option<Vec<Assist>> {
     let record_lit = ast::RecordExpr::cast(record_expr_field.syntax().parent()?.parent()?)?;
@@ -127,6 +130,36 @@ fn missing_record_expr_field_fixes(
 #[cfg(test)]
 mod tests {
     use crate::tests::{check_diagnostics, check_fix, check_no_fix};
+
+    #[test]
+    fn dont_work_for_field_with_disabled_cfg() {
+        check_diagnostics(
+            r#"
+struct Test {
+    #[cfg(feature = "hello")]
+    test: u32,
+    other: u32
+}
+
+fn main() {
+    let a = Test {
+        #[cfg(feature = "hello")]
+        test: 1,
+        other: 1
+    };
+
+    let Test {
+        #[cfg(feature = "hello")]
+        test,
+        mut other,
+        ..
+    } = a;
+
+    other += 1;
+}
+"#,
+        );
+    }
 
     #[test]
     fn no_such_field_diagnostics() {
@@ -365,5 +398,39 @@ fn f(s@m::Struct {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn editions_between_macros() {
+        check_diagnostics(
+            r#"
+//- /edition2015.rs crate:edition2015 edition:2015
+#[macro_export]
+macro_rules! pass_expr_thorough {
+    ($e:expr) => { $e };
+}
+
+//- /edition2018.rs crate:edition2018 deps:edition2015 edition:2018
+async fn bar() {}
+async fn foo() {
+    edition2015::pass_expr_thorough!(bar().await);
+}
+        "#,
+        );
+        check_diagnostics(
+            r#"
+//- /edition2018.rs crate:edition2018 edition:2018
+pub async fn bar() {}
+#[macro_export]
+macro_rules! make_await {
+    () => { async { $crate::bar().await }; };
+}
+
+//- /edition2015.rs crate:edition2015 deps:edition2018 edition:2015
+fn foo() {
+    edition2018::make_await!();
+}
+        "#,
+        );
     }
 }

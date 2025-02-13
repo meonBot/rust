@@ -49,3 +49,36 @@ fn other_markdown() {}
 ///   pub struct Struct;
 ///   ```
 fn issue_7421() {}
+
+/// `
+//~^ ERROR: backticks are unbalanced
+fn escape_0() {}
+
+/// Escaped \` backticks don't count.
+fn escape_1() {}
+
+/// Escaped \` \` backticks don't count.
+fn escape_2() {}
+
+/// Escaped \` ` backticks don't count, but unescaped backticks do.
+//~^ ERROR: backticks are unbalanced
+fn escape_3() {}
+
+/// Backslashes ` \` within code blocks don't count.
+fn escape_4() {}
+
+trait Foo {
+    fn bar();
+}
+
+struct Bar;
+impl Foo for Bar {
+    // NOTE: false positive
+    /// Returns an `Option<Month>` from a i64, assuming a 1-index, January = 1.
+    ///
+    /// `Month::from_i64(n: i64)`: | `1`                  | `2`                   | ... | `12`
+    /// ---------------------------| -------------------- | --------------------- | ... | -----
+    /// ``:                        | Some(Month::January) | Some(Month::February) | ... |
+    /// Some(Month::December)
+    fn bar() {}
+}

@@ -25,9 +25,9 @@ macro_rules! TrivialTypeTraversalImpls {
                 fn visit_with<F: $crate::visit::TypeVisitor<I>>(
                     &self,
                     _: &mut F)
-                    -> ::std::ops::ControlFlow<F::BreakTy>
+                    -> F::Result
                 {
-                    ::std::ops::ControlFlow::Continue(())
+                    <F::Result as rustc_ast_ir::visit::VisitorResult>::output()
                 }
             }
         )+
@@ -47,8 +47,16 @@ TrivialTypeTraversalImpls! {
     u16,
     u32,
     u64,
-    String,
-    crate::DebruijnIndex,
+    // tidy-alphabetical-start
     crate::AliasRelationDirection,
+    crate::BoundConstness,
+    crate::DebruijnIndex,
+    crate::PredicatePolarity,
+    crate::solve::BuiltinImplSource,
+    crate::solve::Certainty,
+    crate::solve::GoalSource,
     crate::UniverseIndex,
+    crate::Variance,
+    rustc_ast_ir::Mutability,
+    // tidy-alphabetical-end
 }

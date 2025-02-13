@@ -1,21 +1,34 @@
+//! This module helps you efficiently store and retrieve values using interning.
+//!
+//! Interning is a neat trick that keeps only one copy of identical values, saving memory
+//! and making comparisons super fast. Here, we provide the `Interned<T>` struct and the `Internable` trait
+//! to make interning easy for different data types.
+//!
+//! The `Interner` struct handles caching for common types like `String`, `PathBuf`, and `Vec<String>`,
+//! while the `Cache` struct acts as a write-once storage for linking computation steps with their results.
+//!
+//! # Thread Safety
+//!
+//! We use `Mutex` to make sure interning and retrieval are thread-safe. But keep in mind—once a value is
+//! interned, it sticks around for the entire lifetime of the program.
+
 use std::any::{Any, TypeId};
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::mem;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::Mutex;
-
-// FIXME: replace with std::lazy after it gets stabilized and reaches beta
-use once_cell::sync::Lazy;
+use std::sync::{LazyLock, Mutex};
+use std::{fmt, mem};
 
 use crate::core::builder::Step;
 
+/// Represents an interned value of type `T`, allowing for efficient comparisons and retrieval.
+///
+/// This struct stores a unique index referencing the interned value within an internal cache.
 pub struct Interned<T>(usize, PhantomData<*const T>);
 
 impl<T: Internable + Default> Default for Interned<T> {
@@ -43,17 +56,17 @@ impl PartialEq<str> for Interned<String> {
         *self == other
     }
 }
-impl<'a> PartialEq<&'a str> for Interned<String> {
+impl PartialEq<&str> for Interned<String> {
     fn eq(&self, other: &&str) -> bool {
         **self == **other
     }
 }
-impl<'a, T> PartialEq<&'a Interned<T>> for Interned<T> {
+impl<T> PartialEq<&Interned<T>> for Interned<T> {
     fn eq(&self, other: &&Self) -> bool {
         self.0 == other.0
     }
 }
-impl<'a, T> PartialEq<Interned<T>> for &'a Interned<T> {
+impl<T> PartialEq<Interned<T>> for &Interned<T> {
     fn eq(&self, other: &Interned<T>) -> bool {
         self.0 == other.0
     }
@@ -64,7 +77,7 @@ unsafe impl<T> Sync for Interned<T> {}
 
 impl fmt::Display for Interned<String> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s: &str = &*self;
+        let s: &str = self;
         f.write_str(s)
     }
 }
@@ -74,7 +87,7 @@ where
     Self: Deref<Target = U>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s: &U = &*self;
+        let s: &U = self;
         f.write_fmt(format_args!("{s:?}"))
     }
 }
@@ -115,6 +128,10 @@ impl<T: Internable + Ord> Ord for Interned<T> {
     }
 }
 
+/// A structure for managing the interning of values of type `T`.
+///
+/// `TyIntern<T>` maintains a mapping between values and their interned representations,
+/// ensuring that duplicate values are not stored multiple times.
 struct TyIntern<T: Clone + Eq> {
     items: Vec<T>,
     set: HashMap<T, Interned<T>>,
@@ -127,12 +144,15 @@ impl<T: Hash + Clone + Eq> Default for TyIntern<T> {
 }
 
 impl<T: Hash + Clone + Eq> TyIntern<T> {
+    /// Interns a borrowed value, ensuring it is stored uniquely.
+    ///
+    /// If the value has been previously interned, the same `Interned<T>` instance is returned.
     fn intern_borrow<B>(&mut self, item: &B) -> Interned<T>
     where
         B: Eq + Hash + ToOwned<Owned = T> + ?Sized,
         T: Borrow<B>,
     {
-        if let Some(i) = self.set.get(&item) {
+        if let Some(i) = self.set.get(item) {
             return *i;
         }
         let item = item.to_owned();
@@ -142,6 +162,9 @@ impl<T: Hash + Clone + Eq> TyIntern<T> {
         interned
     }
 
+    /// Interns an owned value, storing it uniquely.
+    ///
+    /// If the value has been previously interned, the existing `Interned<T>` is returned.
     fn intern(&mut self, item: T) -> Interned<T> {
         if let Some(i) = self.set.get(&item) {
             return *i;
@@ -152,11 +175,16 @@ impl<T: Hash + Clone + Eq> TyIntern<T> {
         interned
     }
 
+    /// Retrieves a reference to the interned value associated with the given `Interned<T>` instance.
     fn get(&self, i: Interned<T>) -> &T {
         &self.items[i.0]
     }
 }
 
+/// A global interner for managing interned values of common types.
+///
+/// This structure maintains caches for `String`, `PathBuf`, and `Vec<String>`, ensuring efficient storage
+/// and retrieval of frequently used values.
 #[derive(Default)]
 pub struct Interner {
     strs: Mutex<TyIntern<String>>,
@@ -164,6 +192,10 @@ pub struct Interner {
     lists: Mutex<TyIntern<Vec<String>>>,
 }
 
+/// Defines the behavior required for a type to be internable.
+///
+/// Types implementing this trait must provide access to a static cache and define an `intern` method
+/// that ensures values are stored uniquely.
 trait Internable: Clone + Eq + Hash + 'static {
     fn intern_cache() -> &'static Mutex<TyIntern<Self>>;
 
@@ -191,23 +223,16 @@ impl Internable for Vec<String> {
 }
 
 impl Interner {
+    /// Interns a string reference, ensuring it is stored uniquely.
+    ///
+    /// If the string has been previously interned, the same `Interned<String>` instance is returned.
     pub fn intern_str(&self, s: &str) -> Interned<String> {
         self.strs.lock().unwrap().intern_borrow(s)
     }
-    pub fn intern_string(&self, s: String) -> Interned<String> {
-        self.strs.lock().unwrap().intern(s)
-    }
-
-    pub fn intern_path(&self, s: PathBuf) -> Interned<PathBuf> {
-        self.paths.lock().unwrap().intern(s)
-    }
-
-    pub fn intern_list(&self, v: Vec<String>) -> Interned<Vec<String>> {
-        self.lists.lock().unwrap().intern(v)
-    }
 }
 
-pub static INTERNER: Lazy<Interner> = Lazy::new(Interner::default);
+/// A global instance of `Interner` that caches common interned values.
+pub static INTERNER: LazyLock<Interner> = LazyLock::new(Interner::default);
 
 /// This is essentially a `HashMap` which allows storing any type in its input and
 /// any type in its output. It is a write-once cache; values are never evicted,
@@ -224,28 +249,31 @@ pub struct Cache(
 );
 
 impl Cache {
+    /// Creates a new empty cache.
     pub fn new() -> Cache {
         Cache(RefCell::new(HashMap::new()))
     }
 
+    /// Stores the result of a computation step in the cache.
     pub fn put<S: Step>(&self, step: S, value: S::Output) {
         let mut cache = self.0.borrow_mut();
         let type_id = TypeId::of::<S>();
         let stepcache = cache
             .entry(type_id)
-            .or_insert_with(|| Box::new(HashMap::<S, S::Output>::new()))
+            .or_insert_with(|| Box::<HashMap<S, S::Output>>::default())
             .downcast_mut::<HashMap<S, S::Output>>()
             .expect("invalid type mapped");
         assert!(!stepcache.contains_key(&step), "processing {step:?} a second time");
         stepcache.insert(step, value);
     }
 
+    /// Retrieves a cached result for the given step, if available.
     pub fn get<S: Step>(&self, step: &S) -> Option<S::Output> {
         let mut cache = self.0.borrow_mut();
         let type_id = TypeId::of::<S>();
         let stepcache = cache
             .entry(type_id)
-            .or_insert_with(|| Box::new(HashMap::<S, S::Output>::new()))
+            .or_insert_with(|| Box::<HashMap<S, S::Output>>::default())
             .downcast_mut::<HashMap<S, S::Output>>()
             .expect("invalid type mapped");
         stepcache.get(step).cloned()
@@ -270,3 +298,6 @@ impl Cache {
         self.0.borrow().contains_key(&TypeId::of::<S>())
     }
 }
+
+#[cfg(test)]
+mod tests;

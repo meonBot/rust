@@ -1,4 +1,4 @@
-error[E0277]: the trait bound `u32: Signed` is not satisfied
+error[E0277]: the trait bound `&'static u32: Defaulted` is not satisfied
   --> $DIR/typeck-default-trait-impl-precedence.rs:19:20
    |
 LL |     is_defaulted::<&'static u32>();
